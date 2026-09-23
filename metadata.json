@@ -1,0 +1,9 @@
+{
+  "name": "Viblo Shorts Generator",
+  "description": "AI YouTube Shorts generator that turns a one-line idea into a captioned vertical video with voiceover, stock footage, and YouTube metadata.",
+  "version": "1.0.0",
+  "permissions": [],
+  "capabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

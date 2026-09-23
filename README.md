@@ -29,6 +29,15 @@ topic string
 output/short.mp4  +  output/short_metadata.json (title/description/hashtags)
 ```
 
+## Web Application (AI Studio)
+
+```bash
+npm install
+npm run dev
+```
+
+Runs on `http://0.0.0.0:3000` with live 9:16 vertical video preview, synchronized burned-in captions, voiceover playback, stock footage search, and video export.
+
 ## Setup
 
 ```bash
