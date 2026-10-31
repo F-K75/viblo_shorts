@@ -1,6 +1,6 @@
 {
-  "name": "Viblo Shorts Generator",
-  "description": "AI YouTube Shorts generator that turns a one-line idea into a captioned vertical video with voiceover, stock footage, and YouTube metadata.",
+  "name": "Forge Studio",
+  "description": "AI YouTube Shorts and kinetic captions studio that turns long videos into viral 9:16 vertical clips with original voice and audio.",
   "version": "1.0.0",
   "permissions": [],
   "capabilities": [

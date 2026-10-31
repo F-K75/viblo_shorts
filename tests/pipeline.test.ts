@@ -1,0 +1,143 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {
+  estimateWordTimings,
+  assignBeatTimings,
+  chunkWords,
+  recalculateWordsFromBeats,
+  autoAlignBeatTimelines,
+  applyCaptionOffset,
+  generateSrtFromBeats,
+} from '../src/utils/pipeline.js';
+import { Beat } from '../src/types.js';
+
+test('Pipeline: estimateWordTimings computes accurate word cadence and pauses', () => {
+  const text = 'Never give up on your dreams, because consistency always wins.';
+  const words = estimateWordTimings(text, 1.0);
+
+  assert.equal(words.length, 10, 'Should extract exactly 10 words');
+  assert.equal(words[0].word, 'Never');
+  assert.ok(words[0].start_s >= 0, 'First word start time should be >= 0');
+  assert.ok(words[words.length - 1].end_s > words[0].start_s, 'Last word ends after first word starts');
+
+  // Verify sequential monotonic ordering
+  for (let i = 1; i < words.length; i++) {
+    assert.ok(
+      words[i].start_s >= words[i - 1].start_s,
+      `Word ${i} (${words[i].word}) start time must be >= word ${i - 1} (${words[i - 1].word})`
+    );
+  }
+});
+
+test('Pipeline: estimateWordTimings scales accurately when targetDuration is specified', () => {
+  const text = 'Here are five powerful habits that top creators use to maintain extreme productivity without burning out.';
+  const shortTiming = estimateWordTimings(text, 1.0, 4.0);
+  const normalTiming = estimateWordTimings(text, 1.0, 8.0);
+
+  const shortTotal = shortTiming[shortTiming.length - 1].end_s;
+  const normalTotal = normalTiming[normalTiming.length - 1].end_s;
+
+  assert.ok(
+    normalTotal > shortTotal,
+    `Duration with 8s target (${normalTotal}s) must be greater than 4s target (${shortTotal}s)`
+  );
+});
+
+test('Pipeline: applyCaptionOffset shifts timings without negative timestamps', () => {
+  const text = 'Focus on the signal not the noise.';
+  const initial = estimateWordTimings(text, 1.0);
+
+  const shiftedForward = applyCaptionOffset(initial, 1.5);
+  assert.equal(shiftedForward[0].start_s, parseFloat((initial[0].start_s + 1.5).toFixed(2)));
+
+  const shiftedBackward = applyCaptionOffset(initial, -10.0);
+  assert.equal(shiftedBackward[0].start_s, 0, 'Negative offset must clamp to 0s');
+});
+
+test('Pipeline: assignBeatTimings maps words into beats accurately', () => {
+  const rawBeats = [
+    { text: 'Your time is limited.', visual_keywords: 'clock time' },
+    { text: 'So do not waste it living someone elses life.', visual_keywords: 'person walking' },
+  ];
+  const fullText = rawBeats.map((b) => b.text).join(' ');
+  const words = estimateWordTimings(fullText, 1.0);
+
+  const timedBeats = assignBeatTimings(rawBeats, words, 'https://example.com/video.mp4');
+
+  assert.equal(timedBeats.length, 2);
+  assert.equal(timedBeats[0].text, rawBeats[0].text);
+  assert.equal(timedBeats[1].text, rawBeats[1].text);
+  assert.ok(timedBeats[0].start_s < timedBeats[0].end_s);
+  assert.ok(timedBeats[1].start_s >= timedBeats[0].start_s);
+  assert.equal(timedBeats[0].video_url, 'https://example.com/video.mp4');
+});
+
+test('Pipeline: chunkWords chunks words into compact caption groups', () => {
+  const text = 'Stop doing this immediately if you want to succeed';
+  const words = estimateWordTimings(text, 1.0);
+  const chunks = chunkWords(words, 2);
+
+  assert.ok(chunks.length > 0);
+  assert.ok(chunks[0].words.length <= 2);
+  assert.equal(chunks[0].start_s, words[0].start_s);
+});
+
+test('Pipeline: recalculateWordsFromBeats accurately updates word timestamps when beat is edited', () => {
+  const beats: Beat[] = [
+    {
+      id: 'beat-1',
+      text: 'First revelation hook',
+      visual_keywords: 'focus',
+      start_s: 0.0,
+      end_s: 3.0,
+      video_url: '',
+    },
+    {
+      id: 'beat-2',
+      text: 'Second core insight for the viewer',
+      visual_keywords: 'inspiration',
+      start_s: 3.0,
+      end_s: 7.5,
+      video_url: '',
+    },
+  ];
+
+  const words = recalculateWordsFromBeats(beats);
+  assert.equal(words.length, 9, 'Should have 3 + 6 = 9 words');
+
+  // Verify first beat words are inside [0, 3]s
+  const beat1Words = words.filter((w) => w.beatId === 'beat-1');
+  assert.equal(beat1Words.length, 3);
+  assert.ok(beat1Words[0].start_s >= 0.0);
+  assert.ok(beat1Words[beat1Words.length - 1].end_s <= 3.0);
+
+  // Verify second beat words are inside [3, 7.5]s
+  const beat2Words = words.filter((w) => w.beatId === 'beat-2');
+  assert.equal(beat2Words.length, 6);
+  assert.ok(beat2Words[0].start_s >= 3.0);
+  assert.ok(beat2Words[beat2Words.length - 1].end_s <= 7.5);
+});
+
+test('Pipeline: autoAlignBeatTimelines eliminates gaps and overlaps sequentially', () => {
+  const overlappingBeats: Beat[] = [
+    { id: 'b1', text: 'Sentence one with five words here', visual_keywords: 'a', start_s: 0, end_s: 10, video_url: '' },
+    { id: 'b2', text: 'Sentence two with five more words', visual_keywords: 'b', start_s: 2, end_s: 8, video_url: '' },
+  ];
+
+  const aligned = autoAlignBeatTimelines(overlappingBeats, 12.0);
+  assert.equal(aligned.length, 2);
+  assert.equal(aligned[0].start_s, 0);
+  assert.equal(aligned[0].end_s, aligned[1].start_s, 'Beat 2 must start exactly where Beat 1 ends');
+  assert.equal(aligned[1].end_s, 12.0, 'Total duration should match target of 12.0s');
+});
+
+test('Pipeline: generateSrtFromBeats formats standard SRT timecodes', () => {
+  const beats: Beat[] = [
+    { id: 'b1', text: 'Welcome to Forge Studio', visual_keywords: 'a', start_s: 1.25, end_s: 4.5, video_url: '' },
+    { id: 'b2', text: 'Create viral YouTube Shorts', visual_keywords: 'b', start_s: 4.5, end_s: 8.0, video_url: '' },
+  ];
+
+  const srt = generateSrtFromBeats(beats);
+  assert.ok(srt.includes('1\n00:00:01,250 --> 00:00:04,500\nWelcome to Forge Studio'));
+  assert.ok(srt.includes('2\n00:00:04,500 --> 00:00:08,000\nCreate viral YouTube Shorts'));
+});

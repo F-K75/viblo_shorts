@@ -1,8 +1,6 @@
-# Viblo-style Shorts Generator
+# Forge Studio
 
-Turns a one-line idea into a finished, captioned YouTube Short — the same
-"idea in, video out" flow Viblo AI uses for TikTok/Reels, aimed at YouTube
-Shorts (1080x1920, ≤58s).
+Turns long-form YouTube videos into high-engagement viral 9:16 Shorts with original audio, kinetic captions, and viral hook trimming.
 
 ## Pipeline
 

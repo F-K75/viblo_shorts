@@ -1,0 +1,11 @@
+{
+  "127.0.0.1": {
+    "plan": "pro",
+    "status": "active",
+    "dailyQuotaLimit": 250,
+    "dailyQuotaUsed": 0,
+    "monthlyRenderMinutesLimit": 120,
+    "monthlyRenderMinutesUsed": 14,
+    "currentPeriodEnd": "2026-11-10T10:00:34.579Z"
+  }
+}

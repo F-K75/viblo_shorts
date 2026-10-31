@@ -1,0 +1,20 @@
+[
+  {
+    "id": "job_1791712853625_bhlmq",
+    "userId": "default_user",
+    "type": "test_task",
+    "payload": {
+      "test": true
+    },
+    "status": "completed",
+    "progress": 100,
+    "stepMessage": "Job completed successfully.",
+    "createdAt": "2026-10-11T10:00:53.625Z",
+    "completedAt": "2026-10-11T10:00:54.928Z",
+    "result": {
+      "jobId": "job_1791712853625_bhlmq",
+      "type": "test_task",
+      "processedAt": "2026-10-11T10:00:54.928Z"
+    }
+  }
+]

@@ -1,0 +1,145 @@
+[
+  {
+    "id": "proj_e2e_1791712837548",
+    "title": "User A Private Short Project",
+    "topic": "Personal Branding",
+    "creationMode": "prompt",
+    "script": {
+      "hook": "Never underestimate consistency.",
+      "title": "Consistency Wins #shorts",
+      "description": "Why consistency beats talent.",
+      "hashtags": [
+        "#shorts",
+        "#mindset"
+      ],
+      "beats": [
+        {
+          "id": "b1",
+          "text": "Never underestimate consistency.",
+          "visual_keywords": "workout",
+          "start_s": 0,
+          "end_s": 4,
+          "video_url": ""
+        }
+      ]
+    },
+    "captionStyle": {
+      "id": "hormozi",
+      "name": "Hormozi",
+      "fontSize": 32,
+      "textColor": "#FFFFFF",
+      "highlightColor": "#FFE600",
+      "strokeColor": "#000000",
+      "strokeWidth": 4,
+      "positionY": 68,
+      "wordsPerChunk": 2
+    },
+    "createdAt": "2026-10-11T10:00:37.553Z",
+    "updatedAt": "2026-10-11T10:00:37.553Z"
+  },
+  {
+    "id": "proj_sample_steve_jobs",
+    "userId": "default_user",
+    "title": "Steve Jobs: Follow Your Intuition",
+    "topic": "Steve Jobs' 2005 Stanford Commencement Address",
+    "creationMode": "youtube",
+    "script": {
+      "hook": "Your time is limited, so don't waste it living someone else's life.",
+      "title": "The Brutal Truth About Time & Success #shorts",
+      "description": "Steve Jobs' life-changing Stanford commencement wisdom on living authentically.",
+      "hashtags": [
+        "#shorts",
+        "#stevejobs",
+        "#mindset",
+        "#success",
+        "#inspiration"
+      ],
+      "viralScore": 97,
+      "sourceYouTubeId": "UF8uR6Z6KLc",
+      "sourceYouTubeTitle": "Steve Jobs 2005 Stanford Commencement Address",
+      "sourceYouTubeAuthor": "Stanford University",
+      "clipStartSeconds": 15,
+      "clipEndSeconds": 48,
+      "audioSourceMode": "youtube",
+      "captionOffsetSeconds": 0,
+      "beats": [
+        {
+          "id": "yt-beat-1",
+          "text": "Your time is limited, so don't waste it living someone else's life.",
+          "visual_keywords": "focus inspiration speech leadership",
+          "start_s": 0,
+          "end_s": 5.5,
+          "video_url": "",
+          "thumbnail": "https://i.ytimg.com/vi/UF8uR6Z6KLc/hqdefault.jpg"
+        },
+        {
+          "id": "yt-beat-2",
+          "text": "Don't be trapped by dogma, which is living with the results of other people's thinking.",
+          "visual_keywords": "person walking city skyline focus",
+          "start_s": 5.5,
+          "end_s": 12,
+          "video_url": "",
+          "thumbnail": "https://images.unsplash.com/photo-1519501025264-65ba15a82390?w=1080&h=1920&fit=crop&q=80"
+        },
+        {
+          "id": "yt-beat-3",
+          "text": "Don't let the noise of others' opinions drown out your own inner voice.",
+          "visual_keywords": "calm moonlight reflection nature",
+          "start_s": 12,
+          "end_s": 18.5,
+          "video_url": "",
+          "thumbnail": "https://images.unsplash.com/photo-1506126613408-eca07ce68773?w=1080&h=1920&fit=crop&q=80"
+        },
+        {
+          "id": "yt-beat-4",
+          "text": "And most important, have the courage to follow your heart and intuition.",
+          "visual_keywords": "sunrise city modern skyline goal",
+          "start_s": 18.5,
+          "end_s": 25.5,
+          "video_url": "",
+          "thumbnail": "https://images.unsplash.com/photo-1522071820081-009f0129c71c?w=1080&h=1920&fit=crop&q=80"
+        },
+        {
+          "id": "yt-beat-5",
+          "text": "They somehow already know what you truly want to become. Everything else is secondary.",
+          "visual_keywords": "success victory celebration team",
+          "start_s": 25.5,
+          "end_s": 33,
+          "video_url": "",
+          "thumbnail": "https://images.unsplash.com/photo-1553729459-efe14ef6055d?w=1080&h=1920&fit=crop&q=80"
+        }
+      ]
+    },
+    "captionStyle": {
+      "id": "hormozi",
+      "name": "Alex Hormozi",
+      "fontFamily": "Montserrat",
+      "fontWeight": "900",
+      "fontSize": 32,
+      "textColor": "#FFFFFF",
+      "highlightColor": "#FFE600",
+      "strokeColor": "#000000",
+      "strokeWidth": 5,
+      "positionY": 68,
+      "wordsPerChunk": 2,
+      "textTransform": "uppercase",
+      "boxStyle": "rounded-pill",
+      "badge": "Hormozi Gold"
+    },
+    "visualMode": "youtube-crop",
+    "audioSourceMode": "youtube",
+    "videoInfo": {
+      "videoId": "UF8uR6Z6KLc",
+      "url": "https://www.youtube.com/watch?v=UF8uR6Z6KLc",
+      "title": "Steve Jobs 2005 Stanford Commencement Address",
+      "authorName": "Stanford University",
+      "thumbnailUrl": "https://i.ytimg.com/vi/UF8uR6Z6KLc/hqdefault.jpg"
+    },
+    "clipStartSeconds": 15,
+    "clipEndSeconds": 48,
+    "createdAt": "2026-10-10T10:00:37.553Z",
+    "updatedAt": "2026-10-11T10:00:37.553Z",
+    "thumbnail": "https://i.ytimg.com/vi/UF8uR6Z6KLc/hqdefault.jpg",
+    "duration": 33
+  }
+]
