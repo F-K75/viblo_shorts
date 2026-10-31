@@ -1,84 +1,56 @@
 # Forge Studio
 
-Turns long-form YouTube videos into high-engagement viral 9:16 Shorts with original audio, kinetic captions, and viral hook trimming.
+AI studio for vertical (9:16) YouTube Shorts: turn an idea or a YouTube video + transcript into a scripted,
+captioned Short with kinetic word-highlight captions, B-roll, optional AI voice and music, then export it.
 
-## Pipeline
+> Status: see [RELEASE_READINESS_REPORT.md](RELEASE_READINESS_REPORT.md) — **not yet production ready**.
 
-```
-topic string
-   │
-   ▼
-[1] script_generator.py   → Claude writes hook + beats + title/description/hashtags (JSON)
-   │
-   ▼
-[2] voiceover.py          → edge-tts speaks the script, returns word-level timestamps
-   │
-   ▼
-[3] utils.py               → maps those timestamps onto each script "beat"
-   │
-   ▼
-[4] stock_footage.py       → Pexels clip fetched per beat, matched by visual_keywords
-   │
-   ▼
-[5] video_assembler.py     → clips cropped to 9:16, stitched to voiceover length,
-                              word-synced captions burned in, voiceover + music mixed
-   │
-   ▼
-output/short.mp4  +  output/short_metadata.json (title/description/hashtags)
-```
+## Quick start (development)
 
-## Web Application (AI Studio)
+Requirements: Node ≥ 22, [bun](https://bun.sh) (lockfile), `ffmpeg` on `PATH`.
 
 ```bash
-npm install
-npm run dev
+bun install
+cp .env.example .env   # optional: GEMINI_API_KEY, PEXELS_API_KEY
+npm run dev            # http://localhost:3000
 ```
 
-Runs on `http://0.0.0.0:3000` with live 9:16 vertical video preview, synchronized burned-in captions, voiceover playback, stock footage search, and video export.
+Without `GEMINI_API_KEY` the app still works, using built-in template content that the UI clearly labels as such.
 
-## Setup
+## Scripts
+
+| Command | What it does |
+|---|---|
+| `npm run dev` | API + Vite dev middleware on `:3000` |
+| `npm run lint` | Typecheck frontend **and** server |
+| `npm test` | Unit + integration tests (boots its own isolated server; needs ffmpeg) |
+| `npm run test:e2e` | Playwright browser journey against the production build (`npm run build` first) |
+| `npm run test:live` | Real Gemini API tests (skipped unless `GEMINI_API_KEY` is set) |
+| `npm run test:load` | Concurrent load test with latency percentiles |
+| `npm run build` | Typecheck + production bundle in `dist/` |
+| `npm start` | Production server (requires `SESSION_SECRET`) |
+
+## Production
 
 ```bash
-cd viblo_shorts
-pip install -r requirements.txt
-cp .env.example .env
-# then edit .env and fill in ANTHROPIC_API_KEY and PEXELS_API_KEY
+docker build -t forge-studio .
+docker run -p 3000:3000 -e SESSION_SECRET=$(openssl rand -hex 32) -v forge-data:/data forge-studio
 ```
 
-You also need `ffmpeg` on your system (moviepy uses it under the hood):
-- macOS: `brew install ffmpeg`
-- Ubuntu/Debian: `sudo apt install ffmpeg`
-- Windows: `choco install ffmpeg` or download from ffmpeg.org
+* Health: `GET /api/health` (liveness + metrics), `GET /api/ready` (storage + ffmpeg).
+* Runs as a **single instance** (JSON-file storage in `/data`). Back up the volume.
+* Behind a load balancer set `TRUST_PROXY=1`; restrict cross-origin callers with `ALLOWED_ORIGINS`.
+* All settings: [.env.example](.env.example).
 
-## Run
+## Documentation
 
-```bash
-python main.py "5 productivity habits that actually work" --out habits.mp4
-```
+* [System architecture](docs/SYSTEM_ARCHITECTURE.md) · [Application flow](docs/APPLICATION_FLOW.md)
+* [Feature inventory](docs/FEATURE_INVENTORY.md) · [API inventory](docs/API_INVENTORY.md)
+* [Data architecture](docs/DATABASE_ARCHITECTURE.md) · [Technical debt](docs/TECHNICAL_DEBT.md)
 
-This produces:
-- `output/habits.mp4` — the finished vertical Short
-- `output/habits_metadata.json` — title, description, hashtags ready to paste into YouTube Studio
+## Known limitations
 
-Options:
-```bash
-python main.py "<topic>" \
-  --out <filename.mp4> \
-  --audience "e.g. college students" \
-  --tone "e.g. calm and reassuring"
-```
-
-## Notes / where to extend
-
-- **Voice**: swap `TTS_VOICE` in `.env` for any edge-tts voice (`edge-tts --list-voices` to see all).
-- **Captions**: word grouping size is `WORDS_PER_CHUNK` in `caption_renderer.py` (default 3 words/chunk); styling (font size, color, position) is in `config.py` / `video_assembler.py`.
-- **Music**: drop a royalty-free mp3 anywhere and point `MUSIC_PATH` at it.
-- **Stock source**: `stock_footage.py` only talks to Pexels; swapping in Pixabay or your own footage library means changing that one file — nothing else in the pipeline needs to know.
-- **Script style**: the actual writing instructions live in `SYSTEM_PROMPT` inside `script_generator.py` — that's the highest-leverage place to tune hook style, pacing, or niche voice.
-- **Cost per video**: roughly one Claude call (~1-2k tokens) + a handful of Pexels API calls (free tier: 200 requests/hour) + free TTS. No per-video GPU cost.
-
-## Known limits vs. a polished product like Viblo
-
-- No auto-generated B-roll (Viblo has AI video gen; this sources real stock footage instead — often looks more natural, but you're limited to what Pexels has for a query).
-- No multi-platform export presets (TikTok/Reels crops) — everything here targets 1080x1920 only; cropping to 1:1 or other ratios would be a small addition to `video_assembler.py`.
-- No built-in trend/hook A/B testing — `main.py` generates one script per run; calling `generate_script` a few times and picking the best hook is a one-line change if you want that.
+* Exports are recorded in the browser in real time (≈1× the Short's length); keep the tab in the foreground.
+* Clips sourced from YouTube can't include the original YouTube footage/audio in the export (browser
+  limitation and YouTube ToS). Use the SRT/VTT captions from the Publishing Pack instead.
+* Narration is included in exports only when server-side Gemini TTS is available.
