@@ -201,7 +201,7 @@ export const StudioPage1Source: React.FC<StudioPage1SourceProps> = ({
               <div className="flex items-center justify-between">
                 <label className="text-xs font-semibold text-white flex items-center gap-1.5">
                   <Youtube className="w-4 h-4 text-red-500" />
-                  <span>YouTube Video URL or Topic</span>
+                  <span>YouTube Video URL</span>
                 </label>
                 <span className="text-[11px] text-neutral-400">Podcasts, interviews, speeches</span>
               </div>

@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { useEscapeKey } from '../utils/useEscapeKey';
 import {
   X,
   CloudUpload,
@@ -57,6 +58,8 @@ export const GoogleDriveExportModal: React.FC<GoogleDriveExportModalProps> = ({
 
   const [showConfirm, setShowConfirm] = useState(false);
   const [copiedLink, setCopiedLink] = useState(false);
+
+  useEscapeKey(isOpen, onClose);
 
   useEffect(() => {
     if (!isOpen) return;

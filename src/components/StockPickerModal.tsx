@@ -1,7 +1,9 @@
 import React, { useState, useEffect } from 'react';
+import { useEscapeKey } from '../utils/useEscapeKey';
 import { Search, X, Check, Film, Loader2 } from 'lucide-react';
 import { Beat } from '../types';
 import { getSafeThumbnail } from '../utils/visualPlaceholders';
+import { apiFetch } from '../utils/api';
 
 interface StockPickerModalProps {
   beat: Beat | null;
@@ -41,7 +43,7 @@ export const StockPickerModal: React.FC<StockPickerModalProps> = ({
     if (!searchQuery.trim()) return;
     setLoading(true);
     try {
-      const res = await fetch('/api/stock-footage', {
+      const res = await apiFetch('/api/stock-footage', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ query: searchQuery }),
@@ -54,6 +56,8 @@ export const StockPickerModal: React.FC<StockPickerModalProps> = ({
       setLoading(false);
     }
   };
+
+  useEscapeKey(isOpen, onClose);
 
   if (!isOpen || !beat) return null;
 

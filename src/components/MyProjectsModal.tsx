@@ -1,4 +1,6 @@
 import React, { useState, useEffect } from 'react';
+import { apiFetch, apiErrorMessage } from '../utils/api';
+import { useEscapeKey } from '../utils/useEscapeKey';
 import {
   FolderKanban,
   X,
@@ -31,12 +33,13 @@ export const MyProjectsModal: React.FC<MyProjectsModalProps> = ({
   onLoadProject,
   onNewProject,
   currentProjectId,
-  userId = 'default_user',
 }) => {
   const [projects, setProjects] = useState<Project[]>([]);
   const [loading, setLoading] = useState(false);
   const [actionLoadingId, setActionLoadingId] = useState<string | null>(null);
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  useEscapeKey(isOpen, onClose);
 
   useEffect(() => {
     if (isOpen) {
@@ -48,15 +51,18 @@ export const MyProjectsModal: React.FC<MyProjectsModalProps> = ({
   const fetchProjects = async () => {
     setLoading(true);
     try {
-      const res = await fetch('/api/projects', {
-        headers: { 'x-user-id': userId },
+      const res = await apiFetch('/api/projects', {
       });
       if (res.ok) {
         const data = await res.json();
         setProjects(data.projects || []);
+        setError(null);
+      } else {
+        setError(await apiErrorMessage(res, 'Could not load your projects'));
       }
     } catch (err) {
       console.error('Failed to load projects:', err);
+      setError('Could not reach the server. Check your connection and try again.');
     } finally {
       setLoading(false);
     }
@@ -71,15 +77,17 @@ export const MyProjectsModal: React.FC<MyProjectsModalProps> = ({
     setConfirmDeleteId(null);
     setActionLoadingId(id);
     try {
-      const res = await fetch(`/api/projects/${id}`, {
+      const res = await apiFetch(`/api/projects/${id}`, {
         method: 'DELETE',
-        headers: { 'x-user-id': userId },
       });
       if (res.ok) {
         setProjects((prev) => prev.filter((p) => p.id !== id));
+      } else {
+        setError(await apiErrorMessage(res, 'Delete failed'));
       }
     } catch (err) {
       console.error('Delete failed:', err);
+      setError('Delete failed: could not reach the server.');
     } finally {
       setActionLoadingId(null);
     }
@@ -89,16 +97,18 @@ export const MyProjectsModal: React.FC<MyProjectsModalProps> = ({
     e.stopPropagation();
     setActionLoadingId(id);
     try {
-      const res = await fetch(`/api/projects/${id}/duplicate`, {
+      const res = await apiFetch(`/api/projects/${id}/duplicate`, {
         method: 'POST',
-        headers: { 'x-user-id': userId },
       });
       if (res.ok) {
         const data = await res.json();
         setProjects((prev) => [data.project, ...prev]);
+      } else {
+        setError(await apiErrorMessage(res, 'Duplicate failed'));
       }
     } catch (err) {
       console.error('Duplicate failed:', err);
+      setError('Duplicate failed: could not reach the server.');
     } finally {
       setActionLoadingId(null);
     }
@@ -147,6 +157,11 @@ export const MyProjectsModal: React.FC<MyProjectsModalProps> = ({
 
         {/* Projects List */}
         <div className="py-6 overflow-y-auto relative z-10 flex-1 space-y-4">
+          {error && (
+            <div role="alert" className="mb-4 rounded-xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-xs text-rose-200">
+              {error}
+            </div>
+          )}
           {loading ? (
             <div className="py-16 text-center text-neutral-400 flex flex-col items-center justify-center gap-3">
               <Loader2 className="w-6 h-6 animate-spin text-rose-500" />
@@ -238,11 +253,13 @@ export const MyProjectsModal: React.FC<MyProjectsModalProps> = ({
                           disabled={actionLoadingId === proj.id}
                           className="p-1.5 rounded-lg text-neutral-400 hover:text-white hover:bg-white/8 transition"
                           title="Duplicate Short"
+                          aria-label={`Duplicate ${proj.title}`}
                         >
                           <Copy className="w-3.5 h-3.5" />
                         </button>
-                        <button
+                        {!(proj as any).isSample && <button
                           type="button"
+                          aria-label={confirmDeleteId === proj.id ? 'Confirm delete' : `Delete ${proj.title}`}
                           onClick={(e) => handleDelete(proj.id, e)}
                           disabled={actionLoadingId === proj.id}
                           className={`p-1.5 rounded-lg transition text-xs font-semibold flex items-center gap-1 ${
@@ -254,7 +271,7 @@ export const MyProjectsModal: React.FC<MyProjectsModalProps> = ({
                         >
                           <Trash2 className="w-3.5 h-3.5" />
                           {confirmDeleteId === proj.id && <span>Delete?</span>}
-                        </button>
+                        </button>}
                       </div>
                     </div>
                   </div>

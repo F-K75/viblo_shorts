@@ -71,7 +71,7 @@ export interface YouTubeVideoInfo {
 export interface YouTubeClipCandidate {
   id: string;
   clipTitle: string;
-  viralScore: number;
+  viralScore?: number;
   reasoning: string;
   hook: string;
   approxStartTimestamp?: string;

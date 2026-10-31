@@ -98,6 +98,8 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
   const [isExporting, setIsExporting] = useState(false);
   const [exportProgress, setExportProgress] = useState(0);
   const [exportResolution, setExportResolution] = useState<'1080p' | '720p'>('1080p');
+  const [exportError, setExportError] = useState<string | null>(null);
+  const isYouTubeSource = Boolean(sourceYouTubeId);
   const [musicMood, setMusicMood] = useState<MusicMood>('lofi');
   const [videoLoaded, setVideoLoaded] = useState(false);
   const [videoError, setVideoError] = useState(false);
@@ -310,8 +312,13 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
   // Video Export Handler using Canvas + MediaRecorder with mixed audio
   const handleExportVideo = async () => {
     if (beats.length === 0 || isExporting) return;
+    if (typeof MediaRecorder === 'undefined') {
+      setExportError('Your browser does not support in-browser video recording. Please use a recent Chrome, Edge or Firefox.');
+      return;
+    }
     setIsExporting(true);
     setExportProgress(0);
+    setExportError(null);
 
     const canvasW = exportResolution === '720p' ? 720 : 1080;
     const canvasH = exportResolution === '720p' ? 1280 : 1920;
@@ -327,17 +334,32 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
     }
 
     try {
-      audioManager.initContext();
+      const audioRunning = await audioManager.ensureRunning();
       if (musicEnabled) {
         audioManager.startBackgroundMusic(musicVolume, musicMood);
       }
-      const audioTrack = audioManager.getExportAudioStream();
-      const videoTrack = canvas.captureStream(30).getVideoTracks()[0];
+      // Only attach an audio track when the audio graph is running; a dead track stalls the muxer.
+      const audioTrack = audioRunning ? audioManager.getExportAudioStream() : null;
+      // captureStream(0) + requestFrame(): emit exactly one frame per drawn frame. With captureStream(30),
+      // Chromium only emits frames when it decides the canvas changed, which dropped most frames of static scenes.
+      const videoTrack = canvas.captureStream(0).getVideoTracks()[0] as MediaStreamTrack & { requestFrame?: () => void };
       const combinedStream = audioTrack
         ? new MediaStream([videoTrack, audioTrack])
         : new MediaStream([videoTrack]);
 
-      const mimeTypes = ['video/mp4', 'video/webm;codecs=vp9', 'video/webm'];
+      // Prefer H.264: it is hardware-accelerated almost everywhere, YouTube's preferred upload codec, and
+      // in testing it was the only codec that kept up with real-time 1080p capture on a 4-core machine
+      // (VP8/VP9 software encoders dropped most frames).
+      const mimeTypes = [
+        'video/mp4;codecs=avc1.42E028,mp4a.40.2',
+        'video/mp4;codecs=avc1.42E028',
+        'video/mp4;codecs=avc1',
+        'video/webm;codecs=h264,opus',
+        'video/webm;codecs=h264',
+        'video/mp4',
+        'video/webm;codecs=vp9',
+        'video/webm',
+      ];
       const supportedMime = mimeTypes.find((m) => MediaRecorder.isTypeSupported(m)) || 'video/webm';
 
       const recorder = new MediaRecorder(combinedStream, {
@@ -356,7 +378,7 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
         };
       });
 
-      recorder.start();
+      recorder.start(1000); // timeslice: stream chunks out instead of buffering the whole video in the encoder
 
       const videoElements: HTMLVideoElement[] = beats.map((b) => {
         const v = document.createElement('video');
@@ -389,19 +411,30 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
 
       videoElements.forEach((v) => v.play().catch(() => {}));
 
+      // MediaRecorder captures in WALL-CLOCK time, so frames must be drawn in real time.
+      // (Previously the loop ran ~3x faster than real time and a 33s Short exported as ~10s.)
       const fps = 30;
-      const totalFrames = Math.floor(totalDuration * fps);
-      const dt = 1 / fps;
+      const frameMs = 1000 / fps;
+      const startWall = performance.now();
+      const narrate = aiVoiceEnabled && !(isYouTubeSource && audioSourceMode === 'youtube');
+      let lastSpokenBeat = -1;
+      let frame = 0;
 
-      for (let frame = 0; frame < totalFrames; frame++) {
-        const t = frame * dt;
-        setExportProgress(Math.round((frame / totalFrames) * 100));
+      while (true) {
+        const t = (performance.now() - startWall) / 1000;
+        if (t >= totalDuration) break;
+        if (frame % 10 === 0) setExportProgress(Math.min(99, Math.round((t / totalDuration) * 100)));
 
         const bIndex = beats.findIndex((b) => t >= b.start_s && t < b.end_s);
         const activeIdx = bIndex !== -1 ? bIndex : 0;
         const currentV = videoElements[activeIdx];
         const currentImg = imageElements[activeIdx];
         const currentBeat = beats[activeIdx];
+        if (narrate && bIndex !== -1 && bIndex !== lastSpokenBeat) {
+          lastSpokenBeat = bIndex;
+          // Neural TTS audio is routed into the export stream by audioManager.
+          void audioManager.speakNeuralOrFallback(currentBeat.text, voiceName);
+        }
 
         ctx.fillStyle = '#0a0a0a';
         ctx.fillRect(0, 0, canvasW, canvasH);
@@ -520,12 +553,14 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
           ctx.restore();
         }
 
-        if (frame % 10 === 0) {
-          await new Promise((r) => setTimeout(r, 10));
-        }
+        videoTrack.requestFrame?.();
+        frame++;
+        const wait = startWall + frame * frameMs - performance.now();
+        await new Promise((r) => setTimeout(r, Math.max(0, wait)));
       }
 
       recorder.stop();
+      audioManager.stopSpeech();
       videoElements.forEach((v) => v.pause());
 
       const blob = await exportPromise;
@@ -534,10 +569,14 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
       a.href = downloadUrl;
       const extension = supportedMime.includes('mp4') ? 'mp4' : 'webm';
       a.download = `forge_short_${exportResolution}_${Date.now()}.${extension}`;
+      document.body.appendChild(a);
       a.click();
-      URL.revokeObjectURL(downloadUrl);
-    } catch (err) {
+      a.remove();
+      // Revoking immediately can cancel the download in some browsers.
+      setTimeout(() => URL.revokeObjectURL(downloadUrl), 60_000);
+    } catch (err: any) {
       console.error('Video export error:', err);
+      setExportError(`Export failed: ${err?.message || 'unknown error'}. Please try again, or use 720p.`);
     } finally {
       if (!isPlaying) {
         audioManager.stopBackgroundMusic();
@@ -1018,6 +1057,16 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
             </div>
           </div>
 
+          <p className="text-[10px] leading-snug text-neutral-500 px-1">
+            {isYouTubeSource
+              ? 'Note: YouTube footage and audio cannot be recorded by the browser (embedded player). The export contains the thumbnail/B-roll with your captions; publish the clip from the original video with these captions (SRT in Publishing Pack).'
+              : 'Exports render in real time (a 30s Short takes ~30s). Keep this tab in the foreground. Narration is included when server AI voice is available; browser system voices cannot be recorded.'}
+          </p>
+          {exportError && (
+            <div role="alert" className="rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-[11px] text-rose-200">
+              {exportError}
+            </div>
+          )}
           <button
             onClick={handleExportVideo}
             disabled={isExporting || beats.length === 0}

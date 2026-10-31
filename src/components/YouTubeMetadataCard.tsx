@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { Copy, Check, Download, Youtube, Sparkles, RefreshCw, Layers, CheckCircle2 } from 'lucide-react';
 import { ShortScript } from '../types';
+import { apiFetch } from '../utils/api';
 
 interface YouTubeMetadataCardProps {
   script: ShortScript;
@@ -23,7 +24,7 @@ export const YouTubeMetadataCard: React.FC<YouTubeMetadataCardProps> = ({ script
   const handleOptimizeWithGemini = async () => {
     setIsOptimizing(true);
     try {
-      const res = await fetch('/api/gemini/optimize-metadata', {
+      const res = await apiFetch('/api/gemini/optimize-metadata', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

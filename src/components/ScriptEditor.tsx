@@ -27,6 +27,7 @@ import { recalculateWordsFromBeats } from '../utils/pipeline';
 import { getSafeThumbnail } from '../utils/visualPlaceholders';
 import { VoiceToTextPanel } from './VoiceToTextPanel';
 import { startLiveVoiceListener } from '../utils/voiceRecognition';
+import { apiFetch } from '../utils/api';
 
 interface ScriptEditorProps {
   beats: Beat[];
@@ -172,14 +173,18 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({
     setShowHooksModal(true);
     setLoadingHooks(true);
     try {
-      const res = await fetch('/api/gemini/suggest-hooks', {
+      const res = await apiFetch('/api/gemini/suggest-hooks', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ topic: topic || beats[0]?.text || 'viral YouTube Short' }),
       });
       const data = await res.json();
       if (data.hooks && Array.isArray(data.hooks)) {
-        setSuggestedHooks(data.hooks);
+        setSuggestedHooks(
+          data.isFallback
+            ? data.hooks.map((h: any) => ({ ...h, style: `Template (AI unavailable) · ${h.style}` }))
+            : data.hooks
+        );
       }
     } catch (err) {
       console.error('Failed to get hook suggestions:', err);
@@ -202,7 +207,7 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({
     setRewritingBeatId(beat.id);
     setActivePunchUpMenuBeatId(null);
     try {
-      const res = await fetch('/api/gemini/rewrite-beat', {
+      const res = await apiFetch('/api/gemini/rewrite-beat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -212,7 +217,9 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({
         }),
       });
       const data = await res.json();
-      if (data.text) {
+      if (data.unchanged || data.isFallback) {
+        setCcFeedback(data.fallbackMessage || 'AI rewrite is unavailable right now; the line was left unchanged.');
+      } else if (data.text) {
         onUpdateBeat(beat.id, {
           text: data.text,
           visual_keywords: data.visual_keywords || beat.visual_keywords,
@@ -241,7 +248,7 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({
     setFetchingYouTubeCC(true);
     setCcFeedback(null);
     try {
-      const res = await fetch('/api/youtube/captions', {
+      const res = await apiFetch('/api/youtube/captions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ videoId: sourceYouTubeId }),
@@ -297,7 +304,7 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({
     setParsingPastedCc(true);
     setPasteError(null);
     try {
-      const res = await fetch('/api/youtube/parse-transcript', {
+      const res = await apiFetch('/api/youtube/parse-transcript', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

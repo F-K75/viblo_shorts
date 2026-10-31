@@ -1,4 +1,5 @@
 import { WordTiming, Beat } from '../types';
+import { apiFetch } from './api';
 
 // SpeechRecognition type declarations for browsers
 declare global {
@@ -147,17 +148,17 @@ export async function fetchVideoVoiceTranscription(params: {
   fullText: string;
   source: string;
 }> {
-  const res = await fetch('/api/voice-to-text/transcribe-clip', {
+  const res = await apiFetch('/api/voice-to-text/transcribe-clip', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(params),
   });
 
+  const data = await res.json().catch(() => ({}));
   if (!res.ok) {
-    throw new Error('Failed to fetch voice transcription from server');
+    throw new Error(data?.error || 'Failed to fetch voice transcription from server');
   }
-
-  return await res.json();
+  return data;
 }
 
 /**
@@ -171,7 +172,7 @@ export async function alignSpokenWordsToTimeline(params: {
   words: WordTiming[];
   beats: Beat[];
 }> {
-  const res = await fetch('/api/voice-to-text/align-words', {
+  const res = await apiFetch('/api/voice-to-text/align-words', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(params),

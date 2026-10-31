@@ -16,6 +16,7 @@ import {
   Film,
 } from 'lucide-react';
 import { YouTubeVideoInfo, YouTubeClipCandidate } from '../types';
+import { apiFetch } from '../utils/api';
 
 interface YouTubeToClipsProps {
   onSelectClip: (clip: YouTubeClipCandidate, videoInfo: YouTubeVideoInfo) => Promise<void>;
@@ -72,7 +73,7 @@ export const YouTubeToClips: React.FC<YouTubeToClipsProps> = ({
 
     try {
       setLoadingStep('Fetching YouTube video details...');
-      const infoRes = await fetch('/api/youtube/info', {
+      const infoRes = await apiFetch('/api/youtube/info', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url: trimmed }),
@@ -86,7 +87,7 @@ export const YouTubeToClips: React.FC<YouTubeToClipsProps> = ({
       setVideoInfo(infoData);
 
       setLoadingStep('Gemini analyzing viral moments and high-retention hooks...');
-      const genRes = await fetch('/api/youtube/generate-clips', {
+      const genRes = await apiFetch('/api/youtube/generate-clips', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

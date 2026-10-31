@@ -132,7 +132,7 @@ export const VoiceToTextPanel: React.FC<VoiceToTextPanelProps> = ({
   const handleInstantAudioTranscribe = async () => {
     setIsAiProcessing(true);
     setErrorMessage(null);
-    setAiStatus('Listening to video voice track and extracting verbatim audio timestamps...');
+    setAiStatus('Fetching the video\'s captions for word timings...');
 
     try {
       const data = await fetchVideoVoiceTranscription({
@@ -145,7 +145,11 @@ export const VoiceToTextPanel: React.FC<VoiceToTextPanelProps> = ({
 
       if (data.success && Array.isArray(data.words) && data.words.length > 0) {
         setHeardWords(data.words);
-        setAiStatus(`Extracted ${data.words.length} kinetic words from video voice (${data.source})`);
+        setAiStatus(
+          (data as any).isEstimated
+            ? `Timings for ${data.words.length} words were ESTIMATED from the script text (no captions available). Adjust on the timeline if needed.`
+            : `Loaded ${data.words.length} words with real timestamps from the video's captions.`
+        );
 
         // Automatically prepare beats if returned
         if (data.beats && data.beats.length > 0) {
@@ -167,7 +171,7 @@ export const VoiceToTextPanel: React.FC<VoiceToTextPanelProps> = ({
     if (heardWords.length === 0) return;
 
     setIsAiProcessing(true);
-    setAiStatus('Aligning recognized words to kinetic beats with Gemini...');
+    setAiStatus('Aligning recognized words to caption beats...');
 
     try {
       const fullText = heardWords.map((w) => w.word).join(' ');

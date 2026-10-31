@@ -54,8 +54,8 @@ const SAMPLE_CLIPS = [
 const FEATURES = [
   {
     icon: Scissors,
-    title: "100% Original YouTube Video & Audio",
-    desc: "No random stock clips or robotic AI voiceovers. Your clips retain the original speaker's face, cadence, emotion, and audio track.",
+    title: "Built Around the Original Video",
+    desc: "Preview clips on the original YouTube video with synced captions, then export captions (SRT/VTT) and a 9:16 caption render for publishing.",
   },
   {
     icon: Flame,
@@ -85,10 +85,10 @@ const FEATURES = [
 ];
 
 const METRICS = [
-  { label: 'Shorts Generated', val: '140,000+' },
-  { label: 'Avg Retention Boost', val: '+240%' },
-  { label: 'Time Saved per Short', val: '45 mins' },
-  { label: 'Export Quality', val: '1080p FHD' },
+  { label: 'Vertical Format', val: '9:16' },
+  { label: 'Caption Styles', val: 'Kinetic' },
+  { label: 'Subtitle Export', val: 'SRT · VTT' },
+  { label: 'Export Resolution', val: 'Up to 1080p' },
 ];
 
 export const HomePage: React.FC<HomePageProps> = ({ onStartFree, onSignIn, onTrySample }) => {
@@ -152,7 +152,7 @@ export const HomePage: React.FC<HomePageProps> = ({ onStartFree, onSignIn, onTry
             <span className="w-2 h-2 rounded-full bg-rose-500 animate-pulse" />
             <span>AI Shorts & Kinetic Captions Engine</span>
             <span aria-hidden="true">·</span>
-            <span className="text-neutral-400">100% Original YouTube Audio</span>
+            <span className="text-neutral-400">Captions from real YouTube transcripts</span>
           </div>
 
           <h1 className="text-3xl sm:text-5xl lg:text-6xl font-display font-extrabold tracking-tight text-white leading-[1.12]">
@@ -213,22 +213,22 @@ export const HomePage: React.FC<HomePageProps> = ({ onStartFree, onSignIn, onTry
             <div className="space-y-4 p-4">
               <div className="flex items-center gap-2 text-xs text-rose-400 font-mono">
                 <Sparkles className="w-3.5 h-3.5" />
-                <span>OPUSCLIP-GRADE KINETIC CAPTIONS</span>
+                <span>KINETIC CAPTIONS</span>
               </div>
               <h2 className="text-xl sm:text-2xl font-bold text-white tracking-tight">
                 High-Retention Word Sync with Instant Trimming
               </h2>
               <p className="text-xs text-neutral-400 leading-relaxed">
-                Every word spoken in the YouTube video is automatically transcribed and synchronized down to the millisecond. Choose from Alex Hormozi gold highlights, MrBeast electric cyan, or Vox clean documentary captions.
+                Captions come from the video's own transcript when available (or one you paste), with word timings you can fine-tune on the timeline. Choose from Alex Hormozi gold highlights, MrBeast electric cyan, or Vox clean documentary captions.
               </p>
               <div className="grid grid-cols-2 gap-3 pt-2">
                 <div className="p-3 rounded-xl bg-black/40 border border-white/6">
-                  <div className="text-lg font-mono font-bold text-white">0.05s</div>
-                  <div className="text-[11px] text-neutral-400">Audio Sync Precision</div>
+                  <div className="text-lg font-mono font-bold text-white">±0.1s</div>
+                  <div className="text-[11px] text-neutral-400">Manual timing nudges</div>
                 </div>
                 <div className="p-3 rounded-xl bg-black/40 border border-white/6">
-                  <div className="text-lg font-mono font-bold text-rose-400">100%</div>
-                  <div className="text-[11px] text-neutral-400">Original Voice & Video</div>
+                  <div className="text-lg font-mono font-bold text-rose-400">Word-level</div>
+                  <div className="text-[11px] text-neutral-400">Highlight sync</div>
                 </div>
               </div>
             </div>
