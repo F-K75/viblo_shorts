@@ -1,0 +1,207 @@
+// YouTube URL + caption parsing helpers (pure functions, unit-tested directly).
+
+export type CaptionSegment = { start_s: number; end_s: number; text: string };
+
+const ID_RE = /^[a-zA-Z0-9_-]{11}$/;
+
+/**
+ * Extract the 11-character video id from a YouTube URL or a bare id.
+ * Returns null for anything that is not recognisably a YouTube link/id.
+ * (Previously a catch-all regex turned any 11-letter word in a free-text topic,
+ * e.g. "productivity", into a bogus video id.)
+ */
+export function extractYouTubeId(input: string): string | null {
+  if (!input || typeof input !== 'string') return null;
+  let str = input.trim().replace(/^[<"'\s(\[]+|[>"'\s)\]]+$/g, '');
+
+  if (ID_RE.test(str)) return str;
+
+  try {
+    if (str.includes('%')) str = decodeURIComponent(str);
+  } catch {
+    // ignore malformed escapes
+  }
+
+  // Free text with spaces is never a URL.
+  if (/\s/.test(str)) return null;
+
+  try {
+    const fullUrl = /^https?:\/\//i.test(str) ? str : `https://${str}`;
+    const parsed = new URL(fullUrl);
+    const host = parsed.hostname.toLowerCase();
+    const isYouTubeHost =
+      host === 'youtu.be' ||
+      host === 'youtube.com' ||
+      host.endsWith('.youtube.com') ||
+      host === 'youtube-nocookie.com' ||
+      host.endsWith('.youtube-nocookie.com');
+    if (!isYouTubeHost) return null;
+
+    const pathParts = parsed.pathname.split('/').filter(Boolean);
+    if (host === 'youtu.be') {
+      return pathParts[0] && ID_RE.test(pathParts[0]) ? pathParts[0] : null;
+    }
+    const vParam = parsed.searchParams.get('v');
+    if (vParam && ID_RE.test(vParam)) return vParam;
+    if (pathParts.length >= 2 && ['shorts', 'live', 'embed', 'v', 'vi'].includes(pathParts[0])) {
+      return ID_RE.test(pathParts[1]) ? pathParts[1] : null;
+    }
+  } catch {
+    // fallthrough
+  }
+  return null;
+}
+
+/** Parse MM:SS or HH:MM:SS (or plain seconds) to seconds. */
+export function parseTimestampToSeconds(ts?: string, fallback = 0): number {
+  if (!ts) return fallback;
+  const cleaned = String(ts).trim().replace(/[^\d:.]/g, '');
+  const parts = cleaned.split(':').map(Number);
+  if (parts.length === 2 && parts.every((p) => !isNaN(p))) return parts[0] * 60 + parts[1];
+  if (parts.length === 3 && parts.every((p) => !isNaN(p))) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+  const parsed = parseFloat(cleaned);
+  return isNaN(parsed) ? fallback : parsed;
+}
+
+function decodeEntities(s: string): string {
+  return s
+    .replace(/&amp;#39;/g, "'")
+    .replace(/&#39;/g, "'")
+    .replace(/&quot;/g, '"')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&');
+}
+
+const isNoise = (t: string) => !t || t.startsWith('[♪') || t === '[Music]' || t === '[Applause]';
+
+/** Parses YouTube timedtext XML (srv3 `<p t d>` and classic `<text start dur>`). */
+export function parseXmlCaptions(xml: string): CaptionSegment[] {
+  const segments: CaptionSegment[] = [];
+  const pRegex = /<p\s+t="(\d+)"\s+d="(\d+)"[^>]*>([\s\S]*?)<\/p>/gi;
+  let pMatch: RegExpExecArray | null;
+  while ((pMatch = pRegex.exec(xml)) !== null) {
+    const tMs = parseInt(pMatch[1], 10);
+    const dMs = parseInt(pMatch[2], 10);
+    const inner = pMatch[3];
+    let txt = '';
+    const sRegex = /<s[^>]*>([^<]*)<\/s>/gi;
+    let sMatch: RegExpExecArray | null;
+    while ((sMatch = sRegex.exec(inner)) !== null) txt += sMatch[1];
+    if (!txt) txt = inner.replace(/<[^>]+>/g, '');
+    txt = decodeEntities(txt).replace(/\s+/g, ' ').trim();
+    if (!isNoise(txt)) {
+      segments.push({
+        start_s: parseFloat((tMs / 1000).toFixed(2)),
+        end_s: parseFloat(((tMs + dMs) / 1000).toFixed(2)),
+        text: txt,
+      });
+    }
+  }
+  if (segments.length > 0) return segments;
+
+  const textRegex = /<text\s+start="([0-9.]+)"\s+dur="([0-9.]+)"[^>]*>([\s\S]*?)<\/text>/gi;
+  let m: RegExpExecArray | null;
+  while ((m = textRegex.exec(xml)) !== null) {
+    const start = parseFloat(m[1]);
+    const dur = parseFloat(m[2]);
+    const clean = decodeEntities(m[3]).replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim();
+    if (!isNoise(clean)) {
+      segments.push({ start_s: start, end_s: parseFloat((start + dur).toFixed(2)), text: clean });
+    }
+  }
+  return segments;
+}
+
+/** Parses transcripts pasted from YouTube's "Show transcript" panel, or inline-timestamp formats. */
+export function parsePastedTranscriptToSegments(rawText: string): CaptionSegment[] {
+  if (!rawText || typeof rawText !== 'string') return [];
+  const lines = rawText.split('\n').map((l) => l.trim()).filter(Boolean);
+  if (lines.length === 0) return [];
+  const segments: CaptionSegment[] = [];
+
+  const toSec = (s: string): number => {
+    const parts = s.trim().split(':').map(parseFloat);
+    if (parts.length === 2 && parts.every((p) => !isNaN(p))) return parts[0] * 60 + parts[1];
+    if (parts.length === 3 && parts.every((p) => !isNaN(p))) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+    const n = parseFloat(s);
+    return isNaN(n) ? 0 : n;
+  };
+
+  const timeOnlyRegex = /^(\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?)$/;
+  let timeLineCount = 0;
+  for (let i = 0; i < Math.min(lines.length, 12); i++) if (timeOnlyRegex.test(lines[i])) timeLineCount++;
+
+  if (timeLineCount >= 2) {
+    let currentStart: number | null = null;
+    let textParts: string[] = [];
+    for (const line of lines) {
+      if (timeOnlyRegex.test(line)) {
+        if (currentStart !== null && textParts.length > 0) {
+          segments.push({
+            start_s: currentStart,
+            end_s: Math.max(currentStart + 1.0, toSec(line)),
+            text: textParts.join(' ').trim(),
+          });
+        }
+        currentStart = toSec(line);
+        textParts = [];
+      } else {
+        textParts.push(line);
+      }
+    }
+    if (currentStart !== null && textParts.length > 0) {
+      segments.push({ start_s: currentStart, end_s: currentStart + 3.5, text: textParts.join(' ').trim() });
+    }
+    if (segments.length > 0) return segments;
+  }
+
+  const inlineTimeRegex =
+    /(?:\[?(\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?)(?:\s*[-–—]\s*(\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?))?\]?[:\s]+)(.+)/;
+  for (const line of lines) {
+    const m = line.match(inlineTimeRegex);
+    if (m) {
+      const start = toSec(m[1]);
+      const end = m[2] ? toSec(m[2]) : start + 3.0;
+      const t = m[3].trim();
+      if (t) segments.push({ start_s: start, end_s: Math.max(start + 0.8, end), text: t });
+    }
+  }
+  return segments;
+}
+
+/**
+ * Deterministic word-timing estimate for text whose real audio timing is unknown.
+ * Duration is distributed proportionally to word length (+ pause weight after punctuation).
+ * Results are ESTIMATES and are labelled as such by callers.
+ */
+export function estimateWordTimeline(text: string, durationS: number, startOffset = 0) {
+  const tokens = String(text || '').trim().split(/\s+/).filter(Boolean);
+  if (tokens.length === 0) return [] as Array<{ word: string; start_s: number; end_s: number }>;
+  const weights = tokens.map((t) => Math.max(2, t.length) + (/[.!?]$/.test(t) ? 4 : /[,;:]$/.test(t) ? 2 : 0));
+  const total = weights.reduce((a, b) => a + b, 0);
+  let cur = startOffset;
+  return tokens.map((word, i) => {
+    const dur = (weights[i] / total) * durationS;
+    const w = { word, start_s: +cur.toFixed(2), end_s: +(cur + dur * 0.92).toFixed(2) };
+    cur += dur;
+    return w;
+  });
+}
+
+/** Splits text into sentence beats with estimated timings over durationS. */
+export function estimateSentenceBeats(text: string, durationS: number) {
+  const sentences = String(text || '')
+    .replace(/\s+/g, ' ')
+    .match(/[^.!?]+[.!?]*/g)
+    ?.map((s) => s.trim())
+    .filter(Boolean) || [];
+  const totalWords = sentences.reduce((a, s) => a + s.split(' ').length, 0) || 1;
+  let cur = 0;
+  return sentences.map((s) => {
+    const dur = (s.split(' ').length / totalWords) * durationS;
+    const b = { text: s, start_s: +cur.toFixed(2), end_s: +(cur + dur).toFixed(2) };
+    cur += dur;
+    return b;
+  });
+}
