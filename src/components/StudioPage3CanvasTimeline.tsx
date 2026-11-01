@@ -54,6 +54,11 @@ interface StudioPage3CanvasTimelineProps {
   onApplyWordsAndBeats?: (words: WordTiming[], beats?: Beat[]) => void;
   visualMode?: VisualSourceMode;
   onChangeVisualMode?: (mode: VisualSourceMode) => void;
+  registerPlaybackClock?: (fn: (() => number | null) | null) => void;
+  localSourceUrl?: string;
+  localSourceName?: string;
+  onSelectLocalSource?: (file: File) => void;
+  onClearLocalSource?: () => void;
 }
 
 export const StudioPage3CanvasTimeline: React.FC<StudioPage3CanvasTimelineProps> = ({
@@ -93,6 +98,11 @@ export const StudioPage3CanvasTimeline: React.FC<StudioPage3CanvasTimelineProps>
   onApplyWordsAndBeats,
   visualMode,
   onChangeVisualMode,
+  registerPlaybackClock,
+  localSourceUrl,
+  localSourceName,
+  onSelectLocalSource,
+  onClearLocalSource,
 }) => {
   const scriptSectionRef = useRef<HTMLDivElement>(null);
   const captionSectionRef = useRef<HTMLDivElement>(null);
@@ -263,6 +273,11 @@ export const StudioPage3CanvasTimeline: React.FC<StudioPage3CanvasTimelineProps>
             onUpdateCaptionStyle={onChangeCaptionStyle}
             visualMode={visualMode}
             onChangeVisualMode={onChangeVisualMode}
+            registerPlaybackClock={registerPlaybackClock}
+            localSourceUrl={localSourceUrl}
+            localSourceName={localSourceName}
+            onSelectLocalSource={onSelectLocalSource}
+            onClearLocalSource={onClearLocalSource}
           />
         </aside>
       </div>

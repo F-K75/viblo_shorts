@@ -80,6 +80,35 @@ class AudioManager {
     return this.ctx;
   }
 
+  /**
+   * Routes a media element's audio into the export recording (and optionally the speakers).
+   * createMediaElementSource can only be called once per element, so pass a fresh element.
+   * Returns a cleanup function.
+   */
+  public routeMediaElementToExport(el: HTMLMediaElement, gain = 1, monitor = true): () => void {
+    const ctx = this.initContext();
+    if (!ctx) return () => {};
+    this.getExportAudioStream(); // ensures exportDestination exists
+    try {
+      const src = ctx.createMediaElementSource(el);
+      const g = ctx.createGain();
+      g.gain.value = gain;
+      src.connect(g);
+      if (this.exportDestination) g.connect(this.exportDestination);
+      if (monitor) g.connect(ctx.destination);
+      return () => {
+        try {
+          src.disconnect();
+          g.disconnect();
+        } catch {
+          // ignore
+        }
+      };
+    } catch {
+      return () => {};
+    }
+  }
+
   /** Resumes the AudioContext and reports whether audio is actually running (needed for export audio). */
   public async ensureRunning(): Promise<boolean> {
     const ctx = this.initContext();

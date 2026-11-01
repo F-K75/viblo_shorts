@@ -51,6 +51,7 @@ docker run -p 3000:3000 -e SESSION_SECRET=$(openssl rand -hex 32) -v forge-data:
 ## Known limitations
 
 * Exports are recorded in the browser in real time (≈1× the Short's length); keep the tab in the foreground.
-* Clips sourced from YouTube can't include the original YouTube footage/audio in the export (browser
-  limitation and YouTube ToS). Use the SRT/VTT captions from the Publishing Pack instead.
+* For clips sourced from YouTube, upload your own copy of the source video in the export panel (it stays on
+  your device) to export real footage + original audio with synced captions. Without it, the export is a
+  captions-only preview, because browsers can't record the embedded YouTube player.
 * Narration is included in exports only when server-side Gemini TTS is available.

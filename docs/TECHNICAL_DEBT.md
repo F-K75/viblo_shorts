@@ -6,7 +6,7 @@
 | 2 | `server.ts` is still ~2.3k lines | P3 | Pure logic extracted to `server/lib/*` (tested). Next: split routes into routers |
 | 3 | `App.tsx` (~1.2k lines) owns all state; no router | P3 | Introduce a router + state store; deep links per step |
 | 4 | Client export is real-time canvas recording | P2 | Slow (≈1× duration), depends on browser codecs and foreground tab. Server-side compositing (ffmpeg with footage + TTS) would be robust |
-| 5 | YouTube-sourced clips cannot be exported with original video/audio | P1 (product) | Browser cannot capture the iframe; downloading YouTube media conflicts with YouTube ToS. Currently disclosed in UI; needs a product decision (creator-uploaded source files) |
+| 5 | YouTube-sourced clips cannot be exported with original video/audio | Resolved | Browser cannot capture the iframe; downloading YouTube media conflicts with YouTube ToS. Resolved: user uploads their own copy of the source video (local object URL, never sent to the server) |
 | 6 | Server render is caption-only | P2 | Does not composite footage/narration; documented |
 | 7 | Gemini model ids not verifiable here | P1 | `GEMINI_MODELS` env; run `npm run test:live` with a real key before launch |
 | 8 | No CSP header | P2 | Needs allowlist for Firebase, Google Fonts, YouTube embeds, Unsplash/Mixkit/Pexels media, Drive API |

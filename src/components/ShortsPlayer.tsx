@@ -23,6 +23,7 @@ import { Beat, CaptionStyle, WordTiming, VisualSourceMode, AudioSourceMode } fro
 import { chunkWords, applyCaptionOffset } from '../utils/pipeline';
 import { audioManager, MusicMood } from '../utils/audio';
 import { getSafeThumbnail, getSafeVideoUrl } from '../utils/visualPlaceholders';
+import { attachYouTubePlayer, YT_STATE, type YTPlayer } from '../utils/youtubeApi';
 
 function formatSecondsToTimestamp(sec: number): string {
   const m = Math.floor(sec / 60);
@@ -59,6 +60,13 @@ interface ShortsPlayerProps {
   onUpdateCaptionStyle?: (updates: Partial<CaptionStyle>) => void;
   visualMode?: VisualSourceMode;
   onChangeVisualMode?: (mode: VisualSourceMode) => void;
+  /** Registers the preview's master clock (real media position, clip-relative seconds) with the app loop. */
+  registerPlaybackClock?: (fn: (() => number | null) | null) => void;
+  /** Object URL of the user's own copy of the source video; enables real footage + audio in preview/export. */
+  localSourceUrl?: string;
+  localSourceName?: string;
+  onSelectLocalSource?: (file: File) => void;
+  onClearLocalSource?: () => void;
 }
 
 export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
@@ -90,6 +98,11 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
   onUpdateCaptionStyle,
   visualMode: propVisualMode,
   onChangeVisualMode,
+  registerPlaybackClock,
+  localSourceUrl,
+  localSourceName,
+  onSelectLocalSource,
+  onClearLocalSource,
 }) => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -142,81 +155,148 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
     }
   }, [audioSourceMode]);
 
+  const ytPlayerRef = useRef<YTPlayer | null>(null);
+  const sourceVideoRef = useRef<HTMLVideoElement>(null);
+  const localFileInputRef = useRef<HTMLInputElement>(null);
+  const hasLocalSource = Boolean(sourceYouTubeId && localSourceUrl && visualMode !== 'b-roll');
+
+  // Commands go through the official YouTube IFrame API player once it is ready.
   const postToYouTube = (func: string, args: any[] = []) => {
-    if (!iframeRef.current || !iframeRef.current.contentWindow) return;
+    const player = ytPlayerRef.current as any;
+    if (!player || typeof player[func] !== 'function') return;
     try {
-      iframeRef.current.contentWindow.postMessage(
-        JSON.stringify({ event: 'command', func, args }),
-        '*'
-      );
+      player[func](...args);
     } catch {
       // ignore
     }
   };
 
+  // Bind the official player to the (re)mounted iframe. The API performs the postMessage handshake that is
+  // required before YouTube reports playback time (the previous hand-rolled messages never received it).
   useEffect(() => {
-    if (!sourceYouTubeId) return;
-
-    if (isPlaying) {
-      postToYouTube('setOption', ['captions', 'track', {}]);
-      postToYouTube('unloadModule', ['captions']);
-      postToYouTube('unloadModule', ['cc']);
-
-      if (audioMode === 'youtube') {
-        if (!isYoutubeMuted) {
-          postToYouTube('unMute');
-          postToYouTube('setVolume', [Math.round(youtubeVolume * 100)]);
-        } else {
-          postToYouTube('mute');
+    ytPlayerRef.current = null;
+    if (!sourceYouTubeId || hasLocalSource || visualMode === 'b-roll') return;
+    const iframe = iframeRef.current;
+    if (!iframe) return;
+    let cancelled = false;
+    attachYouTubePlayer(iframe)
+      .then((player) => {
+        if (cancelled) return;
+        ytPlayerRef.current = player;
+        try {
+          if (audioModeRef.current === 'youtube' && !isYoutubeMutedRef.current) {
+            player.unMute();
+            player.setVolume(Math.round(youtubeVolumeRef.current * 100));
+          } else {
+            player.mute();
+          }
+          player.seekTo(clipStartRef.current + currentTimestampRef.current, true);
+          if (isPlayingRef.current) player.playVideo();
+          else player.pauseVideo();
+        } catch {
+          // ignore
         }
+      })
+      .catch((err) => console.warn('[YouTube] player API unavailable; captions use the internal clock:', err?.message));
+    return () => {
+      cancelled = true;
+      ytPlayerRef.current = null;
+    };
+  }, [sourceYouTubeId, visualMode, hasLocalSource]);
+
+  // Refs mirrored for the clock function (it is called from the app's animation loop).
+  const audioModeRef = useRef(audioMode);
+  audioModeRef.current = audioMode;
+  const isYoutubeMutedRef = useRef(isYoutubeMuted);
+  isYoutubeMutedRef.current = isYoutubeMuted;
+  const youtubeVolumeRef = useRef(youtubeVolume);
+  youtubeVolumeRef.current = youtubeVolume;
+  const clipStartRef = useRef(clipStartSec);
+  clipStartRef.current = clipStartSec;
+  const isPlayingRef = useRef(isPlaying);
+  isPlayingRef.current = isPlaying;
+  const currentTimestampRef = useRef(currentTimestamp);
+  currentTimestampRef.current = currentTimestamp;
+  const hasLocalSourceRef = useRef(hasLocalSource);
+  hasLocalSourceRef.current = hasLocalSource;
+  const heldClockRef = useRef<number | null>(null);
+
+  // Master clock: while the source's own audio is playing, captions follow the real media position.
+  // During buffering/seeking the clock HOLDS (captions wait) instead of running ahead of the audio.
+  useEffect(() => {
+    if (!registerPlaybackClock) return;
+    const clock = (): number | null => {
+      if (!sourceYouTubeId || audioModeRef.current !== 'youtube') return null;
+      const hold = heldClockRef.current ?? currentTimestampRef.current;
+      if (hasLocalSourceRef.current) {
+        const v = sourceVideoRef.current;
+        if (!v) return null;
+        if (v.paused || v.seeking || v.readyState < 3) return hold;
+        const t = Math.max(0, v.currentTime - clipStartRef.current);
+        heldClockRef.current = t;
+        return t;
+      }
+      const player = ytPlayerRef.current;
+      if (!player) return null; // API unavailable: fall back to the internal clock
+      try {
+        if (player.getPlayerState() !== YT_STATE.PLAYING) return hold;
+        const t = Math.max(0, player.getCurrentTime() - clipStartRef.current);
+        heldClockRef.current = t;
+        return t;
+      } catch {
+        return null;
+      }
+    };
+    registerPlaybackClock(clock);
+    return () => registerPlaybackClock(null);
+  }, [registerPlaybackClock, sourceYouTubeId]);
+
+  useEffect(() => {
+    heldClockRef.current = isPlaying ? currentTimestamp : null;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isPlaying]);
+
+  // Play / pause / volume for the YouTube player.
+  useEffect(() => {
+    if (!sourceYouTubeId || hasLocalSource) return;
+    if (isPlaying) {
+      if (audioMode === 'youtube' && !isYoutubeMuted) {
+        postToYouTube('unMute');
+        postToYouTube('setVolume', [Math.round(youtubeVolume * 100)]);
       } else {
         postToYouTube('mute');
       }
-
-      const targetTime = clipStartSec + currentTimestamp;
-      postToYouTube('seekTo', [targetTime, true]);
+      postToYouTube('seekTo', [clipStartSec + currentTimestamp, true]);
       postToYouTube('playVideo');
     } else {
       postToYouTube('pauseVideo');
     }
-  }, [isPlaying, sourceYouTubeId, audioMode, isYoutubeMuted, youtubeVolume, clipStartSec]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isPlaying, sourceYouTubeId, audioMode, isYoutubeMuted, youtubeVolume, clipStartSec, hasLocalSource]);
 
+  // Play / pause / volume for the user's uploaded source video.
   useEffect(() => {
-    const handleWindowMessage = (e: MessageEvent) => {
-      try {
-        const data = typeof e.data === 'string' ? JSON.parse(e.data) : e.data;
-        if (data?.event === 'onReady') {
-          postToYouTube('listening');
-          postToYouTube('setOption', ['captions', 'track', {}]);
-          postToYouTube('unloadModule', ['captions']);
-          postToYouTube('unloadModule', ['cc']);
-          if (audioMode === 'youtube' && !isYoutubeMuted) {
-            postToYouTube('unMute');
-            postToYouTube('setVolume', [Math.round(youtubeVolume * 100)]);
-          }
-        }
-        if (data?.event === 'infoDelivery' && typeof data?.info?.currentTime === 'number') {
-          const ytTime = data.info.currentTime;
-          const clipTime = Math.max(0, ytTime - clipStartSec);
-          if (isPlaying && Math.abs(currentTimestamp - clipTime) > 0.35) {
-            onSeek(clipTime);
-          }
-        }
-      } catch {
-        // ignore
-      }
-    };
-    window.addEventListener('message', handleWindowMessage);
-    return () => window.removeEventListener('message', handleWindowMessage);
-  }, [audioMode, isYoutubeMuted, youtubeVolume, clipStartSec, isPlaying, currentTimestamp, onSeek]);
+    const v = sourceVideoRef.current;
+    if (!v || !hasLocalSource) return;
+    v.muted = audioMode !== 'youtube' || isYoutubeMuted;
+    v.volume = Math.max(0, Math.min(1, youtubeVolume));
+    if (isPlaying) {
+      const target = clipStartSec + currentTimestamp;
+      if (Math.abs(v.currentTime - target) > 0.25) v.currentTime = target;
+      v.play().catch(() => {});
+    } else {
+      v.pause();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isPlaying, hasLocalSource, audioMode, isYoutubeMuted, youtubeVolume, clipStartSec, localSourceUrl]);
 
+  // When paused, keep the uploaded video's frame in step with timeline scrubbing.
   useEffect(() => {
-    if (!isPlaying || !sourceYouTubeId || audioMode !== 'youtube') return;
-    const pollInterval = setInterval(() => {
-      postToYouTube('getCurrentTime');
-    }, 250);
-    return () => clearInterval(pollInterval);
-  }, [isPlaying, sourceYouTubeId, audioMode]);
+    const v = sourceVideoRef.current;
+    if (!v || !hasLocalSource || isPlaying) return;
+    const target = clipStartSec + currentTimestamp;
+    if (Math.abs(v.currentTime - target) > 0.05) v.currentTime = target;
+  }, [currentTimestamp, hasLocalSource, isPlaying, clipStartSec]);
 
   const handleSetAudioMode = (mode: AudioSourceMode) => {
     setAudioMode(mode);
@@ -236,7 +316,10 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
 
   const handlePlayerSeek = (newTime: number) => {
     onSeek(newTime);
-    if (sourceYouTubeId) {
+    heldClockRef.current = newTime;
+    if (hasLocalSource && sourceVideoRef.current) {
+      sourceVideoRef.current.currentTime = clipStartSec + newTime;
+    } else if (sourceYouTubeId) {
       const targetTime = clipStartSec + newTime;
       postToYouTube('seekTo', [targetTime, true]);
       if (isPlaying) postToYouTube('playVideo');
@@ -245,7 +328,10 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
 
   const handlePlayerReset = () => {
     onReset();
-    if (sourceYouTubeId) {
+    heldClockRef.current = 0;
+    if (hasLocalSource && sourceVideoRef.current) {
+      sourceVideoRef.current.currentTime = clipStartSec;
+    } else if (sourceYouTubeId) {
       postToYouTube('seekTo', [clipStartSec, true]);
       if (isPlaying) postToYouTube('playVideo');
     }
@@ -333,8 +419,39 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
       return;
     }
 
+    let sourceVideo: HTMLVideoElement | null = null;
+    let releaseSourceAudio = () => {};
     try {
       const audioRunning = await audioManager.ensureRunning();
+
+      // Uploaded source video: real footage + original audio, cut to the clip.
+      if (hasLocalSource && localSourceUrl) {
+        const sv = document.createElement('video');
+        sourceVideo = sv;
+        sv.src = localSourceUrl;
+        sv.playsInline = true;
+        sv.preload = 'auto';
+        await new Promise<void>((resolve, reject) => {
+          sv.onloadedmetadata = () => resolve();
+          sv.onerror = () => reject(new Error('could not read the uploaded video file (unsupported format?)'));
+        });
+        if (Number.isFinite(sv.duration) && sv.duration < clipStartSec + 1) {
+          throw new Error(
+            `the uploaded video is ${sv.duration.toFixed(0)}s long but this clip starts at ${clipStartSec.toFixed(0)}s. Is it the full original video?`
+          );
+        }
+        sv.currentTime = clipStartSec;
+        await new Promise<void>((resolve) => {
+          sv.onseeked = () => resolve();
+          setTimeout(resolve, 4000);
+        });
+        if (audioRunning && audioMode === 'youtube' && !isYoutubeMuted) {
+          releaseSourceAudio = audioManager.routeMediaElementToExport(sv, youtubeVolume, true);
+        } else {
+          sv.muted = true;
+        }
+      }
+
       if (musicEnabled) {
         audioManager.startBackgroundMusic(musicVolume, musicMood);
       }
@@ -379,6 +496,7 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
       });
 
       recorder.start(1000); // timeslice: stream chunks out instead of buffering the whole video in the encoder
+      if (sourceVideo) await sourceVideo.play();
 
       const videoElements: HTMLVideoElement[] = beats.map((b) => {
         const v = document.createElement('video');
@@ -421,8 +539,12 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
       let frame = 0;
 
       while (true) {
-        const t = (performance.now() - startWall) / 1000;
-        if (t >= totalDuration) break;
+        // With an uploaded source, its playback position is the clock, so footage, original audio and
+        // captions stay locked together even if decoding stalls.
+        const t = sourceVideo
+          ? Math.max(0, sourceVideo.currentTime - clipStartSec)
+          : (performance.now() - startWall) / 1000;
+        if (t >= totalDuration || sourceVideo?.ended) break;
         if (frame % 10 === 0) setExportProgress(Math.min(99, Math.round((t / totalDuration) * 100)));
 
         const bIndex = beats.findIndex((b) => t >= b.start_s && t < b.end_s);
@@ -440,7 +562,25 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
         ctx.fillRect(0, 0, canvasW, canvasH);
 
         try {
-          if (currentV && currentV.videoWidth) {
+          if (sourceVideo && sourceVideo.readyState >= 2 && sourceVideo.videoWidth) {
+            const vw = sourceVideo.videoWidth;
+            const vh = sourceVideo.videoHeight;
+            const cover = (scaleMode: 'cover' | 'contain') => {
+              const scale = scaleMode === 'cover' ? Math.max(canvasW / vw, canvasH / vh) : Math.min(canvasW / vw, canvasH / vh);
+              const dw = vw * scale;
+              const dh = vh * scale;
+              ctx.drawImage(sourceVideo!, (canvasW - dw) / 2, (canvasH - dh) / 2, dw, dh);
+            };
+            if (visualMode === 'youtube-fit') {
+              ctx.save();
+              ctx.filter = 'blur(40px) brightness(0.55)';
+              cover('cover');
+              ctx.restore();
+              cover('contain');
+            } else {
+              cover('cover');
+            }
+          } else if (currentV && currentV.videoWidth) {
             const vw = currentV.videoWidth;
             const vh = currentV.videoHeight;
             const targetRatio = canvasW / canvasH;
@@ -561,6 +701,7 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
 
       recorder.stop();
       audioManager.stopSpeech();
+      sourceVideo?.pause();
       videoElements.forEach((v) => v.pause());
 
       const blob = await exportPromise;
@@ -578,6 +719,12 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
       console.error('Video export error:', err);
       setExportError(`Export failed: ${err?.message || 'unknown error'}. Please try again, or use 720p.`);
     } finally {
+      releaseSourceAudio();
+      if (sourceVideo) {
+        sourceVideo.pause();
+        sourceVideo.removeAttribute('src');
+        sourceVideo.load();
+      }
       if (!isPlaying) {
         audioManager.stopBackgroundMusic();
       }
@@ -651,8 +798,21 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
         ref={containerRef}
         className="relative w-full aspect-[9/16] rounded-3xl overflow-hidden shadow-2xl bg-black border border-white/12 select-none group"
       >
-        {/* Visual Layer: YouTube Video OR Vertical B-Roll */}
-        {sourceYouTubeId && visualMode !== 'b-roll' ? (
+        {/* Visual Layer: uploaded source video, YouTube video, OR vertical B-roll */}
+        {hasLocalSource ? (
+          <div className="absolute inset-0 overflow-hidden bg-black flex items-center justify-center">
+            <video
+              ref={sourceVideoRef}
+              src={localSourceUrl}
+              playsInline
+              preload="auto"
+              onLoadedMetadata={(e) => {
+                e.currentTarget.currentTime = clipStartSec + currentTimestamp;
+              }}
+              className={`absolute inset-0 w-full h-full pointer-events-none ${visualMode === 'youtube-fit' ? 'object-contain' : 'object-cover'}`}
+            />
+          </div>
+        ) : sourceYouTubeId && visualMode !== 'b-roll' ? (
           visualMode === 'youtube-fit' ? (
             <div className="absolute inset-0 overflow-hidden bg-black flex items-center justify-center">
               {/* Ambient blurred backdrop of original YouTube video */}
@@ -819,6 +979,7 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
             isPlaying ? 'bg-transparent opacity-0 group-hover:opacity-100 hover:bg-black/20' : 'bg-black/35 opacity-100'
           }`}
           title={isPlaying ? 'Click to Pause' : 'Click to Play Video & Audio'}
+          aria-label={isPlaying ? 'Pause preview' : 'Play preview'}
         >
           <div className="w-14 h-14 rounded-full bg-rose-600/90 hover:bg-rose-500 text-white flex items-center justify-center shadow-2xl transform transition hover:scale-110 border border-white/20">
             {isPlaying ? <Pause className="w-6 h-6 fill-current" /> : <Play className="w-6 h-6 fill-current ml-1" />}
@@ -1057,10 +1218,55 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
             </div>
           </div>
 
+          {isYouTubeSource && (
+            <div className="rounded-xl border border-white/8 bg-[#0f141c] p-3 space-y-2">
+              <input
+                ref={localFileInputRef}
+                type="file"
+                accept="video/*"
+                className="hidden"
+                onChange={(e) => {
+                  const file = e.target.files?.[0];
+                  if (file) onSelectLocalSource?.(file);
+                  e.target.value = '';
+                }}
+              />
+              {localSourceUrl ? (
+                <div className="flex items-center justify-between gap-2 text-[11px]">
+                  <span className="text-emerald-300 truncate" title={localSourceName}>
+                    Source video: {localSourceName || 'uploaded file'}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => onClearLocalSource?.()}
+                    className="text-neutral-400 hover:text-white shrink-0"
+                  >
+                    Remove
+                  </button>
+                </div>
+              ) : (
+                <>
+                  <p className="text-[11px] leading-snug text-amber-200">
+                    Browsers can&apos;t record the embedded YouTube player. To export real footage and the original
+                    audio, add your copy of this video (the full original — the clip is cut automatically).
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => localFileInputRef.current?.click()}
+                    className="w-full py-2 rounded-lg bg-white/8 hover:bg-white/12 text-white text-xs font-semibold transition"
+                  >
+                    Upload source video (stays on your device)
+                  </button>
+                </>
+              )}
+              {visualMode === 'b-roll' && localSourceUrl && (
+                <p className="text-[10px] text-neutral-500">B-Roll mode is selected, so stock visuals are used instead of the source video.</p>
+              )}
+            </div>
+          )}
           <p className="text-[10px] leading-snug text-neutral-500 px-1">
-            {isYouTubeSource
-              ? 'Note: YouTube footage and audio cannot be recorded by the browser (embedded player). The export contains the thumbnail/B-roll with your captions; publish the clip from the original video with these captions (SRT in Publishing Pack).'
-              : 'Exports render in real time (a 30s Short takes ~30s). Keep this tab in the foreground. Narration is included when server AI voice is available; browser system voices cannot be recorded.'}
+            Exports render in real time (a 30s Short takes ~30s). Keep this tab in the foreground.
+            {!isYouTubeSource && ' Narration is included when server AI voice is available; browser system voices cannot be recorded.'}
           </p>
           {exportError && (
             <div role="alert" className="rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-[11px] text-rose-200">
@@ -1080,7 +1286,7 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
             ) : (
               <>
                 <Download className="w-4 h-4" />
-                <span>Export & Download Finished Short</span>
+                <span>{isYouTubeSource && !hasLocalSource ? 'Export Captions-Only Preview' : 'Export & Download Finished Short'}</span>
               </>
             )}
           </button>

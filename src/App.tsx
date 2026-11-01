@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   Sparkles,
   Settings,
@@ -184,6 +184,28 @@ export const App: React.FC = () => {
   }, [currentPage, currentUser?.id]);
 
   const playbackRaf = useRef<number | null>(null);
+  // When the preview plays real media (YouTube player or an uploaded source video), that media is the
+  // master clock: captions follow its actual position instead of an independent timer.
+  const externalClockRef = useRef<(() => number | null) | null>(null);
+  const registerPlaybackClock = useCallback((fn: (() => number | null) | null) => {
+    externalClockRef.current = fn;
+  }, []);
+  // User-provided copy of the source video (object URL; never uploaded to the server).
+  const [localSource, setLocalSource] = useState<{ videoId: string; url: string; name: string } | null>(null);
+  const handleSelectLocalSource = (file: File) => {
+    const videoId = scriptRef.current?.sourceYouTubeId;
+    if (!videoId) return;
+    setLocalSource((prev) => {
+      if (prev) URL.revokeObjectURL(prev.url);
+      return { videoId, url: URL.createObjectURL(file), name: file.name };
+    });
+  };
+  const handleClearLocalSource = () => {
+    setLocalSource((prev) => {
+      if (prev) URL.revokeObjectURL(prev.url);
+      return null;
+    });
+  };
   const lastTimeRef = useRef<number>(0);
   const scriptRef = useRef<ShortScript | null>(script);
   scriptRef.current = script;
@@ -406,7 +428,8 @@ export const App: React.FC = () => {
           ? currentScript.beats[currentScript.beats.length - 1].end_s
           : 30;
 
-        const next = prev + delta;
+        const ext = externalClockRef.current?.();
+        const next = typeof ext === 'number' && Number.isFinite(ext) ? ext : prev + delta;
         if (next >= totalDur) {
           setIsPlaying(false);
           audioManager.stopSpeech();
@@ -1212,6 +1235,11 @@ export const App: React.FC = () => {
             onApplyWordsAndBeats={handleApplyWordsAndBeats}
             visualMode={visualMode}
             onChangeVisualMode={setVisualMode}
+            registerPlaybackClock={registerPlaybackClock}
+            localSourceUrl={localSource && localSource.videoId === script.sourceYouTubeId ? localSource.url : undefined}
+            localSourceName={localSource && localSource.videoId === script.sourceYouTubeId ? localSource.name : undefined}
+            onSelectLocalSource={handleSelectLocalSource}
+            onClearLocalSource={handleClearLocalSource}
           />
         )}
       </main>

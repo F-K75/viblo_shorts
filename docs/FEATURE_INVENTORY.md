@@ -19,7 +19,8 @@ Legend: ✅ works end-to-end (executed) · ⚠️ works with documented limits �
 | Save project | ❌ new shorts reused sample id → silent 403 | ✅ | E2E test |
 | My Projects (list/open/duplicate/delete) | ❌ showed other users' data; no Esc | ✅ isolated; Esc closes | E2E + integration |
 | Browser export (MP4/WebM) | ❌ 33 s timeline exported as 10.6 s, no audio | ✅ duration matches timeline, audio track present | E2E asserts with ffprobe |
-| Export of YouTube-sourced clips | ❌ silently exported thumbnail only | ⚠️ limitation disclosed in UI (browser cannot record YouTube iframe) | Code review + UI |
+| Export of YouTube-sourced clips | ❌ silently exported thumbnail only | ✅ with user-uploaded source video (real footage + original audio, cut to clip); otherwise labelled captions-only | E2E (ffprobe: duration, frame content, audio level) |
+| Caption sync with YouTube audio | ❌ independent timer; handshake never completed, so captions ran ahead while the video buffered | ✅ official IFrame API; player is the master clock, captions hold while buffering | E2E with API stand-in (YouTube unreachable here) |
 | Server FFmpeg render + jobs | ⚠️ fake jobs; cancel didn't stop; retry faked success | ✅ real queue, kill on cancel, real retry | Integration tests |
 | Publishing pack (SRT/VTT, platform copy) | ✅ | ✅ | Integration test |
 | Google Drive export | 🔒 | 🔒 untested (OAuth + network) | — |

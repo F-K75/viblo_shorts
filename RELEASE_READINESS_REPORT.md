@@ -31,7 +31,7 @@ no features beyond what the code already promised.
 
 | Dimension | Initial | Final | Basis |
 |---|---:|---:|---|
-| Product functionality | 30 | 62 | Save and export were broken and are now fixed + E2E-tested. Real AI is unverified. YouTube-source export can't include footage |
+| Product functionality | 30 | 62 | Save and export were broken and are now fixed + E2E-tested. Real AI is unverified. YouTube-source export needs the user's own copy of the video |
 | Frontend and UX | 50 | 68 | Silent failures replaced by error/notice states; Escape on modals; mobile header fixed; misleading claims removed |
 | Backend engineering | 30 | 70 | Validation, error handler, atomic storage, real job queue, timeouts, graceful shutdown, server typechecked in CI |
 | AI engineering | 20 | 55 | Timeouts, bounded retries, schema validation, labelled fallbacks, no hallucinated transcripts, token/latency metrics. No real-model evaluation |
@@ -90,7 +90,7 @@ Initial scores reflect the measured baseline: header-spoofable admin access, sil
 | Sev | Issue |
 |---|---|
 | **P1** | Real Gemini behaviour (model ids `gemini-3.1-flash-lite`, `gemini-3.8-flash`, `gemini-3.8-flash-lite-tts`, output quality, latency, cost) is **unverified** — run `GEMINI_API_KEY=… npm run test:live` |
-| **P1** | Exports of YouTube-sourced clips cannot contain the original footage/audio (iframe capture is impossible; downloading conflicts with YouTube ToS). Disclosed in UI; needs a product decision |
+| P2 | YouTube-sourced exports need the user's own copy of the source video (uploaded locally; iframe capture is impossible and downloading conflicts with YouTube ToS). Without it the export is a labelled captions-only preview. Resolved per product decision on 2026-11-01; E2E-tested |
 | **P1** | Single-process JSON storage + in-memory limiter/queue: no horizontal scaling, no backups/PITR |
 | **P1** | No payment integration (billing intentionally disabled) |
 | P2 | No Content-Security-Policy |
@@ -100,7 +100,7 @@ Initial scores reflect the measured baseline: header-spoofable admin access, sil
 | P2 | Google Drive export and real Firebase sign-in untested |
 | P3 | Large `server.ts`/`App.tsx`; dead `YouTubeToClips.tsx`; mobile stepper hidden below `lg` |
 
-Breakdown of remaining: **P0: 0 · P1: 4 · P2: 5 · P3: 3** (details in `docs/TECHNICAL_DEBT.md`).
+Breakdown of remaining: **P0: 0 · P1: 3 · P2: 6 · P3: 3** (details in `docs/TECHNICAL_DEBT.md`).
 
 ## 5. Security assessment
 * AuthN: Firebase ID tokens verified server-side (signature, aud, iss, exp, iat); guest tokens HMAC-signed with timing-safe compare; production refuses to start without `SESSION_SECRET` (verified, exit 1).
@@ -147,7 +147,7 @@ Verified on GitHub: CI pipeline and Docker image build + smoke test pass. Not re
 
 ## 9. Release blockers (must clear before launch)
 1. Run `npm run test:live` with the production Gemini key; confirm model ids, output quality, latency and cost.
-2. Decide the YouTube-source export story (or reposition the product copy).
+2. ~~Decide the YouTube-source export story~~ — resolved: user-supplied source video upload (2026-11-01).
 3. Replace JSON storage with a managed DB, or explicitly accept single-instance operation with volume snapshots.
 4. Wire log shipping and alerting on `/api/ready` and error rate; add a deploy/rollback pipeline (CI and Docker build are already green).
 5. Integrate payments or remove paid-plan UI.
