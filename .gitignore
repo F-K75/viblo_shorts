@@ -1,10 +1,21 @@
+# dependencies / build output
+node_modules/
+dist/
+
+# runtime data (user projects, jobs, subscriptions, renders, session secret) — never commit
+data/
+
+# env / secrets
+.env
+.env.*
+!.env.example
+.dev.env.json
+
+# legacy python artefacts
 __pycache__/
 *.py[cod]
 .venv/
 venv/
-.env
-.env.*
-!.env.example
 output/
 *.mp4
 *.mp3

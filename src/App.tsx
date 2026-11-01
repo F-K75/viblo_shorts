@@ -52,6 +52,11 @@ import { GoogleDriveExportModal } from './components/GoogleDriveExportModal';
 import { BillingModal } from './components/BillingModal';
 import { MyProjectsModal } from './components/MyProjectsModal';
 import { PublishingPackModal } from './components/PublishingPackModal';
+import { apiFetch, apiErrorMessage, clearGuestSession } from './utils/api';
+import { auth } from './utils/googleDrive';
+import { signOut } from 'firebase/auth';
+
+const SAMPLE_PROJECT_ID = 'proj_sample_steve_jobs';
 
 const QUICK_TOPICS = [
   '5 productivity habits that actually work',
@@ -80,7 +85,24 @@ const SAMPLE_VIDEOS = [
 ];
 
 export const App: React.FC = () => {
-  const [currentPage, setCurrentPage] = useState<'home' | 'auth' | 'studio'>('home');
+  const [currentPage, setCurrentPageState] = useState<'home' | 'auth' | 'studio'>(() => {
+    try {
+      const saved = sessionStorage.getItem('forge_page');
+      const hasUser = Boolean(localStorage.getItem('forge_user'));
+      if (saved === 'studio' && hasUser) return 'studio';
+    } catch {
+      // ignore
+    }
+    return 'home';
+  });
+  const setCurrentPage = (page: 'home' | 'auth' | 'studio') => {
+    setCurrentPageState(page);
+    try {
+      sessionStorage.setItem('forge_page', page);
+    } catch {
+      // ignore
+    }
+  };
   const [authMode, setAuthMode] = useState<'signin' | 'signup'>('signin');
   const [currentUser, setCurrentUser] = useState<AuthUser | null>(() => {
     try {
@@ -102,6 +124,8 @@ export const App: React.FC = () => {
   const [isGenerating, setIsGenerating] = useState(false);
   const [generationStep, setGenerationStep] = useState<string>('');
   const [youtubeError, setYoutubeError] = useState<string | null>(null);
+  // Non-blocking notice shown when AI output is a template fallback or not grounded in a transcript.
+  const [aiNotice, setAiNotice] = useState<string | null>(null);
 
   const [script, setScript] = useState<ShortScript | null>(null);
   const [clipCandidates, setClipCandidates] = useState<YouTubeClipCandidate[]>([]);
@@ -146,7 +170,18 @@ export const App: React.FC = () => {
   const [currentProjectId, setCurrentProjectId] = useState<string | undefined>('proj_sample_steve_jobs');
   const [isSavingProject, setIsSavingProject] = useState(false);
   const [lastSavedMessage, setLastSavedMessage] = useState<string | null>(null);
-  const [userPlan, setUserPlan] = useState<'free' | 'pro' | 'studio'>('pro');
+  const [userPlan, setUserPlan] = useState<'free' | 'pro' | 'studio'>('free');
+  const [saveError, setSaveError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (currentPage !== 'studio' || !currentUser) return;
+    apiFetch('/api/user/subscription')
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => {
+        if (d?.subscription?.plan) setUserPlan(d.subscription.plan);
+      })
+      .catch(() => {});
+  }, [currentPage, currentUser?.id]);
 
   const playbackRaf = useRef<number | null>(null);
   const lastTimeRef = useRef<number>(0);
@@ -161,9 +196,12 @@ export const App: React.FC = () => {
     if (!script) return;
     setIsSavingProject(true);
     setLastSavedMessage(null);
+    setSaveError(null);
+    // The built-in sample is read-only: saving it (or anything derived from it) creates a new project.
+    const saveId = currentProjectId && currentProjectId !== SAMPLE_PROJECT_ID ? currentProjectId : undefined;
 
     const projectPayload: Partial<Project> = {
-      id: currentProjectId || `proj_${Date.now()}`,
+      id: saveId,
       title: script.title || topic || 'Untitled Short',
       topic,
       creationMode,
@@ -179,14 +217,10 @@ export const App: React.FC = () => {
     };
 
     try {
-      const activeUserId = currentUser?.id || 'default_user';
-      const res = await fetch('/api/projects', {
+      const res = await apiFetch('/api/projects', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-user-id': activeUserId,
-        },
-        body: JSON.stringify({ ...projectPayload, userId: activeUserId }),
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(projectPayload),
       });
 
       if (res.ok) {
@@ -198,12 +232,14 @@ export const App: React.FC = () => {
         } catch {
           // ignore localStorage quota errors
         }
-        setLastSavedMessage('Saved to database!');
+        setLastSavedMessage('Saved');
         setTimeout(() => setLastSavedMessage(null), 3000);
+      } else {
+        setSaveError(await apiErrorMessage(res, 'Save failed'));
       }
     } catch (err) {
       console.error('Save failed:', err);
-      setLastSavedMessage('Save error');
+      setSaveError('Save failed: could not reach the server. Your work is still open — try again.');
     } finally {
       setIsSavingProject(false);
     }
@@ -406,10 +442,12 @@ export const App: React.FC = () => {
     setIsGenerating(true);
     setIsPlaying(false);
     audioManager.stopAll();
+    setYoutubeError(null);
+    setAiNotice(null);
 
     try {
       setGenerationStep('Gemini composing high-retention hook, script beats, and visual cues...');
-      const scriptRes = await fetch('/api/generate-script', {
+      const scriptRes = await apiFetch('/api/generate-script', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -420,10 +458,16 @@ export const App: React.FC = () => {
       });
 
       if (!scriptRes.ok) {
-        throw new Error('Failed to generate script');
+        throw new Error(await apiErrorMessage(scriptRes, 'Failed to generate script'));
       }
 
       const scriptData = await scriptRes.json();
+      if (!Array.isArray(scriptData.beats) || scriptData.beats.length === 0) {
+        throw new Error('The generated script was empty. Please try a different topic.');
+      }
+      if (scriptData.isFallback) {
+        setAiNotice(scriptData.fallbackMessage || 'AI was unavailable, so a built-in template script was used.');
+      }
 
       setGenerationStep('Synthesizing speech & word timestamps for kinetic captions...');
       const fullText = scriptData.beats.map((b: any) => b.text).join(' ');
@@ -436,7 +480,7 @@ export const App: React.FC = () => {
       const finalBeats: Beat[] = await Promise.all(
         timedBeats.map(async (beat) => {
           try {
-            const fRes = await fetch('/api/stock-footage', {
+            const fRes = await apiFetch('/api/stock-footage', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ query: beat.visual_keywords }),
@@ -463,11 +507,11 @@ export const App: React.FC = () => {
         description: scriptData.description || 'Watch to learn more.',
         hashtags: scriptData.hashtags || ['#shorts', '#viral'],
         beats: finalBeats,
-        viralScore: 96,
-        clipReasoning: 'Structured narrative arc engineered for full watch-time completion.',
+        clipReasoning: scriptData.isFallback ? 'Template script (AI unavailable).' : `Generated by ${scriptData.llm || 'AI'}.`,
       };
 
       setScript(newScript);
+      setCurrentProjectId(undefined); // a newly generated Short is a new project
       const accurateWords = recalculateWordsFromBeats(finalBeats);
       setAllWords(accurateWords);
       setCurrentTimestamp(0);
@@ -478,8 +522,7 @@ export const App: React.FC = () => {
           id: `strategy-prompt-${Date.now()}`,
           clipTitle: scriptData.title || selectedTopic,
           hook: newScript.hook,
-          viralScore: 96,
-          reasoning: 'Generated full retention arc with hook, tension, and resolution.',
+          reasoning: scriptData.isFallback ? 'Template script — configure GEMINI_API_KEY for AI-written scripts.' : 'AI-generated script with hook, tension, and resolution.',
           startSeconds: 0,
           endSeconds: finalBeats[finalBeats.length - 1]?.end_s || 30,
           approxStartTimestamp: '00:00',
@@ -492,8 +535,9 @@ export const App: React.FC = () => {
 
       // Automatically transition to Page 2 (Clip Strategies & Trimmer)
       setStudioStep(2);
-    } catch (err) {
+    } catch (err: any) {
       console.error('Generation failed:', err);
+      setYoutubeError(err?.message || 'Script generation failed. Please try again.');
     } finally {
       setIsGenerating(false);
       setGenerationStep('');
@@ -505,18 +549,18 @@ export const App: React.FC = () => {
     setIsPlaying(false);
     audioManager.stopAll();
     setYoutubeError(null);
+    setAiNotice(null);
 
     try {
       setGenerationStep('Fetching YouTube video metadata...');
-      const infoRes = await fetch('/api/youtube/info', {
+      const infoRes = await apiFetch('/api/youtube/info', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url }),
       });
 
       if (!infoRes.ok) {
-        const errJson = await infoRes.json().catch(() => ({}));
-        throw new Error(errJson.error || 'Could not fetch YouTube video details');
+        throw new Error(await apiErrorMessage(infoRes, 'Could not fetch YouTube video details'));
       }
 
       const infoData: YouTubeVideoInfo = await infoRes.json();
@@ -524,7 +568,7 @@ export const App: React.FC = () => {
       setTopic(infoData.title);
 
       setGenerationStep('Gemini analyzing viral moments and high-retention clip strategies...');
-      const genRes = await fetch('/api/youtube/generate-clips', {
+      const genRes = await apiFetch('/api/youtube/generate-clips', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -535,8 +579,7 @@ export const App: React.FC = () => {
       });
 
       if (!genRes.ok) {
-        const errJson = await genRes.json().catch(() => ({}));
-        throw new Error(errJson.error || 'Failed to generate viral clips from this video.');
+        throw new Error(await apiErrorMessage(genRes, 'Failed to generate clips from this video.'));
       }
 
       const genData = await genRes.json();
@@ -544,7 +587,9 @@ export const App: React.FC = () => {
         throw new Error(genData.error || 'No clips found');
       }
 
+      setAiNotice(genData.fallbackMessage ? `${genData.fallbackMessage} ${genData.groundingWarning || ''}`.trim() : genData.groundingWarning || null);
       setClipCandidates(genData.clips);
+      setCurrentProjectId(undefined);
       if (genData.videoInfo) {
         setVideoInfo(genData.videoInfo);
       }
@@ -860,16 +905,17 @@ export const App: React.FC = () => {
     <div className="min-h-screen bg-[#090c10] text-[#f1f5f9] flex flex-col selection:bg-rose-500 selection:text-white">
       {/* Top Bar Navigation */}
       <header className="sticky top-0 z-40 bg-[#090c10]/90 backdrop-blur-md border-b border-white/8">
-        <div className="max-w-7xl mx-auto px-6 h-16 flex items-center justify-between">
+        <div className="max-w-7xl mx-auto px-3 sm:px-6 h-16 flex items-center justify-between gap-2">
           {/* Brand Wordmark with Home Action */}
           <button
             onClick={() => setCurrentPage('home')}
+            aria-label="Forge Studio home"
             className="flex items-center gap-2.5 text-left group"
           >
             <div className="w-8 h-8 rounded-lg bg-rose-600 flex items-center justify-center text-white font-bold shadow-md shadow-rose-950/50">
               <Youtube className="w-4 h-4 fill-current" />
             </div>
-            <span className="font-display text-lg font-bold tracking-tight text-white group-hover:text-rose-400 transition select-none">
+            <span className="hidden sm:inline font-display text-lg font-bold tracking-tight text-white group-hover:text-rose-400 transition select-none">
               Forge Studio
             </span>
           </button>
@@ -929,7 +975,7 @@ export const App: React.FC = () => {
           </nav>
 
           {/* User Profile & Actions */}
-          <div className="flex items-center gap-2 shrink-0">
+          <div className="flex items-center gap-1.5 sm:gap-2 min-w-0">
             {currentUser ? (
               <div className="flex items-center gap-1.5 bg-black/40 border border-white/8 px-2 py-1 rounded-xl">
                 <img
@@ -941,15 +987,20 @@ export const App: React.FC = () => {
                   {currentUser.name}
                 </span>
                 <span className="text-[10px] font-mono text-emerald-400 bg-emerald-950/60 px-1 rounded uppercase font-bold">
-                  {currentUser.plan}
+                  {userPlan}
                 </span>
                 <button
                   onClick={() => {
                     setCurrentUser(null);
                     localStorage.removeItem('viblo_user');
                     localStorage.removeItem('forge_user');
+                    localStorage.removeItem('forge_active_project');
+                    clearGuestSession();
+                    signOut(auth).catch(() => {});
                     setCurrentPage('home');
                   }}
+                  aria-label="Sign out"
+
                   className="text-neutral-400 hover:text-rose-400 p-0.5 rounded transition ml-0.5"
                   title="Sign out & return to home"
                 >
@@ -973,9 +1024,10 @@ export const App: React.FC = () => {
               onClick={() => setIsBillingOpen(true)}
               className="px-2.5 py-1.5 text-xs font-semibold text-amber-300 bg-amber-500/10 border border-amber-500/25 hover:bg-amber-500/20 rounded-xl flex items-center gap-1.5 transition"
               title="Manage subscription and generation quotas"
+              aria-label="Plans and usage"
             >
               <Zap className="w-3.5 h-3.5 text-amber-400 fill-current" />
-              <span className="hidden md:inline">Pro Plan</span>
+              <span className="hidden md:inline">{userPlan === 'free' ? 'Plans & Usage' : `${userPlan === 'studio' ? 'Studio' : 'Pro'} Plan`}</span>
             </button>
 
             {/* My Projects Dashboard Modal Trigger */}
@@ -983,6 +1035,7 @@ export const App: React.FC = () => {
               onClick={() => setIsMyProjectsOpen(true)}
               className="px-2.5 py-1.5 text-xs font-medium text-neutral-300 hover:text-white rounded-xl border border-white/8 bg-black/40 hover:bg-white/6 flex items-center gap-1.5 transition"
               title="View and load saved projects"
+              aria-label="My projects"
             >
               <FolderKanban className="w-3.5 h-3.5 text-rose-400" />
               <span className="hidden md:inline">Projects</span>
@@ -995,6 +1048,7 @@ export const App: React.FC = () => {
                 disabled={isSavingProject}
                 className="px-3 py-1.5 text-xs font-semibold text-white bg-rose-600 hover:bg-rose-500 rounded-xl transition flex items-center gap-1.5 shadow-md shadow-rose-950/40 disabled:opacity-50"
                 title="Save current project to database"
+              aria-label="Save project"
               >
                 {isSavingProject ? (
                   <Loader2 className="w-3.5 h-3.5 animate-spin" />
@@ -1008,6 +1062,8 @@ export const App: React.FC = () => {
             {/* Quick Export to Google Drive Button in Topbar */}
             <button
               onClick={() => setIsDriveModalOpen(true)}
+              aria-label="Export to Google Drive"
+              title="Export to Google Drive"
               className="px-3 py-1.5 text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-500 rounded-xl transition whitespace-nowrap shadow-sm flex items-center gap-1.5"
             >
               <CloudUpload className="w-3.5 h-3.5" />
@@ -1041,10 +1097,29 @@ export const App: React.FC = () => {
           <div className="flex items-center gap-2 text-[11px] text-neutral-500 shrink-0">
             <span>Stage: {studioStep === 1 ? '1. Source & Idea' : studioStep === 2 ? '2. Clip Strategies & Trimmer' : '3. Studio Canvas & Timeline'}</span>
             <span aria-hidden="true">·</span>
-            <span className="text-emerald-400 font-mono">Cloud Database Active</span>
+            <span className={currentProjectId && currentProjectId !== SAMPLE_PROJECT_ID ? 'text-emerald-400 font-mono' : 'text-neutral-500 font-mono'}>
+              {currentProjectId && currentProjectId !== SAMPLE_PROJECT_ID ? 'Saved project' : 'Not saved yet'}
+            </span>
           </div>
         </div>
       </div>
+
+      {(saveError || aiNotice) && (
+        <div className="max-w-7xl w-full mx-auto px-4 sm:px-6 pt-4 space-y-2">
+          {saveError && (
+            <div role="alert" className="flex items-start justify-between gap-3 rounded-xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-xs text-rose-200">
+              <span>{saveError}</span>
+              <button onClick={() => setSaveError(null)} className="text-rose-300 hover:text-white" aria-label="Dismiss save error">✕</button>
+            </div>
+          )}
+          {aiNotice && (
+            <div role="status" className="flex items-start justify-between gap-3 rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-xs text-amber-100">
+              <span>{aiNotice}</span>
+              <button onClick={() => setAiNotice(null)} className="text-amber-300 hover:text-white" aria-label="Dismiss notice">✕</button>
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Main Studio Body: Render 3 Distinct Pages Based on studioStep */}
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 py-8">
@@ -1171,7 +1246,6 @@ export const App: React.FC = () => {
         onLoadProject={handleLoadProject}
         onNewProject={handleNewProject}
         currentProjectId={currentProjectId}
-        userId={currentUser?.id || 'default_user'}
       />
 
       {/* Multi-Platform Social Publishing Pack Modal (Phase 2 & 5) */}

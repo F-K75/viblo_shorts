@@ -1,3 +1,4 @@
+import { apiFetch } from './api';
 /**
  * Production-ready Web Audio and TTS manager.
  * Provides synthesized royalty-free background music, Gemini Neural TTS decoding,
@@ -79,11 +80,33 @@ class AudioManager {
     return this.ctx;
   }
 
+  /** Resumes the AudioContext and reports whether audio is actually running (needed for export audio). */
+  public async ensureRunning(): Promise<boolean> {
+    const ctx = this.initContext();
+    if (!ctx) return false;
+    try {
+      if (ctx.state !== 'running') await ctx.resume();
+    } catch {
+      // ignore
+    }
+    return ctx.state === 'running';
+  }
+
   public getExportAudioStream(): MediaStreamTrack | null {
     const ctx = this.initContext();
     if (!ctx) return null;
     if (!this.exportDestination) {
       this.exportDestination = ctx.createMediaStreamDestination();
+      // Keep-alive: a silent constant source guarantees the export audio track always carries samples.
+      // Without it, an idle/suspended graph yields an empty audio track and the MP4 muxer stalls video frames.
+      try {
+        const keepAlive = ctx.createConstantSource();
+        keepAlive.offset.value = 0;
+        keepAlive.connect(this.exportDestination);
+        keepAlive.start();
+      } catch {
+        // ConstantSourceNode unsupported: fall back to whatever sources are connected
+      }
     }
     if (this.musicGainNode) {
       try {
@@ -296,7 +319,7 @@ class AudioManager {
 
       if (!blobUrl) {
         try {
-          const res = await fetch('/api/tts', {
+          const res = await apiFetch('/api/tts', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ text, voice: voiceName }),

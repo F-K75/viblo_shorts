@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { useEscapeKey } from '../utils/useEscapeKey';
 import {
   Share2,
   X,
@@ -14,6 +15,7 @@ import {
   CheckCircle2,
 } from 'lucide-react';
 import { ShortScript, PublishingPlatform, PlatformPublishingPack } from '../types';
+import { apiFetch } from '../utils/api';
 
 interface PublishingPackModalProps {
   isOpen: boolean;
@@ -42,7 +44,7 @@ export const PublishingPackModal: React.FC<PublishingPackModalProps> = ({
   const fetchPublishingPack = async (targetPlatform: PublishingPlatform) => {
     setLoading(true);
     try {
-      const res = await fetch('/api/publish/generate-pack', {
+      const res = await apiFetch('/api/publish/generate-pack', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -79,6 +81,8 @@ export const PublishingPackModal: React.FC<PublishingPackModalProps> = ({
     a.click();
     URL.revokeObjectURL(url);
   };
+
+  useEscapeKey(isOpen, onClose);
 
   if (!isOpen) return null;
 

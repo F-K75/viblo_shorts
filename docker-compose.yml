@@ -1,0 +1,24 @@
+services:
+  forge-studio:
+    build: .
+    ports:
+      - "3000:3000"
+    env_file: .env
+    environment:
+      NODE_ENV: production
+      DATA_DIR: /data
+    volumes:
+      - forge-data:/data
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 1g
+volumes:
+  forge-data:

@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { useEscapeKey } from '../utils/useEscapeKey';
 import {
   Zap,
   Check,
@@ -14,6 +15,7 @@ import {
   Loader2,
 } from 'lucide-react';
 import { UserSubscription } from '../types';
+import { apiFetch, apiErrorMessage } from '../utils/api';
 
 interface BillingModalProps {
   isOpen: boolean;
@@ -26,6 +28,7 @@ export const BillingModal: React.FC<BillingModalProps> = ({
   onClose,
   onPlanChanged,
 }) => {
+  const [upgradeError, setUpgradeError] = useState<string | null>(null);
   const [subscription, setSubscription] = useState<UserSubscription | null>(null);
   const [loading, setLoading] = useState(false);
   const [upgradingPlan, setUpgradingPlan] = useState<'free' | 'pro' | 'studio' | null>(null);
@@ -39,7 +42,7 @@ export const BillingModal: React.FC<BillingModalProps> = ({
 
   const fetchSubscription = async () => {
     try {
-      const res = await fetch('/api/user/subscription');
+      const res = await apiFetch('/api/user/subscription');
       if (res.ok) {
         const data = await res.json();
         if (data.subscription) {
@@ -57,16 +60,22 @@ export const BillingModal: React.FC<BillingModalProps> = ({
     setSuccessMessage(null);
 
     try {
-      const res = await fetch('/api/user/subscription/upgrade', {
+      const res = await apiFetch('/api/user/subscription/upgrade', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ plan: targetPlan }),
       });
 
-      if (res.ok) {
+      if (!res.ok) {
+        setSuccessMessage(null);
+        setUpgradeError(await apiErrorMessage(res, 'Plan change failed'));
+        return;
+      }
+      {
         const data = await res.json();
         setSubscription(data.subscription);
-        setSuccessMessage(`Successfully switched to ${targetPlan === 'studio' ? 'Studio Team' : targetPlan === 'pro' ? 'Creator Pro' : 'Free Starter'} plan!`);
+        setUpgradeError(null);
+        setSuccessMessage(`${data.demo ? '[Demo billing — no payment taken] ' : ''}Switched to ${targetPlan === 'studio' ? 'Studio Team' : targetPlan === 'pro' ? 'Creator Pro' : 'Free Starter'} plan!`);
         onPlanChanged?.(targetPlan);
         setTimeout(() => setSuccessMessage(null), 4000);
       }
@@ -78,13 +87,15 @@ export const BillingModal: React.FC<BillingModalProps> = ({
     }
   };
 
+  useEscapeKey(isOpen, onClose);
+
   if (!isOpen) return null;
 
-  const currentPlan = subscription?.plan || 'pro';
+  const currentPlan = subscription?.plan || 'free';
   const dailyUsed = subscription?.dailyQuotaUsed || 0;
-  const dailyLimit = subscription?.dailyQuotaLimit || 250;
-  const renderUsed = subscription?.monthlyRenderMinutesUsed || 14;
-  const renderLimit = subscription?.monthlyRenderMinutesLimit || 120;
+  const dailyLimit = subscription?.dailyQuotaLimit || 50;
+  const renderUsed = subscription?.monthlyRenderMinutesUsed || 0;
+  const renderLimit = subscription?.monthlyRenderMinutesLimit || 10;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-md animate-in fade-in duration-200">
@@ -151,6 +162,11 @@ export const BillingModal: React.FC<BillingModalProps> = ({
           </div>
         </div>
 
+        {upgradeError && (
+          <div role="alert" className="mb-4 rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-xs text-amber-100">
+            {upgradeError}
+          </div>
+        )}
         {successMessage && (
           <div className="mb-6 p-3 rounded-xl bg-emerald-500/10 border border-emerald-500/20 text-emerald-300 text-xs flex items-center gap-2">
             <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />

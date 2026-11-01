@@ -174,7 +174,7 @@ export const StudioPage2ClipStrategies: React.FC<StudioPage2ClipStrategiesProps>
                       </div>
                       <div className="flex items-center gap-1.5 px-2 py-0.5 rounded bg-amber-500/10 border border-amber-500/20 text-amber-300 font-mono text-[11px] font-bold">
                         <Flame className="w-3 h-3 text-amber-400" />
-                        <span>{cand.viralScore || 95}/100</span>
+                        <span>{typeof cand.viralScore === "number" && cand.viralScore > 0 ? `${cand.viralScore}/100` : "Unscored"}</span>
                       </div>
                     </div>
 

@@ -22,6 +22,7 @@ import {
   updateProfile,
 } from 'firebase/auth';
 import { auth } from '../utils/googleDrive';
+import { ensureGuestSession, clearGuestSession } from '../utils/api';
 
 export interface AuthUser {
   id: string;
@@ -91,8 +92,9 @@ export const AuthPage: React.FC<AuthPageProps> = ({
           name: displayName,
           email: cred.user.email || cleanEmail,
           avatar: cred.user.photoURL || `https://api.dicebear.com/7.x/bottts/svg?seed=${encodeURIComponent(cred.user.uid)}`,
-          plan: 'pro',
+          plan: 'free',
         };
+        clearGuestSession();
         setIsLoading(false);
         onSuccess(user);
       } else {
@@ -103,8 +105,9 @@ export const AuthPage: React.FC<AuthPageProps> = ({
           name: displayName,
           email: cred.user.email || cleanEmail,
           avatar: cred.user.photoURL || `https://api.dicebear.com/7.x/bottts/svg?seed=${encodeURIComponent(cred.user.uid)}`,
-          plan: 'pro',
+          plan: 'free',
         };
+        clearGuestSession();
         setIsLoading(false);
         onSuccess(user);
       }
@@ -140,10 +143,11 @@ export const AuthPage: React.FC<AuthPageProps> = ({
       const user: AuthUser = {
         id: cred.user.uid,
         name: displayName,
-        email: cred.user.email || 'creator@google.com',
+        email: cred.user.email || '',
         avatar: cred.user.photoURL || `https://api.dicebear.com/7.x/bottts/svg?seed=${encodeURIComponent(cred.user.uid)}`,
-        plan: 'pro',
+        plan: 'free',
       };
+      clearGuestSession();
       setIsLoading(false);
       onSuccess(user);
     } catch (err: any) {
@@ -160,15 +164,25 @@ export const AuthPage: React.FC<AuthPageProps> = ({
     }
   };
 
-  const handleGuestSignIn = () => {
-    const user: AuthUser = {
-      id: `guest_${Date.now()}`,
-      name: 'Guest Creator',
-      email: 'guest@forge.studio',
-      avatar: 'https://api.dicebear.com/7.x/bottts/svg?seed=guest',
-      plan: 'free',
-    };
-    onSuccess(user);
+  const handleGuestSignIn = async () => {
+    setIsLoading(true);
+    setError(null);
+    try {
+      // The server issues a signed guest session; the guest id is never chosen by the client.
+      const { userId } = await ensureGuestSession();
+      const user: AuthUser = {
+        id: userId,
+        name: 'Guest Creator',
+        email: '',
+        avatar: `https://api.dicebear.com/7.x/bottts/svg?seed=${encodeURIComponent(userId)}`,
+        plan: 'free',
+      };
+      onSuccess(user);
+    } catch (err: any) {
+      setError(err?.message || 'Could not start a guest session. Please try again.');
+    } finally {
+      setIsLoading(false);
+    }
   };
 
   return (
