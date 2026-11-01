@@ -8,11 +8,12 @@
     "build": "tsc --noEmit && tsc --noEmit -p tsconfig.node.json && vite build",
     "start": "NODE_ENV=production tsx server.ts",
     "test": "tsx --test tests/*.test.ts",
-    "test:unit": "tsx --test tests/security.test.ts tests/youtube.test.ts tests/pipeline.test.ts tests/auth_llm_storage.test.ts",
+    "test:unit": "tsx --test tests/security.test.ts tests/youtube.test.ts tests/pipeline.test.ts tests/auth_llm_storage.test.ts tests/storage_backup.test.ts",
     "test:e2e": "tsx --test tests/e2e/*.test.ts",
     "test:live": "tsx --test tests/llm.live.test.ts",
     "test:load": "tsx scripts/loadtest.ts",
-    "lint": "tsc --noEmit && tsc --noEmit -p tsconfig.node.json"
+    "lint": "tsc --noEmit && tsc --noEmit -p tsconfig.node.json",
+    "backup": "tsx scripts/backup.ts"
   },
   "dependencies": {
     "@google/genai": "^2.24.0",
