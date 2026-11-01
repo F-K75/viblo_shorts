@@ -27,9 +27,15 @@ import {
   estimateSentenceBeats,
 } from './server/lib/youtube.ts';
 import { AuthService, resolveSessionSecret, type AuthIdentity } from './server/lib/auth.ts';
-import { readJsonFile, writeJsonFileAtomic, StoreUnavailableError, freeDiskBytes } from './server/lib/storage.ts';
-import { ProjectStore, StoreLimitError } from './server/lib/projectStore.ts';
-import { UsageLedger, utcDay } from './server/lib/usage.ts';
+import os from 'os';
+import { StoreUnavailableError, freeDiskBytes } from './server/lib/storage.ts';
+import { StoreLimitError } from './server/lib/projectStore.ts';
+import { utcDay } from './server/lib/usage.ts';
+import { JsonRepo } from './server/lib/jsonRepo.ts';
+import { ProjectOwnershipError, type Repo, type ServerJob, type StoredSubscription } from './server/lib/repo.ts';
+import { PostgresRepo } from './server/db/pgRepo.ts';
+import { createPool, isUnavailable } from './server/db/pool.ts';
+import { migrate } from './server/db/migrate.ts';
 import { createSnapshot, listSnapshots, pruneSnapshots, writeServerLock, removeServerLock } from './server/lib/backup.ts';
 import { cleanAndParseJSON, validateScript, normalizeHashtags, quoteUserInput } from './server/lib/llm.ts';
 
@@ -98,8 +104,6 @@ function loadFirebaseProjectId(): string | undefined {
 }
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
-const SUBSCRIPTIONS_FILE = path.join(DATA_DIR, 'subscriptions.json');
-const JOBS_FILE = path.join(DATA_DIR, 'jobs.json');
 const RENDERS_DIR = path.join(DATA_DIR, 'renders');
 fs.mkdirSync(RENDERS_DIR, { recursive: true });
 
@@ -110,11 +114,61 @@ if (!trustProxy.ok) {
   process.exit(1);
 }
 
-const projectStore = new ProjectStore(DATA_DIR, BACKUP_DIR, STORE_LIMITS);
-const migrationReport = projectStore.init();
-const usageLedger = new UsageLedger(path.join(DATA_DIR, 'usage.json'), IS_TEST ? 50 : 1000);
-if (!usageLedger.available) {
-  console.error(JSON.stringify({ level: 'error', event: 'usage_ledger_unavailable', reason: usageLedger.reason }));
+// ---------- storage backend (ADR-001/003) ----------
+// postgres: production (multi-instance safe). json: Phase 1 single-instance files (development default and the
+// rollback target). Production must state its choice: DATABASE_URL, or STORAGE_BACKEND=json to explicitly accept
+// single-instance JSON storage.
+const DATABASE_URL = process.env.DATABASE_URL?.trim() || '';
+const STORAGE_BACKEND: 'postgres' | 'json' = (() => {
+  const v = (process.env.STORAGE_BACKEND || '').trim().toLowerCase();
+  if (v && v !== 'postgres' && v !== 'json') {
+    console.error(`[Config] STORAGE_BACKEND must be "postgres" or "json" (got "${v}").`);
+    process.exit(1);
+  }
+  if (v === 'postgres' || (!v && DATABASE_URL)) {
+    if (!DATABASE_URL) {
+      console.error('[Config] STORAGE_BACKEND=postgres requires DATABASE_URL.');
+      process.exit(1);
+    }
+    return 'postgres';
+  }
+  if (!v && IS_PROD) {
+    console.error('[Config] Production requires DATABASE_URL (PostgreSQL). To run single-instance JSON storage anyway, set STORAGE_BACKEND=json explicitly.');
+    process.exit(1);
+  }
+  return 'json';
+})();
+const INSTANCE_ID = `${os.hostname()}:${process.pid}:${crypto.randomBytes(3).toString('hex')}`;
+let repo: Repo; // assigned in initStorage() before the server listens
+let jsonMigrationNote = '';
+
+async function initStorage(): Promise<void> {
+  if (STORAGE_BACKEND === 'json') {
+    const r = new JsonRepo(DATA_DIR, BACKUP_DIR, STORE_LIMITS, IS_TEST ? 50 : 1000);
+    const report = r.init();
+    if (report.migrated) jsonMigrationNote = ` (migrated ${report.records} from legacy file; snapshot ${report.snapshot})`;
+    if (!r.ledger.available) console.error(JSON.stringify({ level: 'error', event: 'usage_ledger_unavailable', reason: r.ledger.reason }));
+    repo = r;
+    return;
+  }
+  const pool = createPool(DATABASE_URL, { applicationName: `forge-studio:${INSTANCE_ID}` });
+  // Retry while the database comes up (container start order, failover); give up and exit for the orchestrator.
+  for (let attempt = 1; ; attempt++) {
+    try {
+      if (process.env.DATABASE_MIGRATE_ON_START !== 'false') {
+        const m = await migrate(pool); // advisory-locked: safe when several instances start together
+        if (m.applied.length) console.log(JSON.stringify({ level: 'info', event: 'schema_migrated', applied: m.applied, version: m.current }));
+      } else {
+        await pool.query('SELECT 1');
+      }
+      break;
+    } catch (err: any) {
+      if (!isUnavailable(err) || attempt >= envNum('DATABASE_STARTUP_RETRIES', 10, 1)) throw err;
+      console.warn(JSON.stringify({ level: 'warn', event: 'database_not_ready', attempt, error: String(err?.message || err).slice(0, 200) }));
+      await new Promise((r) => setTimeout(r, Math.min(5000, 300 * 2 ** attempt)));
+    }
+  }
+  repo = new PostgresRepo(pool, STORE_LIMITS);
 }
 
 const authService = new AuthService(
@@ -248,102 +302,79 @@ const isAdmin = (req: express.Request) => Boolean(req.identity?.isAdmin);
 // ==========================================
 // RATE LIMITING & AI QUOTA
 // ==========================================
-interface Bucket {
-  tokens: number;
-  lastRefill: number;
-}
-const rateBuckets = new Map<string, Bucket>();
 const IP_DAILY_AI_CAP = envNum('IP_DAILY_AI_CAP', 600, 1);
 
 const clientIp = (req: express.Request) => req.ip || req.socket.remoteAddress || 'unknown';
 
-function refillBucket(key: string, max: number, now: number): Bucket {
-  let b = rateBuckets.get(key);
-  if (!b) {
-    b = { tokens: max, lastRefill: now };
-    rateBuckets.set(key, b);
-  }
-  b.tokens = Math.min(max, b.tokens + ((now - b.lastRefill) / 60000) * max);
-  b.lastRefill = now;
-  return b;
-}
-
 /**
  * Token buckets per route group, keyed by verified user id AND by client IP (FS-008): behind a correctly
  * configured proxy the IP bucket stops one IP farming guest accounts; the user bucket keeps limits per person
- * even when many users share an IP. AI routes additionally reserve one unit of the persistent daily quota;
- * the unit is refunded when the handler does not mark a real model success (FS-007).
+ * even when many users share an IP. Buckets live in the Repo, so with PostgreSQL every instance shares them.
+ * AI routes additionally reserve one unit of the persistent daily quota; the unit is refunded when the
+ * handler does not mark a real model success (FS-007).
  */
 function rateLimit(group: string, maxPerMinute: number, opts: { ai?: boolean } = {}) {
-  return (req: express.Request, res: express.Response, next: express.NextFunction) => {
-    try {
-      const now = Date.now();
-      const ip = clientIp(req);
-      const buckets: Bucket[] = [refillBucket(`${group}:ip:${ip}`, req.identity ? maxPerMinute * IP_RATE_MULTIPLIER : maxPerMinute, now)];
-      if (req.identity) buckets.unshift(refillBucket(`${group}:user:${req.identity.userId}`, maxPerMinute, now));
-      if (buckets.some((b) => b.tokens < 1)) {
-        res.setHeader('Retry-After', String(Math.ceil(60 / maxPerMinute)));
-        return res.status(429).json({ error: 'Too many requests. Please wait a moment before trying again.', rateLimited: true });
-      }
-      if (opts.ai && req.identity) {
-        const userId = req.identity.userId;
-        const sub = getUserSubscription(userId);
-        const userKey = `user:${userId}`;
-        const ipKey = `ip:${ip}`;
-        const r = usageLedger.reserve([
+  return async (req: express.Request, res: express.Response, next: express.NextFunction) => {
+    const ip = clientIp(req);
+    const buckets = [{ key: `${group}:ip:${ip}`, max: req.identity ? maxPerMinute * IP_RATE_MULTIPLIER : maxPerMinute }];
+    if (req.identity) buckets.unshift({ key: `${group}:user:${req.identity.userId}`, max: maxPerMinute });
+    const taken = await repo.takeRateTokens(buckets);
+    if (!taken.ok) {
+      res.setHeader('Retry-After', String(Math.ceil(60 / maxPerMinute)));
+      return res.status(429).json({ error: 'Too many requests. Please wait a moment before trying again.', rateLimited: true });
+    }
+    res.setHeader('X-RateLimit-Remaining', String(Math.max(0, taken.remaining)));
+    if (opts.ai && req.identity) {
+      const userId = req.identity.userId;
+      const sub = await getUserSubscription(userId);
+      const userKey = `user:${userId}`;
+      const ipKey = `ip:${ip}`;
+      const day = utcDay();
+      const r = await repo.reserveAi(
+        [
           { key: userKey, limit: sub.dailyQuotaLimit },
           { key: ipKey, limit: IP_DAILY_AI_CAP },
-        ]);
-        if (!r.ok) {
-          return res.status(429).json({
-            error:
-              r.key === userKey
-                ? `Daily AI generation quota (${sub.dailyQuotaLimit} calls) reached. Quota resets at 00:00 UTC.`
-                : 'Daily AI limit for your network reached. Quota resets at 00:00 UTC.',
-            quotaExceeded: true,
+        ],
+        day,
+      );
+      if (!r.ok) {
+        return res.status(429).json({
+          error:
+            r.key === userKey
+              ? `Daily AI generation quota (${sub.dailyQuotaLimit} calls) reached. Quota resets at 00:00 UTC.`
+              : 'Daily AI limit for your network reached. Quota resets at 00:00 UTC.',
+          quotaExceeded: true,
+        });
+      }
+      req.aiReservation = { keys: [userKey, ipKey], day };
+      // Refund when the full response was sent without a real model result (fallback, validation error,
+      // provider failure). A request aborted by the client keeps its charge: the model may still have run.
+      res.on('close', () => {
+        if (!req.aiSucceeded && res.writableFinished) {
+          repo.refundAi([userKey, ipKey], day).catch((err) => {
+            console.error(JSON.stringify({ level: 'error', event: 'ai_refund_failed', error: String(err?.message || err) }));
           });
         }
-        const day = utcDay();
-        req.aiReservation = { keys: [userKey, ipKey], day };
-        // Refund when the full response was sent without a real model result (fallback, validation error,
-        // provider failure). A request aborted by the client keeps its charge: the model may still have run.
-        res.on('close', () => {
-          if (!req.aiSucceeded && res.writableFinished) usageLedger.refund([userKey, ipKey], day);
-        });
-        res.setHeader('X-Daily-Quota-Remaining', String(Math.max(0, sub.dailyQuotaLimit - usageLedger.peek(userKey))));
-      }
-      for (const b of buckets) b.tokens -= 1;
-      res.setHeader('X-RateLimit-Remaining', String(Math.floor(Math.min(...buckets.map((b) => b.tokens)))));
-      next();
-    } catch (err) {
-      next(err);
+      });
+      res.setHeader('X-Daily-Quota-Remaining', String(Math.max(0, sub.dailyQuotaLimit - (await repo.peekAi(userKey, day)))));
     }
+    next();
   };
 }
 
 // Guest sessions are free to mint, so they also have a global hourly budget (FS-001): spoofed or rotating IPs
-// cannot create unbounded accounts (each of which can store data and consume AI quota).
-const guestMintWindow = { hour: -1, count: 0 };
-function guestMintBudget(_req: express.Request, res: express.Response, next: express.NextFunction) {
+// cannot create unbounded accounts. Shared across instances via the Repo.
+let guestMintsThisHour = 0;
+async function guestMintBudget(_req: express.Request, res: express.Response, next: express.NextFunction) {
   const hour = Math.floor(Date.now() / 3600000);
-  if (guestMintWindow.hour !== hour) {
-    guestMintWindow.hour = hour;
-    guestMintWindow.count = 0;
-  }
-  if (guestMintWindow.count >= GUEST_MINT_PER_HOUR) {
+  const w = await repo.incrementWindow('guest-mint', hour, GUEST_MINT_PER_HOUR);
+  guestMintsThisHour = w.count;
+  if (!w.ok) {
     res.setHeader('Retry-After', String(3600 - Math.floor((Date.now() % 3600000) / 1000)));
     return res.status(429).json({ error: 'Guest sign-ups are temporarily paused because of high demand. Please create a free account or try again later.', code: 'guest_capacity' });
   }
-  guestMintWindow.count++;
   next();
 }
-
-// Prevent unbounded growth of in-memory limiter state.
-const limiterSweep = setInterval(() => {
-  const now = Date.now();
-  for (const [k, b] of rateBuckets) if (now - b.lastRefill > 10 * 60000) rateBuckets.delete(k);
-}, 5 * 60000);
-limiterSweep.unref();
 
 // ==========================================
 // GEMINI LLM CLIENT (timeouts, retries, failover, metrics)
@@ -768,8 +799,9 @@ function checkFfmpeg(): Promise<boolean> {
   });
 }
 
-app.get('/api/health', (_req, res) => {
+app.get('/api/health', async (_req, res) => {
   const mem = process.memoryUsage();
+  const storeHealth = await repo.health();
   res.json({
     status: 'ok',
     uptimeSeconds: Math.floor(process.uptime()),
@@ -792,18 +824,19 @@ app.get('/api/health', (_req, res) => {
       promptTokens: llmMetrics.promptTokens,
       outputTokens: llmMetrics.outputTokens,
     },
-    renders: { running: runningRenders.size, queued: renderQueue.length },
+    renders: { running: runningRenders.size, instance: INSTANCE_ID },
     storage: {
-      projects: projectStore.status(),
-      usageLedger: usageLedger.available ? 'ok' : 'unavailable',
+      backend: repo.kind,
+      ok: storeHealth.ok,
+      ...storeHealth.detail,
       freeDiskMb: (() => {
         const f = freeDiskBytes(DATA_DIR);
         return f === null ? null : Math.round(f / MB);
       })(),
     },
-    backups: backupStatus(),
+    backups: repo.kind === 'json' ? backupStatus() : { mode: 'database', note: 'PostgreSQL: encrypted off-site backups (scripts/db-backup.ts) and provider PITR; see docs/BACKUP_AND_RECOVERY.md' },
     proxy: { trust: trustProxy.ok ? trustProxy.description : 'invalid', untrustedForwardedRequests: proxyDiagnostics.untrustedForwardedRequests },
-    guestMintsThisHour: guestMintWindow.count,
+    guestMintsThisHour,
   });
 });
 
@@ -819,16 +852,9 @@ app.get('/api/ready', async (_req, res) => {
     storage = false;
   }
   const ffmpeg = await checkFfmpeg();
-  // Stores that every request depends on must be readable; a single corrupt user shard does not fail readiness.
-  const stores = (() => {
-    try {
-      readJsonFile(JOBS_FILE, []);
-      readJsonFile(SUBSCRIPTIONS_FILE, {});
-      return projectStore.status().available && usageLedger.available;
-    } catch {
-      return false;
-    }
-  })();
+  // Stores every request depends on must be usable (JSON: shared files readable; PostgreSQL: reachable).
+  // A single corrupt JSON user shard does not fail readiness.
+  const stores = (await repo.health()).ok;
   const ready = storage && ffmpeg && stores;
   res.status(ready ? 200 : 503).json({ ready, checks: { storage, ffmpeg, stores } });
 });
@@ -889,35 +915,35 @@ function newSubscription(plan: PlanId, demo = false): Subscription {
   };
 }
 
-function getUserSubscription(userId: string): Subscription {
-  const subs = readJsonFile<Record<string, Subscription>>(SUBSCRIPTIONS_FILE, {});
-  let sub = subs[userId];
-  let dirty = false;
-  if (!sub || !(sub.plan in PLANS)) {
-    // Default free plan is computed, not persisted: persisting one row per (free, unlimited) guest made
-    // subscriptions.json grow without bound. A row is written only once there is state to keep.
-    return { ...newSubscription('free'), dailyQuotaUsed: usageLedger.peek(`user:${userId}`) };
-  } else if (new Date(sub.currentPeriodEnd).getTime() < Date.now()) {
-    sub = { ...sub, monthlyRenderMinutesUsed: 0, currentPeriodEnd: new Date(Date.now() + 30 * 86400000).toISOString() };
-    dirty = true;
+const defaultStoredSubscription = (): StoredSubscription => ({
+  plan: 'free',
+  status: 'active',
+  monthlyRenderMinutesUsed: 0,
+  currentPeriodEnd: new Date(Date.now() + 30 * 86400000).toISOString(),
+});
+
+/** Effective subscription: plan limits from code, usage from the Repo. Defaults are computed, not persisted. */
+async function getUserSubscription(userId: string): Promise<Subscription> {
+  let stored = await repo.getSubscription(userId);
+  if (stored && !(stored.plan in PLANS)) stored = null;
+  if (stored && new Date(stored.currentPeriodEnd).getTime() < Date.now()) {
+    stored = { ...stored, monthlyRenderMinutesUsed: 0, currentPeriodEnd: new Date(Date.now() + 30 * 86400000).toISOString() };
+    await repo.putSubscription(userId, stored);
   }
-  if (dirty) {
-    subs[userId] = sub;
-    writeJsonFileAtomic(SUBSCRIPTIONS_FILE, subs);
-  }
-  // Plan limits come from code, so a limit change applies to existing rows too.
-  return { ...sub, dailyQuotaLimit: PLANS[sub.plan].dailyQuotaLimit, dailyQuotaUsed: usageLedger.peek(`user:${userId}`) };
+  const base = stored || defaultStoredSubscription();
+  return {
+    plan: base.plan,
+    status: 'active',
+    ...PLANS[base.plan],
+    monthlyRenderMinutesUsed: base.monthlyRenderMinutesUsed || 0,
+    currentPeriodEnd: base.currentPeriodEnd,
+    dailyQuotaUsed: await repo.peekAi(`user:${userId}`, utcDay()),
+    ...(base.demo ? { demo: true } : {}),
+  };
 }
 
-function addRenderMinutes(userId: string, seconds: number) {
-  const subs = readJsonFile<Record<string, Subscription>>(SUBSCRIPTIONS_FILE, {});
-  if (!subs[userId]) subs[userId] = newSubscription('free');
-  subs[userId].monthlyRenderMinutesUsed = +((subs[userId].monthlyRenderMinutesUsed || 0) + seconds / 60).toFixed(2);
-  writeJsonFileAtomic(SUBSCRIPTIONS_FILE, subs);
-}
-
-app.get('/api/quota', rateLimit('quota', 60), (req, res) => {
-  const sub = getUserSubscription(uid(req));
+app.get('/api/quota', rateLimit('quota', 60), async (req, res) => {
+  const sub = await getUserSubscription(uid(req));
   res.json({
     plan: sub.plan,
     status: sub.status,
@@ -930,11 +956,11 @@ app.get('/api/quota', rateLimit('quota', 60), (req, res) => {
   });
 });
 
-app.get('/api/user/subscription', rateLimit('subscription', 60), (req, res) => {
-  res.json({ success: true, subscription: getUserSubscription(uid(req)), billingMode: BILLING_MODE });
+app.get('/api/user/subscription', rateLimit('subscription', 60), async (req, res) => {
+  res.json({ success: true, subscription: await getUserSubscription(uid(req)), billingMode: BILLING_MODE });
 });
 
-app.post('/api/user/subscription/upgrade', rateLimit('subscription-upgrade', 10), (req, res) => {
+app.post('/api/user/subscription/upgrade', rateLimit('subscription-upgrade', 10), async (req, res) => {
   const plan = req.body?.plan;
   if (typeof plan !== 'string' || !(plan in PLANS)) {
     return res.status(400).json({ error: `Unknown plan. Valid plans: ${Object.keys(PLANS).join(', ')}` });
@@ -946,10 +972,9 @@ app.post('/api/user/subscription/upgrade', rateLimit('subscription-upgrade', 10)
       billingConfigured: false,
     });
   }
-  const subs = readJsonFile<Record<string, Subscription>>(SUBSCRIPTIONS_FILE, {});
-  subs[uid(req)] = newSubscription(plan as PlanId, true);
-  writeJsonFileAtomic(SUBSCRIPTIONS_FILE, subs);
-  res.json({ success: true, subscription: subs[uid(req)], demo: true });
+  const sub = newSubscription(plan as PlanId, true);
+  await repo.putSubscription(uid(req), { plan: sub.plan, status: 'active', monthlyRenderMinutesUsed: 0, currentPeriodEnd: sub.currentPeriodEnd, demo: true });
+  res.json({ success: true, subscription: sub, demo: true });
 });
 
 // ==========================================
@@ -1076,26 +1101,33 @@ const newProjectId = () => `proj_${Date.now()}_${crypto.randomBytes(5).toString(
 
 const byUpdatedDesc = (a: any, b: any) => new Date(b.updatedAt || 0).getTime() - new Date(a.updatedAt || 0).getTime();
 
-app.get('/api/projects', rateLimit('projects-read', 120), (req, res) => {
+const ADMIN_LIST_LIMIT = 5000;
+
+app.get('/api/projects', rateLimit('projects-read', 120), async (req, res) => {
   if (isAdmin(req) && req.query.all === '1') {
-    const { projects, unreadableShards } = projectStore.listAll();
-    return res.json({ success: true, projects: [...projects.sort(byUpdatedDesc), SAMPLE_PROJECT], unreadableShards });
+    const { projects, unreadable } = await repo.listAllProjects(ADMIN_LIST_LIMIT);
+    return res.json({ success: true, projects: [...projects.sort(byUpdatedDesc), SAMPLE_PROJECT], unreadableShards: unreadable });
   }
-  const mine = projectStore.listByUser(uid(req)).sort(byUpdatedDesc);
+  const mine = (await repo.listProjects(uid(req))).sort(byUpdatedDesc);
   res.json({ success: true, projects: [...mine, SAMPLE_PROJECT] });
 });
 
-app.get('/api/projects/:id', rateLimit('projects-read', 120), (req, res) => {
+/** The project if the caller may read it (owner or admin); otherwise null (callers answer 404, never 403). */
+async function readableProject(req: express.Request, id: string) {
+  const found = await repo.getProject(id);
+  if (!found || !(found.ownerId === uid(req) || isAdmin(req))) return null;
+  return found;
+}
+
+app.get('/api/projects/:id', rateLimit('projects-read', 120), async (req, res) => {
   if (req.params.id === SAMPLE_ID) return res.json({ success: true, project: SAMPLE_PROJECT });
-  const owner = projectStore.ownerOf(req.params.id);
+  const found = await readableProject(req, req.params.id);
   // 404 (not 403) for other users' projects so ids cannot be enumerated.
-  if (!owner || !(owner === uid(req) || isAdmin(req))) return res.status(404).json({ error: 'Project not found' });
-  const project = projectStore.get(req.params.id);
-  if (!project) return res.status(404).json({ error: 'Project not found' });
-  res.json({ success: true, project });
+  if (!found) return res.status(404).json({ error: 'Project not found' });
+  res.json({ success: true, project: found.project });
 });
 
-app.post('/api/projects', rateLimit('projects-write', 60), (req, res) => {
+app.post('/api/projects', rateLimit('projects-write', 60), async (req, res) => {
   const payload = req.body;
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
     return res.status(400).json({ error: 'Invalid project payload' });
@@ -1123,9 +1155,9 @@ app.post('/api/projects', rateLimit('projects-write', 60), (req, res) => {
   let id: string = payload.id;
   let existing: any = null;
   if (id) {
-    const owner = projectStore.ownerOf(id);
-    if (owner && owner !== userId) return res.status(404).json({ error: 'Project not found' });
-    if (owner === userId) existing = projectStore.get(id);
+    const found = await repo.getProject(id);
+    if (found && found.ownerId !== userId) return res.status(404).json({ error: 'Project not found' });
+    existing = found?.project ?? null;
     // Ids are always server-issued: an unknown client id is treated as a new project with a fresh id.
     if (!existing) id = newProjectId();
   } else {
@@ -1133,25 +1165,20 @@ app.post('/api/projects', rateLimit('projects-write', 60), (req, res) => {
   }
   const now = new Date().toISOString();
   const project = { ...clean, id, userId, createdAt: existing?.createdAt || now, updatedAt: now };
-  projectStore.put(userId, project); // throws StoreLimitError / StoreUnavailableError -> error handler
+  // Ownership and quotas are re-checked atomically inside saveProject (ProjectOwnershipError -> 404).
+  await repo.saveProject(userId, project);
   res.json({ success: true, project });
 });
 
-app.delete('/api/projects/:id', rateLimit('projects-write', 60), (req, res) => {
+app.delete('/api/projects/:id', rateLimit('projects-write', 60), async (req, res) => {
   if (req.params.id === SAMPLE_ID) return res.status(400).json({ error: 'Cannot delete the built-in sample project' });
-  const owner = projectStore.ownerOf(req.params.id);
-  if (!owner || !(owner === uid(req) || isAdmin(req))) return res.status(404).json({ error: 'Project not found' });
-  if (!projectStore.delete(owner, req.params.id)) return res.status(404).json({ error: 'Project not found' });
+  const found = await readableProject(req, req.params.id);
+  if (!found || !(await repo.deleteProject(found.ownerId, req.params.id))) return res.status(404).json({ error: 'Project not found' });
   res.json({ success: true, message: 'Project deleted' });
 });
 
-app.post('/api/projects/:id/duplicate', rateLimit('projects-write', 60), (req, res) => {
-  let existing: any = null;
-  if (req.params.id === SAMPLE_ID) existing = SAMPLE_PROJECT;
-  else {
-    const owner = projectStore.ownerOf(req.params.id);
-    if (owner && (owner === uid(req) || isAdmin(req))) existing = projectStore.get(req.params.id);
-  }
+app.post('/api/projects/:id/duplicate', rateLimit('projects-write', 60), async (req, res) => {
+  const existing = req.params.id === SAMPLE_ID ? SAMPLE_PROJECT : (await readableProject(req, req.params.id))?.project;
   if (!existing) return res.status(404).json({ error: 'Source project not found' });
   const now = new Date().toISOString();
   const { isSample: _ignored, ...rest } = JSON.parse(JSON.stringify(existing));
@@ -1163,41 +1190,17 @@ app.post('/api/projects/:id/duplicate', rateLimit('projects-write', 60), (req, r
     createdAt: now,
     updatedAt: now,
   };
-  projectStore.put(uid(req), duplicated);
+  await repo.saveProject(uid(req), duplicated);
   res.json({ success: true, project: duplicated });
 });
 
 // ==========================================
 // FFMPEG RENDER ENGINE + BACKGROUND JOB QUEUE
 // ==========================================
-interface ServerJob {
-  id: string;
-  userId: string;
-  type: string;
-  status: 'queued' | 'processing' | 'completed' | 'failed' | 'cancelled';
-  progress: number;
-  stepMessage?: string;
-  createdAt: string;
-  completedAt?: string;
-  error?: string;
-  result?: any;
-  payload?: any;
-}
-
 const RENDER_JOB_TYPES = new Set(['render_video', 'render_short']);
-const runningRenders = new Map<string, ChildProcess>(); // key: job id or direct render id
-const renderQueue: string[] = [];
-
-const getStoredJobs = () => readJsonFile<ServerJob[]>(JOBS_FILE, []);
-
-function upsertJob(job: ServerJob): void {
-  const jobs = getStoredJobs();
-  const idx = jobs.findIndex((j) => j.id === job.id);
-  if (idx >= 0) jobs[idx] = job;
-  else jobs.unshift(job);
-  if (jobs.length > 500) jobs.length = 500;
-  writeJsonFileAtomic(JOBS_FILE, jobs);
-}
+const runningRenders = new Map<string, ChildProcess>(); // key: job id or direct render id (this instance only)
+const HEARTBEAT_MS = envNum('JOB_HEARTBEAT_MS', 1000, 100);
+const JOB_STALE_MS = envNum('JOB_STALE_MS', 30000, 1000);
 
 interface RenderParams {
   title: string;
@@ -1293,110 +1296,122 @@ function renderVideoWithFfmpeg(
   });
 }
 
-const isActiveJob = (j: ServerJob) => j.status === 'queued' || j.status === 'processing';
 const MAX_ACTIVE_JOBS_PER_USER = 5;
 
 /**
- * Minutes already used plus minutes reserved by the user's queued/processing jobs (FS-015: usage is only
- * recorded on completion, so without the reservation several queued jobs could each pass the check).
+ * Admission rule for creating and retrying jobs, evaluated by the Repo atomically with the insert/requeue.
+ * Counts minutes already used PLUS minutes reserved by the user's other queued/processing jobs (FS-015).
  */
-function renderMinutesAvailable(userId: string, seconds: number, excludeJobId?: string): boolean {
-  const sub = getUserSubscription(userId);
-  const reservedSeconds = getStoredJobs()
-    .filter((j) => j.userId === userId && isActiveJob(j) && j.id !== excludeJobId)
-    .reduce((a, j) => a + (Number(j.payload?.duration) || 0), 0);
-  return sub.monthlyRenderMinutesUsed + (reservedSeconds + seconds) / 60 <= sub.monthlyRenderMinutesLimit;
+function jobAdmission(sub: Subscription, durationS: number) {
+  return (active: ServerJob[]): [number, Record<string, unknown>] | null => {
+    if (active.length >= MAX_ACTIVE_JOBS_PER_USER) {
+      return [429, { error: `You already have ${MAX_ACTIVE_JOBS_PER_USER} active render jobs. Wait for them to finish.` }];
+    }
+    const reservedSeconds = active.reduce((a, j) => a + (Number(j.payload?.duration) || 0), 0);
+    if (sub.monthlyRenderMinutesUsed + (reservedSeconds + durationS) / 60 > sub.monthlyRenderMinutesLimit) {
+      return [402, { error: 'Monthly render minutes exhausted for your plan.', quotaExceeded: true }];
+    }
+    return null;
+  };
 }
 
-/** Shared guard for creating and retrying jobs. Returns an error response tuple, or null when allowed. */
-function jobAdmissionError(userId: string, durationS: number, excludeJobId?: string): [number, object] | null {
-  if (getStoredJobs().filter((j) => j.userId === userId && isActiveJob(j) && j.id !== excludeJobId).length >= MAX_ACTIVE_JOBS_PER_USER) {
-    return [429, { error: `You already have ${MAX_ACTIVE_JOBS_PER_USER} active render jobs. Wait for them to finish.` }];
-  }
-  if (!renderMinutesAvailable(userId, durationS, excludeJobId)) {
-    return [402, { error: 'Monthly render minutes exhausted for your plan.', quotaExceeded: true }];
-  }
-  return null;
-}
+// ---------- render worker (every instance runs one; jobs are claimed atomically from the Repo) ----------
+let workerStarting = 0;
+let workerPumping = false;
+let workerStopped = false;
 
-function pumpRenderQueue() {
+async function pumpRenderQueue() {
+  if (workerPumping || workerStopped) return;
+  workerPumping = true;
   try {
-    while (runningRenders.size < MAX_CONCURRENT_RENDERS && renderQueue.length > 0) {
-      const jobId = renderQueue.shift()!;
-      const job = getStoredJobs().find((j) => j.id === jobId);
-      if (!job || job.status !== 'queued') continue;
-      executeRenderJob(job).catch((err) => {
-        console.error(JSON.stringify({ level: 'error', event: 'render_job_bookkeeping_failed', jobId: job.id, error: String(err?.message || err) }));
+    while (!workerStopped && runningRenders.size + workerStarting < MAX_CONCURRENT_RENDERS) {
+      workerStarting++;
+      let job: ServerJob | null = null;
+      try {
+        job = await repo.claimNextJob(INSTANCE_ID);
+      } finally {
+        if (!job) workerStarting--;
+      }
+      if (!job) break;
+      const claimed = job;
+      executeRenderJob(claimed, () => workerStarting--).catch((err) => {
+        console.error(JSON.stringify({ level: 'error', event: 'render_job_bookkeeping_failed', jobId: claimed.id, error: String(err?.message || err) }));
       });
     }
   } catch (err: any) {
-    // e.g. jobs.json unavailable: queued ids stay in memory and are retried on the next pump.
-    console.error(JSON.stringify({ level: 'error', event: 'render_queue_pump_failed', error: String(err?.message || err) }));
+    // e.g. database unavailable: the jobs stay queued and the next tick retries.
+    console.error(JSON.stringify({ level: 'error', event: 'render_queue_pump_failed', error: String(err?.message || err).slice(0, 300) }));
+  } finally {
+    workerPumping = false;
   }
 }
 
-async function executeRenderJob(job: ServerJob) {
+async function executeRenderJob(job: ServerJob, started: () => void) {
   const params = normalizeRenderParams(job.payload);
   const renderId = newRenderId();
-  job.status = 'processing';
-  job.progress = 20;
-  job.stepMessage = 'Rendering...';
-  upsertJob(job);
+  let stopped: 'cancelled' | 'lost' | null = null;
+  let startedSignalled = false;
+  const signalStarted = () => {
+    if (!startedSignalled) {
+      startedSignalled = true;
+      started();
+    }
+  };
+  // Heartbeat: proves this worker is alive (dead workers are reaped) and observes cancellation from any instance.
+  const hb = setInterval(() => {
+    repo
+      .heartbeat(job.id, INSTANCE_ID, job.progress, job.stepMessage || '')
+      .then((r) => {
+        if (r !== 'ok' && !stopped) {
+          stopped = r;
+          runningRenders.get(job.id)?.kill('SIGKILL');
+        }
+      })
+      .catch(() => {
+        // transient storage error: keep rendering; a long outage lets the reaper fail the job honestly
+      });
+  }, HEARTBEAT_MS);
+  hb.unref();
   try {
-    const result = await renderVideoWithFfmpeg(renderId, params, job.id, (pct, msg) => {
-      const cur = getStoredJobs().find((j) => j.id === job.id);
-      if (cur?.status === 'cancelled') return;
+    const render = renderVideoWithFfmpeg(renderId, params, job.id, (pct, msg) => {
       job.progress = pct;
       job.stepMessage = msg;
-      upsertJob(job);
     });
-    const latest = getStoredJobs().find((j) => j.id === job.id);
-    if (latest?.status === 'cancelled') {
+    signalStarted(); // the ffmpeg process is registered in runningRenders synchronously
+    const result = await render;
+    if (stopped) {
       fs.rmSync(result.outputPath, { force: true });
       return;
     }
-    addRenderMinutes(job.userId, result.duration);
-    Object.assign(job, {
+    const done: ServerJob = {
+      ...job,
       status: 'completed',
       progress: 100,
       stepMessage: 'Video rendered and verified on disk.',
       completedAt: new Date().toISOString(),
       error: undefined,
       result: { renderId, downloadUrl: `/api/render/download/${renderId}`, fileSize: result.fileSize, duration: result.duration, format: 'mp4' },
-    });
-    upsertJob(job);
+    };
+    if (await repo.finishJob(done, INSTANCE_ID)) {
+      await repo.addRenderMinutes(job.userId, result.duration, defaultStoredSubscription());
+    } else {
+      fs.rmSync(result.outputPath, { force: true }); // cancelled in the meantime: do not keep or bill it
+    }
   } catch (err: any) {
-    Object.assign(job, { status: 'failed', error: err?.message || 'Render failed', stepMessage: `Failed: ${err?.message || 'Render failed'}`, completedAt: new Date().toISOString() });
+    signalStarted();
+    if (stopped) return;
+    const failed: ServerJob = { ...job, status: 'failed', error: err?.message || 'Render failed', stepMessage: `Failed: ${err?.message || 'Render failed'}`, completedAt: new Date().toISOString() };
     try {
-      const latest = getStoredJobs().find((j) => j.id === job.id);
-      if (latest?.status !== 'cancelled') upsertJob(job);
+      await repo.finishJob(failed, INSTANCE_ID);
     } catch (bookErr: any) {
       // Never let a storage failure while recording a failure escape as an unhandled rejection (FS-016).
       console.error(JSON.stringify({ level: 'error', event: 'render_job_status_write_failed', jobId: job.id, error: String(bookErr?.message || bookErr) }));
     }
   } finally {
-    pumpRenderQueue();
+    clearInterval(hb);
+    void pumpRenderQueue();
   }
 }
-
-// Jobs left queued/processing by a previous process can never complete: mark them failed honestly.
-(function recoverInterruptedJobs() {
-  let jobs: ServerJob[];
-  try {
-    jobs = getStoredJobs();
-  } catch (err: any) {
-    console.error(JSON.stringify({ level: 'error', event: 'job_recovery_skipped', error: String(err?.message || err) }));
-    return;
-  }
-  let changed = false;
-  for (const j of jobs) {
-    if (j.status === 'queued' || j.status === 'processing') {
-      Object.assign(j, { status: 'failed', error: 'Interrupted by server restart', stepMessage: 'Interrupted by server restart — retry to run again.' });
-      changed = true;
-    }
-  }
-  if (changed) writeJsonFileAtomic(JOBS_FILE, jobs);
-})();
 
 // Delete expired render artifacts so disk usage stays bounded.
 function sweepOldRenders() {
@@ -1419,13 +1434,13 @@ app.post('/api/render/video', rateLimit('render', 10), async (req, res) => {
     res.setHeader('Retry-After', '10');
     return res.status(503).json({ error: 'Render capacity is full. Use /api/jobs/create to queue, or retry shortly.' });
   }
-  if (!renderMinutesAvailable(uid(req), params.duration)) {
-    return res.status(402).json({ error: 'Monthly render minutes exhausted for your plan.', quotaExceeded: true });
-  }
+  const sub = await getUserSubscription(uid(req));
+  const minutesDenied = jobAdmission(sub, params.duration)(await repo.activeJobs(uid(req)));
+  if (minutesDenied?.[0] === 402) return res.status(402).json(minutesDenied[1]);
   const renderId = newRenderId();
   try {
     const result = await renderVideoWithFfmpeg(renderId, params, renderId);
-    addRenderMinutes(uid(req), result.duration);
+    await repo.addRenderMinutes(uid(req), result.duration, defaultStoredSubscription());
     res.json({
       success: true,
       renderId,
@@ -1483,23 +1498,23 @@ app.get('/api/render/probe/:renderId', rateLimit('render-probe', 60), (req, res)
   res.json({ success: true, renderId, fileSize: stat.size, exists: true, mimeType: 'video/mp4', downloadUrl: `/api/render/download/${renderId}`, createdAt: stat.mtime.toISOString() });
 });
 
-const ownJob = (req: express.Request) => {
-  const job = getStoredJobs().find((j) => j.id === req.params.id);
+async function ownJob(req: express.Request) {
+  const job = await repo.getJob(req.params.id);
   return job && (job.userId === uid(req) || isAdmin(req)) ? job : null;
-};
+}
+// workerId is internal; never part of the API response.
+const publicJob = ({ workerId: _w, ...j }: ServerJob) => j;
 
-app.get('/api/jobs', rateLimit('jobs-read', 120), (req, res) => {
-  res.json({ success: true, jobs: getStoredJobs().filter((j) => j.userId === uid(req)).slice(0, 100) });
+app.get('/api/jobs', rateLimit('jobs-read', 120), async (req, res) => {
+  res.json({ success: true, jobs: (await repo.listJobs(uid(req), 100)).map(publicJob) });
 });
 
-app.post('/api/jobs/create', rateLimit('jobs-write', 20), (req, res) => {
+app.post('/api/jobs/create', rateLimit('jobs-write', 20), async (req, res) => {
   const { type, payload } = req.body || {};
   if (typeof type !== 'string' || !RENDER_JOB_TYPES.has(type)) {
     return res.status(400).json({ error: `Unsupported job type. Supported: ${[...RENDER_JOB_TYPES].join(', ')}` });
   }
   const params = normalizeRenderParams(payload);
-  const denied = jobAdmissionError(uid(req), params.duration);
-  if (denied) return res.status(denied[0]).json(denied[1]);
   const job: ServerJob = {
     id: `job_${Date.now()}_${crypto.randomBytes(5).toString('hex')}`,
     userId: uid(req),
@@ -1510,46 +1525,40 @@ app.post('/api/jobs/create', rateLimit('jobs-write', 20), (req, res) => {
     stepMessage: 'Queued for rendering...',
     createdAt: new Date().toISOString(),
   };
-  upsertJob(job);
-  renderQueue.push(job.id);
-  pumpRenderQueue();
-  res.json({ success: true, job });
+  const denied = await repo.insertJob(job, jobAdmission(await getUserSubscription(uid(req)), params.duration));
+  if (denied) return res.status(denied[0]).json(denied[1]);
+  void pumpRenderQueue();
+  res.json({ success: true, job: publicJob(job) });
 });
 
-app.get('/api/jobs/:id', rateLimit('jobs-read', 240), (req, res) => {
-  const job = ownJob(req);
+app.get('/api/jobs/:id', rateLimit('jobs-read', 240), async (req, res) => {
+  const job = await ownJob(req);
   if (!job) return res.status(404).json({ error: 'Job not found' });
-  res.json({ success: true, job });
+  res.json({ success: true, job: publicJob(job) });
 });
 
-app.post('/api/jobs/:id/cancel', rateLimit('jobs-write', 60), (req, res) => {
-  const job = ownJob(req);
+app.post('/api/jobs/:id/cancel', rateLimit('jobs-write', 60), async (req, res) => {
+  const job = await ownJob(req);
   if (!job) return res.status(404).json({ error: 'Job not found' });
-  if (job.status !== 'queued' && job.status !== 'processing') {
-    return res.status(409).json({ error: `Cannot cancel a job that is ${job.status}` });
-  }
-  Object.assign(job, { status: 'cancelled', stepMessage: 'Job cancelled by user request.', completedAt: new Date().toISOString() });
-  upsertJob(job);
-  const qi = renderQueue.indexOf(job.id);
-  if (qi >= 0) renderQueue.splice(qi, 1);
-  runningRenders.get(job.id)?.kill('SIGKILL'); // actually stop the encoder
-  res.json({ success: true, job });
+  const cancelled = await repo.cancelJob(job.id);
+  if (!cancelled) return res.status(409).json({ error: `Cannot cancel a job that is ${(await repo.getJob(job.id))?.status ?? job.status}` });
+  // Stop the encoder now if it runs here; another instance stops it on its next heartbeat.
+  runningRenders.get(job.id)?.kill('SIGKILL');
+  res.json({ success: true, job: publicJob(cancelled) });
 });
 
-app.post('/api/jobs/:id/retry', rateLimit('jobs-write', 20), (req, res) => {
-  const job = ownJob(req);
+app.post('/api/jobs/:id/retry', rateLimit('jobs-write', 20), async (req, res) => {
+  const job = await ownJob(req);
   if (!job) return res.status(404).json({ error: 'Job not found' });
   if (job.status !== 'failed' && job.status !== 'cancelled') {
     return res.status(409).json({ error: `Only failed or cancelled jobs can be retried (job is ${job.status}).` });
   }
-  // Same admission rules as a new job (FS-015: retry used to bypass the active-job cap and render minutes).
-  const denied = jobAdmissionError(uid(req), Number(job.payload?.duration) || 0, job.id);
-  if (denied) return res.status(denied[0]).json(denied[1]);
-  Object.assign(job, { status: 'queued', progress: 5, error: undefined, result: undefined, completedAt: undefined, stepMessage: 'Re-queued for rendering...' });
-  upsertJob(job);
-  renderQueue.push(job.id);
-  pumpRenderQueue();
-  res.json({ success: true, job });
+  // Same admission rules as a new job, evaluated atomically (FS-015).
+  const out = await repo.requeueJob(job.id, jobAdmission(await getUserSubscription(uid(req)), Number(job.payload?.duration) || 0));
+  if (out.denied) return res.status(out.denied[0]).json(out.denied[1]);
+  if (!out.job) return res.status(409).json({ error: 'Job state changed; reload and try again.' });
+  void pumpRenderQueue();
+  res.json({ success: true, job: publicJob(out.job) });
 });
 
 // ==========================================
@@ -2498,6 +2507,16 @@ app.use((err: any, req: express.Request, res: express.Response, _next: express.N
     if (res.headersSent) return;
     return res.status(err.status).json({ error: err.message, code: err.code });
   }
+  if (err instanceof ProjectOwnershipError) {
+    if (res.headersSent) return;
+    return res.status(404).json({ error: 'Project not found' });
+  }
+  if (isUnavailable(err)) {
+    console.error(JSON.stringify({ level: 'error', event: 'database_unavailable_request', rid: req.requestId, path: req.path, error: String(err?.message || err).slice(0, 200) }));
+    if (res.headersSent) return;
+    res.setHeader('Retry-After', '15');
+    return res.status(503).json({ error: 'The service is temporarily unavailable. Nothing was changed. Please try again shortly.', code: 'database_unavailable', requestId: req.requestId });
+  }
   if (err instanceof StoreUnavailableError) {
     // Fail closed: the data could not be read safely, so nothing was written.
     console.error(JSON.stringify({ level: 'error', event: 'store_unavailable_request', rid: req.requestId, path: req.path, error: err.message }));
@@ -2549,6 +2568,8 @@ function runScheduledBackup() {
 // STARTUP / SHUTDOWN
 // ==========================================
 export async function startServer(): Promise<Server> {
+  await initStorage(); // throws (=> exit 1) if the database never becomes reachable or a migration fails
+
   if (IS_PROD) {
     const dist = path.resolve(__dirname, 'dist');
     app.use(express.static(dist, { index: false, maxAge: '1h' }));
@@ -2562,32 +2583,59 @@ export async function startServer(): Promise<Server> {
   const server = app.listen(port, '0.0.0.0', () => {
     const addr = server.address();
     const actualPort = typeof addr === 'object' && addr ? addr.port : port;
-    console.log(`[Forge Studio] listening on :${actualPort} (${NODE_ENV}) llm=${resolveGeminiApiKey() ? LLM_MODELS.join('>') : 'template-fallback'} trustProxy=${trustProxy.ok ? trustProxy.description : '?'} projects=${projectStore.status().projects}${migrationReport.migrated ? ` (migrated ${migrationReport.records} from legacy file; snapshot ${migrationReport.snapshot})` : ''}`);
+    console.log(`[Forge Studio] listening on :${actualPort} (${NODE_ENV}) storage=${repo.kind}${jsonMigrationNote} instance=${INSTANCE_ID} llm=${resolveGeminiApiKey() ? LLM_MODELS.join('>') : 'template-fallback'} trustProxy=${trustProxy.ok ? trustProxy.description : '?'}`);
   });
 
-  writeServerLock(DATA_DIR);
-  let backupTimer: NodeJS.Timeout | null = null;
-  if (BACKUP_INTERVAL_HOURS > 0) {
-    const first = setTimeout(runScheduledBackup, IS_TEST ? 0 : 30000); // soon after boot, then on the interval
-    first.unref();
-    backupTimer = setInterval(runScheduledBackup, BACKUP_INTERVAL_HOURS * 3600000);
-    backupTimer.unref();
+  const timers: NodeJS.Timeout[] = [];
+  const every = (ms: number, fn: () => void) => {
+    const t = setInterval(fn, ms);
+    t.unref();
+    timers.push(t);
+  };
+  if (repo.kind === 'json') {
+    // JSON mode only: single-instance lock + on-volume snapshots (PostgreSQL uses database backups instead).
+    writeServerLock(DATA_DIR);
+    if (BACKUP_INTERVAL_HOURS > 0) {
+      const first = setTimeout(runScheduledBackup, IS_TEST ? 0 : 30000);
+      first.unref();
+      every(BACKUP_INTERVAL_HOURS * 3600000, runScheduledBackup);
+    }
   }
+  const logErr = (event: string) => (err: any) => console.error(JSON.stringify({ level: 'error', event, error: String(err?.message || err).slice(0, 300) }));
+  every(2000, () => void pumpRenderQueue()); // picks up jobs queued by any instance
+  every(Math.max(1000, Math.floor(JOB_STALE_MS / 3)), () => {
+    repo.reapStaleJobs(JOB_STALE_MS).then((n) => n && console.warn(JSON.stringify({ level: 'warn', event: 'stale_jobs_reaped', count: n })), logErr('job_reaper_failed'));
+  });
+  every(5 * 60000, () => void repo.sweep().catch(logErr('storage_sweep_failed')));
+  void pumpRenderQueue(); // queued jobs that survived a restart
 
   let shuttingDown = false;
-  const shutdown = (signal: string, code = 0) => {
+  const shutdown = async (signal: string, code = 0) => {
     if (shuttingDown) return;
     shuttingDown = true;
     console.log(`[Forge Studio] ${signal} received, shutting down...`);
-    if (backupTimer) clearInterval(backupTimer);
-    for (const proc of runningRenders.values()) proc.kill('SIGKILL');
-    usageLedger.flush();
-    removeServerLock(DATA_DIR);
-    server.close(() => process.exit(code));
     setTimeout(() => process.exit(code || 1), 10000).unref();
+    workerStopped = true;
+    for (const t of timers) clearInterval(t);
+    // Renders running here cannot finish: record that honestly now instead of waiting for the reaper.
+    const interrupted = [...runningRenders.keys()].filter((k) => k.startsWith('job_'));
+    for (const proc of runningRenders.values()) proc.kill('SIGKILL');
+    await Promise.allSettled(
+      interrupted.map(async (id) => {
+        const job = await repo.getJob(id);
+        if (job?.status === 'processing') {
+          await repo.finishJob({ ...job, status: 'failed', error: 'Interrupted by server shutdown', stepMessage: 'Interrupted by server shutdown — retry to run again.', completedAt: new Date().toISOString() }, INSTANCE_ID);
+        }
+      }),
+    );
+    server.close(async () => {
+      await repo.close().catch(logErr('storage_close_failed'));
+      if (repo.kind === 'json') removeServerLock(DATA_DIR);
+      process.exit(code);
+    });
   };
-  process.once('SIGTERM', () => shutdown('SIGTERM'));
-  process.once('SIGINT', () => shutdown('SIGINT'));
+  process.once('SIGTERM', () => void shutdown('SIGTERM'));
+  process.once('SIGINT', () => void shutdown('SIGINT'));
   // FS-016: never die silently. A rejected promise is logged with context and the process keeps serving;
   // an uncaught exception leaves state unknown, so it is logged and the process exits cleanly for a restart.
   process.on('unhandledRejection', (reason: any) => {
@@ -2595,7 +2643,7 @@ export async function startServer(): Promise<Server> {
   });
   process.on('uncaughtException', (err) => {
     console.error(JSON.stringify({ level: 'fatal', event: 'uncaught_exception', error: String(err?.stack || err).slice(0, 2000) }));
-    shutdown('uncaughtException', 1);
+    void shutdown('uncaughtException', 1);
   });
   return server;
 }
