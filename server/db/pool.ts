@@ -1,0 +1,92 @@
+// PostgreSQL connection pool + transaction helper (ADR-001).
+import pg from 'pg';
+
+export type Db = pg.Pool;
+export type Tx = pg.PoolClient;
+
+export class DatabaseUnavailableError extends Error {
+  readonly code = 'database_unavailable';
+  constructor(message: string) {
+    super(message);
+    this.name = 'DatabaseUnavailableError';
+  }
+}
+
+// SQLSTATE classes that mean "the database is not reachable / not usable right now" (not a bug in the query).
+const UNAVAILABLE_CODES = new Set(['57P01', '57P02', '57P03', '08000', '08001', '08003', '08004', '08006', '53300']);
+export function isUnavailable(err: any): boolean {
+  if (!err) return false;
+  if (err instanceof DatabaseUnavailableError) return true;
+  if (UNAVAILABLE_CODES.has(err.code)) return true;
+  if (['ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'EPIPE', 'ENOTFOUND', 'EHOSTUNREACH'].includes(err.code)) return true;
+  return /Connection terminated|connection timeout|timeout exceeded when trying to connect|Client has encountered a connection error/i.test(String(err.message || ''));
+}
+
+export function createPool(connectionString: string, opts: { max?: number; applicationName?: string } = {}): Db {
+  const { url, ssl } = tlsConfig(connectionString);
+  const pool = new pg.Pool({
+    connectionString: url,
+    ssl,
+    max: opts.max ?? Number(process.env.DATABASE_POOL_MAX || 10),
+    idleTimeoutMillis: 30000,
+    connectionTimeoutMillis: Number(process.env.DATABASE_CONNECT_TIMEOUT_MS || 5000),
+    // Bound every statement so a stuck query cannot hold a request (and a pool slot) forever.
+    statement_timeout: Number(process.env.DATABASE_STATEMENT_TIMEOUT_MS || 10000),
+    query_timeout: Number(process.env.DATABASE_STATEMENT_TIMEOUT_MS || 10000) + 2000,
+    application_name: opts.applicationName || 'forge-studio',
+  });
+  // An idle client losing its connection (DB restart/failover) must not crash the process.
+  pool.on('error', (err) => {
+    console.error(JSON.stringify({ level: 'error', event: 'db_pool_idle_client_error', error: String(err?.message || err) }));
+  });
+  return pool;
+}
+
+/**
+ * TLS policy (ADR-001). sslmode comes from the URL or DATABASE_SSLMODE:
+ *   disable -> plain TCP (local/test only); unset -> TLS in production, plain elsewhere;
+ *   anything else -> TLS with certificate verification (set DATABASE_SSL_REJECT_UNAUTHORIZED=false only for
+ *   providers whose CA you cannot install). sslmode is removed from the URL so node-postgres cannot reinterpret it.
+ */
+export function tlsConfig(connectionString: string): { url: string; ssl: pg.PoolConfig['ssl'] } {
+  const u = new URL(connectionString);
+  const mode = (u.searchParams.get('sslmode') || process.env.DATABASE_SSLMODE || '').toLowerCase();
+  u.searchParams.delete('sslmode');
+  const verify = process.env.DATABASE_SSL_REJECT_UNAUTHORIZED !== 'false';
+  if (mode === 'disable') return { url: u.toString(), ssl: false };
+  if (mode === '' && process.env.NODE_ENV !== 'production') return { url: u.toString(), ssl: false };
+  return { url: u.toString(), ssl: { rejectUnauthorized: verify } };
+}
+
+/** Runs fn inside a transaction (READ COMMITTED). Rolls back on any error and rethrows it. */
+export async function withTx<T>(db: Db, fn: (tx: Tx) => Promise<T>): Promise<T> {
+  let client: Tx;
+  try {
+    client = await db.connect();
+  } catch (err: any) {
+    throw new DatabaseUnavailableError(`cannot connect to database: ${err?.message || err}`);
+  }
+  try {
+    await client.query('BEGIN');
+    const out = await fn(client);
+    await client.query('COMMIT');
+    return out;
+  } catch (err) {
+    try {
+      await client.query('ROLLBACK');
+    } catch {
+      // connection already broken; the error below is what matters
+    }
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+/** Stable 64-bit advisory-lock keys (distributed locks across instances). */
+export const LOCKS = {
+  migrations: 7_311_000_001,
+  dataMigration: 7_311_000_002,
+  jobReaper: 7_311_000_003,
+  maintenance: 7_311_000_004,
+} as const;

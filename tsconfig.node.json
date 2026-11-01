@@ -18,6 +18,8 @@
   },
   "include": [
     "scripts/backup.ts",
+    "scripts/data-migration.ts",
+    "scripts/db-backup.ts",
     "vite.config.ts",
     "server.ts",
     "server/**/*.ts"
