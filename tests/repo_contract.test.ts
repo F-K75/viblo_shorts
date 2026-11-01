@@ -12,6 +12,7 @@ import { migrate } from '../server/db/migrate.ts';
 import { createTestDatabase, pgSkip, PG_ADMIN_URL, type TestDb } from './helpers/pg.ts';
 import { startTcpProxy } from './helpers/tcpProxy.ts';
 import { checkout, withTx, createPool } from '../server/db/pool.ts';
+import * as poolModule from '../server/db/pool.ts';
 
 const KB = 1024;
 const limits: StoreLimits = {
@@ -86,17 +87,32 @@ for (const kind of ['json', 'postgres'] as const) {
       await r.saveProject(G2, proj('proj_h2', G2, 20 * KB));
     });
 
-    test('AI quota: all-or-nothing reservation, refund, peek', async () => {
+    test('AI quota: all-or-nothing reservation, idempotent reserve/settle, refund, expiry', async () => {
       const r = await makeRepo(kind);
       const d = today();
       const e = [{ key: 'user:a', limit: 2 }, { key: 'ip:1', limit: 3 }];
-      assert.equal((await r.reserveAi(e, d)).ok, true);
-      assert.equal((await r.reserveAi(e, d)).ok, true);
-      assert.deepEqual(await r.reserveAi(e, d), { ok: false, key: 'user:a' });
+      assert.equal((await r.reserveAi(e, d, 'res-0001')).ok, true);
+      assert.equal((await r.reserveAi(e, d, 'res-0001')).ok, true, 'retried reserve with the same id');
+      assert.equal(await r.peekAi('user:a', d), 1, '...never charges twice');
+      assert.equal((await r.reserveAi(e, d, 'res-0002')).ok, true);
+      assert.deepEqual(await r.reserveAi(e, d, 'res-0003'), { ok: false, key: 'user:a' });
       assert.equal(await r.peekAi('ip:1', d), 2, 'rejected reservation charged nothing');
-      await r.refundAi(['user:a', 'ip:1'], d);
-      assert.equal(await r.peekAi('user:a', d), 1);
-      assert.deepEqual(await r.reserveAi([{ key: 'user:z', limit: 0 }], d), { ok: false, key: 'user:z' });
+      assert.equal(await r.settleAi('res-0002', 'refund'), 'settled');
+      assert.equal(await r.settleAi('res-0002', 'refund'), 'already_settled', 'duplicate settle');
+      assert.equal(await r.settleAi('res-0002', 'commit'), 'already_settled');
+      assert.equal(await r.peekAi('user:a', d), 1, '...never double-refunds');
+      assert.equal(await r.settleAi('res-0001', 'commit'), 'settled');
+      assert.equal(await r.peekAi('user:a', d), 1, 'commit keeps the charge');
+      assert.equal(await r.settleAi('res-unknown', 'refund'), 'already_settled', 'unknown id is a no-op');
+      // a reservation that is never settled (crashed request) is refunded by expiry
+      assert.equal((await r.reserveAi(e, d, 'res-0004')).ok, true);
+      assert.equal(await r.peekAi('user:a', d), 2);
+      await new Promise((res) => setTimeout(res, 60));
+      assert.equal(await r.expireAiReservations(30), 1);
+      assert.equal(await r.peekAi('user:a', d), 1, 'expired reservation refunded');
+      assert.equal(await r.settleAi('res-0004', 'commit'), 'already_settled', 'late settle after expiry is a no-op');
+      assert.equal(await r.expireAiReservations(30), 0, 'committed reservations never expire');
+      assert.deepEqual(await r.reserveAi([{ key: 'user:z', limit: 0 }], d, 'res-0005'), { ok: false, key: 'user:z' });
     });
 
     test('rate buckets and windows', async () => {
@@ -195,7 +211,7 @@ describe('PostgreSQL specifics', { skip: pgSkip }, () => {
     dbs.push(db);
     const r = new PostgresRepo(db.pool, limits);
     const d = today();
-    const out = await Promise.all(Array.from({ length: 25 }, () => r.reserveAi([{ key: 'user:x', limit: 7 }, { key: 'ip:y', limit: 100 }], d)));
+    const out = await Promise.all(Array.from({ length: 25 }, (_, i) => r.reserveAi([{ key: 'user:x', limit: 7 }, { key: 'ip:y', limit: 100 }], d, `conc-${i}-xxxx`)));
     assert.equal(out.filter((o) => o.ok).length, 7);
     assert.equal(await r.peekAi('user:x', d), 7);
     assert.equal(await r.peekAi('ip:y', d), 7, 'ip charged only for successful reservations');
@@ -247,5 +263,61 @@ describe('PostgreSQL specifics', { skip: pgSkip }, () => {
       await pool.end().catch(() => {});
       await proxy.close();
     }
+  });
+
+  test('R-02 regression: 200 concurrent reserve->refund cycles sharing one IP key never deadlock and net to zero', async () => {
+    const db = await createTestDatabase();
+    dbs.push(db);
+    const r = new PostgresRepo(db.pool, limits);
+    const d = today();
+    const errors: string[] = [];
+    await Promise.all(
+      Array.from({ length: 200 }, async (_, i) => {
+        const id = `storm-${i}-${Math.random().toString(36).slice(2, 10)}`;
+        try {
+          // entries deliberately passed in user->ip order (the order that used to deadlock against the refund)
+          const out = await r.reserveAi([{ key: `user:u${i % 20}`, limit: 1000 }, { key: 'ip:shared', limit: 100000 }], d, id);
+          if (out.ok) await r.settleAi(id, i % 3 === 0 ? 'commit' : 'refund');
+        } catch (err: any) {
+          errors.push(`${err?.code || ''} ${err?.message || err}`);
+        }
+      }),
+    );
+    assert.deepEqual(errors, [], 'no deadlock / serialization errors surfaced');
+    const committed = Array.from({ length: 200 }, (_, i) => i).filter((i) => i % 3 === 0).length;
+    assert.equal(await r.peekAi('ip:shared', d), committed, 'IP counter == committed reservations exactly');
+    const { rows } = await db.pool.query("SELECT status, count(*)::int AS n FROM ai_reservations GROUP BY status ORDER BY status");
+    assert.deepEqual(rows, [{ status: 'committed', n: committed }, { status: 'refunded', n: 200 - committed }]);
+  });
+
+  test('withTx retries a deadlocked transaction safely (rolled back first, applied exactly once)', async () => {
+    const db = await createTestDatabase();
+    dbs.push(db);
+    await db.pool.query('CREATE TABLE t (id int PRIMARY KEY, v int)');
+    await db.pool.query('INSERT INTO t VALUES (1, 0), (2, 0)');
+    // Two transactions lock rows 1 and 2 in opposite order: PostgreSQL aborts one with 40P01; withTx retries it.
+    const barrier = (() => {
+      let n = 0;
+      let release!: () => void;
+      const p = new Promise<void>((res) => (release = res));
+      return () => {
+        n++;
+        if (n === 2) release();
+        return p;
+      };
+    })();
+    let firstAttempts = 0;
+    const run = (a: number, b: number) =>
+      withTx(db.pool, async (tx) => {
+        if (a === 1) firstAttempts++;
+        await tx.query('UPDATE t SET v = v + 1 WHERE id = $1', [a]);
+        if (firstAttempts <= 1 || a !== 1) await Promise.race([barrier(), new Promise((r) => setTimeout(r, 300))]);
+        await tx.query('UPDATE t SET v = v + 1 WHERE id = $1', [b]);
+      });
+    const retriesBefore = poolModule.txRetryCount;
+    await Promise.all([run(1, 2), run(2, 1)]);
+    assert.ok(poolModule.txRetryCount > retriesBefore, 'a real deadlock occurred and was retried (not a vacuous pass)');
+    const { rows } = await db.pool.query('SELECT id, v FROM t ORDER BY id');
+    assert.deepEqual(rows, [{ id: 1, v: 2 }, { id: 2, v: 2 }], 'both transactions applied exactly once each');
   });
 });

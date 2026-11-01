@@ -58,7 +58,6 @@ export function tlsConfig(connectionString: string): { url: string; ssl: pg.Pool
   return { url: u.toString(), ssl: { rejectUnauthorized: verify } };
 }
 
-/** Runs fn inside a transaction (READ COMMITTED). Rolls back on any error and rethrows it. */
 /**
  * Checks out a client for exclusive use. node-postgres emits 'error' on a CHECKED-OUT client whose connection
  * dies (database restart, failover, network cut); without a listener that is an uncaught exception that kills
@@ -88,27 +87,48 @@ export async function checkout(db: Db): Promise<{ client: Tx; release: () => voi
   };
 }
 
-/** Runs fn inside a transaction (READ COMMITTED). Rolls back on any error and rethrows it. */
-export async function withTx<T>(db: Db, fn: (tx: Tx) => Promise<T>): Promise<T> {
-  const { client, release, broken } = await checkout(db);
-  try {
-    await client.query('BEGIN');
-    const out = await fn(client);
-    await client.query('COMMIT');
-    return out;
-  } catch (err) {
-    if (!broken()) {
-      try {
-        await client.query('ROLLBACK');
-      } catch {
-        // connection already broken; the error below is what matters
+/** SQLSTATEs where the whole transaction was rolled back by the server and may safely be re-run. */
+export const RETRYABLE_SQLSTATES = new Set(['40P01', '40001']); // deadlock_detected, serialization_failure
+export const isRetryableTxError = (err: any) => RETRYABLE_SQLSTATES.has(err?.code);
+
+/**
+ * Runs fn inside a transaction (READ COMMITTED); rolls back on any error. Deadlock/serialization failures are
+ * retried (default 3 attempts, jittered backoff). This is safe because PostgreSQL rolled the whole transaction
+ * back and every fn in this codebase is pure database work (no external side effects), so a retry starts from
+ * a clean state and cannot double-apply. Lock ordering (ADR-003) is the primary defence; this is the backstop.
+ */
+export async function withTx<T>(db: Db, fn: (tx: Tx) => Promise<T>, opts: { attempts?: number } = {}): Promise<T> {
+  const attempts = Math.max(1, opts.attempts ?? 3);
+  for (let attempt = 1; ; attempt++) {
+    const { client, release, broken } = await checkout(db);
+    try {
+      await client.query('BEGIN');
+      const out = await fn(client);
+      await client.query('COMMIT');
+      return out;
+    } catch (err) {
+      if (!broken()) {
+        try {
+          await client.query('ROLLBACK');
+        } catch {
+          // connection already broken; the error below is what matters
+        }
       }
+      if (isRetryableTxError(err) && attempt < attempts && !broken()) {
+        txRetryCount++;
+        console.warn(JSON.stringify({ level: 'warn', event: 'db_tx_retry', code: (err as any).code, attempt }));
+        await new Promise((r) => setTimeout(r, 5 * 2 ** attempt + Math.floor(Math.random() * 20)));
+        continue;
+      }
+      throw err;
+    } finally {
+      release();
     }
-    throw err;
-  } finally {
-    release();
   }
 }
+
+/** Number of transaction retries since start (exposed in detailed health; should stay ~0 after R-02). */
+export let txRetryCount = 0;
 
 /** Stable 64-bit advisory-lock keys (distributed locks across instances). */
 export const LOCKS = {

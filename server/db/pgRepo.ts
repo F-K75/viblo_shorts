@@ -5,7 +5,7 @@
 //  * rate limits: token buckets computed with the database clock (consistent across instances)
 //  * jobs: FOR UPDATE SKIP LOCKED claim, worker heartbeats, reaper for dead workers
 import { StoreLimitError, type StoreLimits } from '../lib/projectStore.ts';
-import { ProjectOwnershipError, userKindOf, type HeartbeatResult, type JobAdmission, type JobDenial, type QuotaEntry, type Repo, type ServerJob, type StoredSubscription } from '../lib/repo.ts';
+import { ProjectOwnershipError, userKindOf, type AiSettlement, type HeartbeatResult, type JobAdmission, type JobDenial, type QuotaEntry, type Repo, type ServerJob, type StoredSubscription } from '../lib/repo.ts';
 import { withTx, type Db, type Tx } from './pool.ts';
 
 const dayDate = (day: number) => new Date(day * 86400000).toISOString().slice(0, 10);
@@ -166,17 +166,27 @@ export class PostgresRepo implements Repo {
   }
 
   // ---------- AI quota ----------
-  async reserveAi(entries: QuotaEntry[], day: number) {
+  // R-02. Lock order (both paths, every instance): the call's own ai_reservations row, then ai_usage_daily rows
+  // in ascending key order. The old refund updated both rows in one `key = ANY(...)` statement, i.e. in scan
+  // order, and deadlocked against reservations that locked user -> ip.
+  async reserveAi(entries: QuotaEntry[], day: number, reservationId: string) {
+    const sorted = [...entries].sort((a, b) => a.key.localeCompare(b.key));
     try {
       await withTx(this.db, async (tx) => {
-        for (const e of entries) {
+        // Idempotency first: a retried reserve whose first attempt committed is a no-op (never charges twice).
+        const ins = await tx.query(
+          `INSERT INTO ai_reservations (id, day, keys, status) VALUES ($1, $2::date, $3::text[], 'reserved') ON CONFLICT (id) DO NOTHING RETURNING id`,
+          [reservationId, dayDate(day), sorted.map((e) => e.key)],
+        );
+        if (ins.rowCount === 0) return;
+        for (const e of sorted) {
           const r = await tx.query(
             `INSERT INTO ai_usage_daily (day, key, count) SELECT $1::date, $2, 1 WHERE $3::int > 0
              ON CONFLICT (day, key) DO UPDATE SET count = ai_usage_daily.count + 1 WHERE ai_usage_daily.count < $3::int
              RETURNING count`,
             [dayDate(day), e.key, e.limit],
           );
-          if (r.rowCount === 0) throw new QuotaRejected(e.key);
+          if (r.rowCount === 0) throw new QuotaRejected(e.key); // rolls back the reservation row too
         }
       });
       return { ok: true as const };
@@ -185,9 +195,37 @@ export class PostgresRepo implements Repo {
       throw err;
     }
   }
-  async refundAi(keys: string[], day: number) {
-    await this.db.query('UPDATE ai_usage_daily SET count = GREATEST(0, count - 1) WHERE day = $1::date AND key = ANY($2::text[])', [dayDate(day), keys]);
+
+  async settleAi(reservationId: string, outcome: AiSettlement): Promise<'settled' | 'already_settled'> {
+    return withTx(this.db, async (tx) => {
+      // Conditional transition: only an open reservation can be settled, so a duplicate/retried settle is a no-op.
+      const r = await tx.query(
+        `UPDATE ai_reservations SET status = $2, settled_at = now() WHERE id = $1 AND status = 'reserved' RETURNING day, keys`,
+        [reservationId, outcome === 'commit' ? 'committed' : 'refunded'],
+      );
+      if (r.rowCount === 0) return 'already_settled' as const;
+      if (outcome === 'refund') {
+        const { day, keys } = r.rows[0];
+        for (const key of [...(keys as string[])].sort()) {
+          await tx.query('UPDATE ai_usage_daily SET count = GREATEST(0, count - 1) WHERE day = $1 AND key = $2', [day, key]);
+        }
+      }
+      return 'settled' as const;
+    });
   }
+
+  async expireAiReservations(ttlMs: number) {
+    // SKIP LOCKED: a reservation being settled right now by its request is left alone (no lock wait, no double settle).
+    const { rows } = await this.db.query(
+      `SELECT id FROM ai_reservations WHERE status = 'reserved' AND created_at < now() - ($1::int * interval '1 millisecond')
+       ORDER BY created_at LIMIT 500 FOR UPDATE SKIP LOCKED`,
+      [Math.max(1, Math.floor(ttlMs))],
+    );
+    let n = 0;
+    for (const { id } of rows) if ((await this.settleAi(id, 'refund')) === 'settled') n++;
+    return n;
+  }
+
   async peekAi(key: string, day: number) {
     const r = (await this.db.query('SELECT count FROM ai_usage_daily WHERE day = $1::date AND key = $2', [dayDate(day), key])).rows[0];
     return r ? Number(r.count) : 0;
@@ -322,6 +360,7 @@ export class PostgresRepo implements Repo {
     await this.db.query("DELETE FROM rate_buckets WHERE refilled_at < now() - interval '10 minutes'");
     await this.db.query('DELETE FROM window_counters WHERE window_id < $1', [Math.floor(Date.now() / 3600000) - 48]);
     await this.db.query("DELETE FROM ai_usage_daily WHERE day < (now() - interval '35 days')::date");
+    await this.db.query("DELETE FROM ai_reservations WHERE status <> 'reserved' AND settled_at < now() - interval '35 days'");
   }
 }
 

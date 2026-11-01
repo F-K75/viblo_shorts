@@ -34,7 +34,7 @@ import { utcDay } from './server/lib/usage.ts';
 import { JsonRepo } from './server/lib/jsonRepo.ts';
 import { ProjectOwnershipError, type Repo, type ServerJob, type StoredSubscription } from './server/lib/repo.ts';
 import { PostgresRepo } from './server/db/pgRepo.ts';
-import { createPool, isUnavailable } from './server/db/pool.ts';
+import { createPool, isUnavailable, isRetryableTxError } from './server/db/pool.ts';
 import { migrate } from './server/db/migrate.ts';
 import { createSnapshot, listSnapshots, pruneSnapshots, writeServerLock, removeServerLock } from './server/lib/backup.ts';
 import { cleanAndParseJSON, validateScript, normalizeHashtags, quoteUserInput } from './server/lib/llm.ts';
@@ -184,8 +184,8 @@ declare global {
     interface Request {
       identity?: AuthIdentity | null;
       requestId?: string;
-      /** Set by rateLimit({ai:true}): the daily-quota units reserved for this request. */
-      aiReservation?: { keys: string[]; day: number };
+      /** Set by rateLimit({ai:true}): the daily-quota reservation for this request. */
+      aiReservation?: { id: string; keys: string[]; day: number };
       /** Set by an AI handler when a real model result (not a fallback) is returned; otherwise the quota is refunded. */
       aiSucceeded?: boolean;
     }
@@ -303,6 +303,9 @@ const isAdmin = (req: express.Request) => Boolean(req.identity?.isAdmin);
 // RATE LIMITING & AI QUOTA
 // ==========================================
 const IP_DAILY_AI_CAP = envNum('IP_DAILY_AI_CAP', 600, 1);
+// An AI reservation not settled within this time (crashed request, failed settle) is refunded. Must exceed the
+// longest possible AI request (models x attempts x LLM_TIMEOUT_MS, ~2 min by default).
+const AI_RESERVATION_TTL_MS = envNum('AI_RESERVATION_TTL_MS', 15 * 60000, 1000);
 
 const clientIp = (req: express.Request) => req.ip || req.socket.remoteAddress || 'unknown';
 
@@ -330,12 +333,15 @@ function rateLimit(group: string, maxPerMinute: number, opts: { ai?: boolean } =
       const userKey = `user:${userId}`;
       const ipKey = `ip:${ip}`;
       const day = utcDay();
+      // One reservation per AI call (R-02): settled exactly once below; never-settled ones are refunded by expiry.
+      const reservationId = crypto.randomUUID();
       const r = await repo.reserveAi(
         [
           { key: userKey, limit: sub.dailyQuotaLimit },
           { key: ipKey, limit: IP_DAILY_AI_CAP },
         ],
         day,
+        reservationId,
       );
       if (!r.ok) {
         return res.status(429).json({
@@ -346,15 +352,17 @@ function rateLimit(group: string, maxPerMinute: number, opts: { ai?: boolean } =
           quotaExceeded: true,
         });
       }
-      req.aiReservation = { keys: [userKey, ipKey], day };
-      // Refund when the full response was sent without a real model result (fallback, validation error,
-      // provider failure). A request aborted by the client keeps its charge: the model may still have run.
+      req.aiReservation = { id: reservationId, keys: [userKey, ipKey], day };
+      // Settle once when the response is done:
+      //  * real model output, or the client aborted (the model may still have run) -> commit (charged);
+      //  * fallback / validation error / provider failure with a complete response -> refund.
+      // If settling fails, the reservation stays open and expiry refunds it (the user is never charged for a
+      // failure; at worst a successful call is not charged).
       res.on('close', () => {
-        if (!req.aiSucceeded && res.writableFinished) {
-          repo.refundAi([userKey, ipKey], day).catch((err) => {
-            console.error(JSON.stringify({ level: 'error', event: 'ai_refund_failed', error: String(err?.message || err) }));
-          });
-        }
+        const outcome = req.aiSucceeded || !res.writableFinished ? 'commit' : 'refund';
+        repo.settleAi(reservationId, outcome).catch((err) => {
+          console.error(JSON.stringify({ level: 'error', event: 'ai_quota_settle_failed', outcome, error: String(err?.message || err).slice(0, 200) }));
+        });
       });
       res.setHeader('X-Daily-Quota-Remaining', String(Math.max(0, sub.dailyQuotaLimit - (await repo.peekAi(userKey, day)))));
     }
@@ -2511,6 +2519,13 @@ app.use((err: any, req: express.Request, res: express.Response, _next: express.N
     if (res.headersSent) return;
     return res.status(404).json({ error: 'Project not found' });
   }
+  if (isRetryableTxError(err)) {
+    // Only reachable after withTx exhausted its retries (lock ordering makes this rare); nothing was applied.
+    console.error(JSON.stringify({ level: 'error', event: 'db_tx_conflict_exhausted', rid: req.requestId, code: err.code, path: req.path }));
+    if (res.headersSent) return;
+    res.setHeader('Retry-After', '1');
+    return res.status(503).json({ error: 'The server is busy. Nothing was changed. Please retry.', code: 'conflict_retry', requestId: req.requestId });
+  }
   if (isUnavailable(err)) {
     console.error(JSON.stringify({ level: 'error', event: 'database_unavailable_request', rid: req.requestId, path: req.path, error: String(err?.message || err).slice(0, 200) }));
     if (res.headersSent) return;
@@ -2607,6 +2622,9 @@ export async function startServer(): Promise<Server> {
     repo.reapStaleJobs(JOB_STALE_MS).then((n) => n && console.warn(JSON.stringify({ level: 'warn', event: 'stale_jobs_reaped', count: n })), logErr('job_reaper_failed'));
   });
   every(5 * 60000, () => void repo.sweep().catch(logErr('storage_sweep_failed')));
+  every(Math.min(60000, Math.max(1000, Math.floor(AI_RESERVATION_TTL_MS / 3))), () => {
+    repo.expireAiReservations(AI_RESERVATION_TTL_MS).then((n) => n && console.warn(JSON.stringify({ level: 'warn', event: 'ai_reservations_expired_refunded', count: n })), logErr('ai_reservation_expiry_failed'));
+  });
   void pumpRenderQueue(); // queued jobs that survived a restart
 
   let shuttingDown = false;

@@ -4,7 +4,7 @@ import path from 'path';
 import { ProjectStore, type StoreLimits } from './projectStore.ts';
 import { readJsonFile, writeJsonFileAtomic } from './storage.ts';
 import { UsageLedger } from './usage.ts';
-import { ProjectOwnershipError, type HeartbeatResult, type JobAdmission, type JobDenial, type QuotaEntry, type Repo, type ServerJob, type StoredSubscription } from './repo.ts';
+import { ProjectOwnershipError, type AiSettlement, type HeartbeatResult, type JobAdmission, type JobDenial, type QuotaEntry, type Repo, type ServerJob, type StoredSubscription } from './repo.ts';
 
 const MAX_STORED_JOBS = 500;
 
@@ -105,11 +105,14 @@ export class JsonRepo implements Repo {
   }
 
   // ---------- AI quota ----------
-  async reserveAi(entries: QuotaEntry[], _day: number) {
-    return this.ledger.reserve(entries);
+  async reserveAi(entries: QuotaEntry[], _day: number, reservationId: string) {
+    return this.ledger.reserve([...entries].sort((a, b) => a.key.localeCompare(b.key)), reservationId);
   }
-  async refundAi(keys: string[], day: number) {
-    this.ledger.refund(keys, day);
+  async settleAi(reservationId: string, outcome: AiSettlement) {
+    return this.ledger.settle(reservationId, outcome);
+  }
+  async expireAiReservations(ttlMs: number) {
+    return this.ledger.expire(ttlMs);
   }
   async peekAi(key: string, _day: number) {
     return this.ledger.peek(key);

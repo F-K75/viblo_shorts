@@ -28,6 +28,8 @@ export interface ServerJob {
   workerId?: string;
 }
 
+export type AiSettlement = 'commit' | 'refund';
+
 export interface QuotaEntry {
   key: string;
   limit: number;
@@ -72,8 +74,18 @@ export interface Repo {
   addRenderMinutes(userId: string, seconds: number, defaults: StoredSubscription): Promise<void>;
 
   // ---- daily AI quota (atomic all-or-nothing reservation across instances) ----
-  reserveAi(entries: QuotaEntry[], day: number): Promise<{ ok: true } | { ok: false; key: string }>;
-  refundAi(keys: string[], day: number): Promise<void>;
+  /**
+   * Reserves one unit on every key, all or nothing, under a caller-generated reservation id. Idempotent per id: a
+   * retried reserve with the same id never charges twice.
+   */
+  reserveAi(entries: QuotaEntry[], day: number, reservationId: string): Promise<{ ok: true } | { ok: false; key: string }>;
+  /**
+   * Settles a reservation exactly once: 'commit' keeps the charge, 'refund' returns it. Settling an already
+   * settled (or unknown) reservation is a no-op, so retries can never double-refund.
+   */
+  settleAi(reservationId: string, outcome: AiSettlement): Promise<'settled' | 'already_settled'>;
+  /** Refunds reservations left open longer than ttlMs (crashed request, failed settle). Returns how many. */
+  expireAiReservations(ttlMs: number): Promise<number>;
   peekAi(key: string, day: number): Promise<number>;
 
   // ---- rate limiting (shared token buckets) ----

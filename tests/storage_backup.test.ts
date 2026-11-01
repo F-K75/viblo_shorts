@@ -163,23 +163,29 @@ test('prune keeps the newest scheduled snapshots and never prunes other reasons'
   assert.equal(all.filter((s) => s.reason === 'pre-migration').length, 1);
 });
 
-test('usage ledger: reserve is all-or-nothing, refund restores, counts persist, corrupt file fails closed', () => {
+test('usage ledger: all-or-nothing reserve, idempotent settle, open reservations persist and expire, corrupt file fails closed', () => {
   const dir = tmp();
   const file = path.join(dir, 'usage.json');
   const l = new UsageLedger(file, 0);
-  const e = [{ key: 'user:a', limit: 2 }, { key: 'ip:1', limit: 3 }];
-  assert.equal(l.reserve(e).ok, true);
-  assert.equal(l.reserve(e).ok, true);
-  assert.deepEqual(l.reserve(e), { ok: false, key: 'user:a' });
+  const e = [{ key: 'ip:1', limit: 3 }, { key: 'user:a', limit: 2 }];
+  assert.equal(l.reserve(e, 'r1').ok, true);
+  assert.equal(l.reserve(e, 'r1').ok, true, 'retried reserve');
+  assert.equal(l.peek('user:a'), 1, 'not charged twice');
+  assert.equal(l.reserve(e, 'r2').ok, true);
+  assert.deepEqual(l.reserve(e, 'r3'), { ok: false, key: 'user:a' });
   assert.equal(l.peek('ip:1'), 2, 'failed reservation charges nothing');
-  l.refund(['user:a', 'ip:1'], Math.floor(Date.now() / 86400000));
-  assert.equal(l.peek('user:a'), 1);
+  assert.equal(l.settle('r2', 'refund'), 'settled');
+  assert.equal(l.settle('r2', 'refund'), 'already_settled');
+  assert.equal(l.peek('user:a'), 1, 'no double refund');
   l.flush();
-  assert.equal(new UsageLedger(file, 0).peek('user:a'), 1, 'persisted across restart');
+  const reloaded = new UsageLedger(file, 0);
+  assert.equal(reloaded.peek('user:a'), 1, 'counts persisted across restart');
+  assert.equal(reloaded.expire(-1), 1, 'open reservation r1 survived the restart and expires');
+  assert.equal(reloaded.peek('user:a'), 0);
   fs.writeFileSync(file, '{bad');
   const broken = new UsageLedger(file, 0);
   assert.equal(broken.available, false);
-  assert.throws(() => broken.reserve(e), (err: any) => err instanceof StoreUnavailableError);
+  assert.throws(() => broken.reserve(e, 'r9'), (err: any) => err instanceof StoreUnavailableError);
   broken.flush();
   assert.equal(fs.readFileSync(file, 'utf8'), '{bad', 'corrupt ledger never overwritten');
 });
