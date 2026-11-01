@@ -1,18 +1,100 @@
 # Forge Studio — Release Assessment
 
-**Current status:** Phase 1 ("Stop the bleed") implemented and at its validation gate · **Date:** 2026-11-01 ·
-**Branch:** `claude/keen-feynman-xtbvz2` · Nothing was deployed.
+**Current status:** Phase 2 ("Durable architecture") implemented and at its validation gate · **Date:** 2026-11-01 ·
+**Branches:** Phase 1 `claude/keen-feynman-xtbvz2` ([F-K75/viblo_shorts#2](https://github.com/F-K75/viblo_shorts/pull/2), CI green, awaiting review) ·
+Phase 2 `claude/keen-feynman-xtbvz2-phase2` (stacked on Phase 1) · Nothing was deployed. No infrastructure was created.
 
-The Phase 0 discovery report follows unchanged in Part B. Part A records what Phase 1 changed, the evidence,
-and what is still open.
+Part P2 records Phase 2. Part A (Phase 1) and Part B (Phase 0 discovery) follow unchanged.
 
-## FORGE STUDIO RELEASE READINESS SCORE: 53/100 (Phase 0: 40)
+## FORGE STUDIO RELEASE READINESS SCORE: 64/100 (Phase 1: 53 · Phase 0: 40)
 
 ## Verdict: **NOT READY FOR RELEASE**
 
-The P0 abuse and data-loss holes are closed for a single-instance deployment and proven by regression tests.
-Release is still blocked by FS-003 (real AI never observed), by the Phase 2 durability work (PostgreSQL,
-off-host backups) and by the Phase 3 product and auth fixes.
+Storage is now transactional, multi-instance safe, and backed up off-site with encryption and a tested
+restore. Release is still blocked by:
+* FS-003: the real Gemini AI has never been observed.
+* Choosing and configuring the managed PostgreSQL provider (HA, PITR, region), which is your decision.
+* The Phase 3 product and auth fixes.
+* Phase 4 operations work: monitoring, CD, object storage for renders.
+
+---
+
+# Part P2 — Phase 2 results
+
+## P2.1 What changed
+| Area | Change | Files |
+|---|---|---|
+| Storage abstraction | One `Repo` interface; `PostgresRepo` (production) and `JsonRepo` (Phase 1 behaviour, dev default, rollback target). Both pass the **same** contract tests | `server/lib/repo.ts`, `server/lib/jsonRepo.ts`, `server/db/pgRepo.ts`, `tests/repo_contract.test.ts` |
+| PostgreSQL | `pg` pool (bounded, connect + statement timeouts, TLS policy). Backend selection; production refuses to start without `DATABASE_URL` unless `STORAGE_BACKEND=json` is explicit. Startup waits for the DB with backoff | `server/db/pool.ts`, `server.ts` |
+| Schema + migrations | Normalized schema around ownership (`users` with transactional quota counters, `projects` with the API document in `jsonb`, `subscriptions`, `jobs`, `ai_usage_daily`, `rate_buckets`, `window_counters`, `storage_totals`, `data_migrations`). Indexes follow the actual queries. Append-only, checksummed migrations applied once under an advisory lock | `server/db/migrations/0001_initial.sql`, `server/db/migrate.ts` |
+| Transactions + isolation | Project writes: one transaction with a per-user row lock; ownership re-checked inside it (`ProjectOwnershipError` → 404); fixed lock order (no deadlocks) | `server/db/pgRepo.ts` |
+| Shared limits | Rate-limit buckets (DB clock), guest-mint budget and AI quota (atomic reserve/refund) are shared by every instance and survive restarts | `server/db/pgRepo.ts`, `server.ts` |
+| Job queue | `FOR UPDATE SKIP LOCKED` claims, worker heartbeats, cancellation observed from any instance, reaper for dead workers, admission (5 active jobs + render minutes) atomic with the insert | `server.ts`, `server/db/pgRepo.ts` |
+| Data migration | `npm run data-migration -- plan \| migrate \| export <dir>`: idempotent, dry-runnable, verified in-transaction (owner + byte-identical content), refuses corrupt sources, never touches the JSON source; rollback export into a new directory | `server/db/dataMigration.ts`, `scripts/data-migration.ts` |
+| Encrypted off-site backups | `pg_dump \| age` (public key only; plaintext never on disk) → S3-compatible bucket with a SHA-256 manifest and row counts; verify; restore into an empty DB only, with row-count verification; prune. Backup image with `pg_dump` 17 + `age` | `server/db/offsiteBackup.ts`, `scripts/db-backup.ts`, `Dockerfile.backup` |
+| CI | PostgreSQL 16 service; `REQUIRE_PG_TESTS=1` (a PostgreSQL test can never silently skip); full suite on JSON **and** on PostgreSQL; E2E on both; Docker smoke with **two app containers on one database**, plus the JSON container, unsafe-config refusals and the backup image's tools | `.github/workflows/ci.yml` |
+| Docs | 8 ADRs; backup/recovery runbook with RPO/RTO and JSON→PostgreSQL cut-over and rollback; guest retention **proposal** | `docs/ARCHITECTURE_DECISIONS.md`, `docs/BACKUP_AND_RECOVERY.md`, `docs/GUEST_DATA_RETENTION_PROPOSAL.md` |
+
+**API contract:** unchanged. The whole pre-existing integration suite and the browser E2E pass unmodified on
+PostgreSQL. **Behaviour changes:**
+1. Production requires `DATABASE_URL`, or `STORAGE_BACKEND=json` explicitly.
+2. Queued render jobs now survive a restart and run afterwards; Phase 1 failed them on boot.
+3. A project containing U+0000 is rejected with 400 on PostgreSQL, because `jsonb` cannot store it.
+4. Internal job `workerId` is never exposed in responses.
+
+## P2.2 Validation gate evidence (all executed in this session on real PostgreSQL 16.15)
+| # | Gate requirement | Evidence | Result |
+|---|---|---|---|
+| 1 | Migration of existing user **and guest** projects | `tests/phase2.test.ts` › Gate 1-3: a JSON store produced through the real API (2 signed-in users + 1 guest, unicode content) → `plan` (dry run: verification ok, **0 rows left behind**) → `migrate` (6 inserted, snapshot taken) → served from PostgreSQL: every user, including the guest with the same token, sees exactly their projects, content byte-identical | ✅ |
+| 2 | No missing or wrongly owned records | In-transaction verification reports `missing=0`, `wrongOwner=0`; per-owner counts 3/1/2; quota counters equal the real row sums. A corrupt source shard aborts with **0 rows written** | ✅ |
+| 3 | Rollback tested | After go-live writes in PostgreSQL: re-running `migrate` is idempotent (0 inserted, 6 present; the PG-side edit is reported as `diverged` and **kept**). `export` → new dir → the JSON backend serves the migrated **and** the post-go-live projects. Export refuses a non-empty directory | ✅ |
+| 4 | Concurrent writes | Contract test: 20 parallel saves vs a cap of 5 ⇒ exactly 5, counters exact. Two instances: 20 concurrent saves ⇒ 20 rows, `project_count`=20; 10 concurrent updates of one project from both instances ⇒ 1 row, last writer wins. 12 concurrent job creates across instances vs a cap of 5 ⇒ exactly 5 | ✅ |
+| 5 | Data isolation between users | Cross-instance read, delete and overwrite by another user ⇒ 404, owner unchanged in the DB; isolation re-checked after migration | ✅ |
+| 6 | Rate limits shared across instances | 40 requests alternating between instances ⇒ **exactly 30** (the per-user limit) succeed; global guest-mint budget 4 ⇒ `200×4, 429×2` across instances | ✅ |
+| 7 | AI quota survives restarts and multiple instances | 10 concurrent AI calls over 2 instances vs quota 3 ⇒ exactly 3 real results, 7×429, **stub model called exactly 3 times**; both instances restarted ⇒ usage still 3, further calls 429 on both | ✅ |
+| 8 | Backup restoration against a real database | `pg_dump \| age` → S3 API (stub) → the object contains **no plaintext** (marker absent; `age-encryption.org/v1` header); a backup without recipients is refused; restore refused into a non-empty DB and without the private key; restore into a new DB verified row counts (3 projects); **the application served the restored data and accepted new writes**; a tampered object fails `verify` (checksum mismatch) | ✅ |
+| 9 | Database failure and recovery | TCP-proxy outage: writes ⇒ `503 database_unavailable` in < 5 s (no hang, no crash), `/api/ready` 503, `/api/health` 200; after recovery readiness returns **without a restart**, no data lost, no half-applied write, no unhandled errors. A DB that never comes up ⇒ clear startup failure after the configured retries | ✅ |
+| 10 | Existing API and browser E2E tests pass | Full suite on JSON: **108 tests, 106 pass, 0 fail, 2 skipped** (live Gemini; no key). Full suite with **every server on PostgreSQL: 108 tests, 99 pass, 0 fail, 9 skipped** (2 live Gemini + 7 JSON-file-specific Phase 1 tests whose PostgreSQL equivalents are gates 1-3/8/9). Browser E2E: 1/1 on JSON, 1/1 on PostgreSQL | ✅ |
+| 11 | Production build, typecheck and CI | `npm run lint` 0, `npm run build` 0 locally. **CI: pending.** It runs on the Phase 2 PR, and I will not report it green before it is | ⏳ |
+
+Things that broke during development and how they were fixed:
+* The E2E failed under the new "production requires a database" guard. Fixed by having the test declare its backend; the guard was not weakened.
+* Multi-instance tests got 401s because each test server generated its own signing key. Fixed in the test harness (one key per test process, like production's shared Google certificates).
+* A test deadlocked because `spawnSync` blocked the in-process S3 stub. Fixed with an async CLI helper.
+* The test harness silently returned servers that never became healthy. It now fails loudly.
+
+## P2.3 Issue status after Phase 2
+| ID | Status |
+|---|---|
+| FS-001 storage DoS | **Resolved** (per-user transactional quotas on PostgreSQL; JSON interim fix retained) |
+| FS-002 data loss / no backups | **Resolved in code**: transactional storage, encrypted off-site backups, tested restore. **Open ops items:** choose the provider, enable HA + PITR, create the bucket with object lock, schedule the backup job, run a restore drill on production-sized data |
+| FS-007 quota | **Resolved** (shared, persistent, atomic) |
+| FS-008 proxy / limits | **Resolved** (shared buckets) |
+| FS-018 O(total) reads | **Resolved** on PostgreSQL (indexed per-user queries) |
+| FS-034 guest retention | **Proposal written** (`docs/GUEST_DATA_RETENTION_PROPOSAL.md`); nothing is deleted. Awaiting your approval |
+| **FS-037 (new, P2)** | Rendered MP4s are stored on the rendering instance's disk; behind a non-sticky LB a download can 404. The UI doesn't use server renders. Fix: object storage (Phase 4) |
+| **FS-038 (new, P3)** | `storage_totals('all')` is a write serialization point. Fine now; shard it if it shows in DB metrics |
+| **FS-039 (new, P3)** | Rate-limited requests now do a small DB transaction. Watch DB load; Redis is the documented escape hatch (ADR-004) |
+| FS-003, FS-004–FS-006, FS-009–FS-014, FS-019–FS-031, FS-033, FS-035, FS-036 | Open (Phases 3–5) |
+
+## P2.4 Score
+| Dimension | Weight | P0 | P1 | P2 | Why it moved |
+|---|---:|---:|---:|---:|---|
+| Core functionality | 20 | 9 | 9 | 9 | No product changes (by design) |
+| Security | 20 | 11 | 14 | 15 | Limits hold across instances; DB TLS; encrypted backups with offline key. CSP, identity swap and guest tokens still open |
+| Data reliability | 15 | 3 | 8 | 12 | Transactions, exact quotas, encrypted off-site backups, tested restore and rollback. Provider HA/PITR not configured yet |
+| Testing | 10 | 6 | 8 | 9 | Contract tests on both backends, multi-instance and outage tests, CI cannot skip PostgreSQL tests. Still no frontend tests, no live AI |
+| Infra / deploy / ops | 15 | 5 | 6 | 8 | Backup image, two-instance container smoke in CI. No CD, monitoring or provisioned infrastructure |
+| Performance / scale | 10 | 3 | 5 | 8 | Horizontally scalable app tier (except render files, FS-037) |
+| Product / legal readiness | 10 | 3 | 3 | 3 | Phase 3 |
+| **Total** | **100** | **40** | **53** | **64** | |
+
+## P2.5 Decisions needed from you
+1. **Managed PostgreSQL provider and region**: this determines HA, PITR, the real RPO/RTO and cost.
+2. **Off-site bucket provider/region** (different from the DB) and who holds the age private key.
+3. Approve the RPO/RTO targets and backup schedule in `docs/BACKUP_AND_RECOVERY.md` §2.
+4. Guest retention policy (`docs/GUEST_DATA_RETENTION_PROPOSAL.md`).
+5. When to retire the JSON source after cut-over. Proposal: 30 days, and only after a verified off-site restore.
 
 ---
 

@@ -1,0 +1,143 @@
+# Architecture Decision Records — Phase 2 (durable architecture)
+
+Each record: context → decision → consequences. "Rejected" lists the alternatives considered.
+
+---
+
+## ADR-001 — PostgreSQL via `node-postgres` with a bounded pool; provider-agnostic
+
+**Context.** Phase 1 storage is single-process JSON files. Production must run more than one instance and
+survive instance loss. The approved direction is *managed* PostgreSQL. The provider itself is not chosen yet.
+
+**Decision.**
+* Plain PostgreSQL (≥ 14; tested on 16), accessed with `pg` (node-postgres). No ORM.
+* One pool per instance: `DATABASE_POOL_MAX` (default 10), connect timeout 5 s, **statement timeout 10 s**
+  (a stuck query cannot hold a request forever), idle clients that lose their connection are logged, never
+  fatal.
+* TLS: production uses TLS with certificate verification unless `sslmode=disable` is stated explicitly.
+* Backend selection: `DATABASE_URL` ⇒ PostgreSQL. Production **refuses to start** without `DATABASE_URL`,
+  unless `STORAGE_BACKEND=json` explicitly accepts single-instance JSON storage.
+* Startup waits for the database (10 attempts, exponential backoff), then exits for the orchestrator.
+
+**Consequences.** Any managed provider works (Cloud SQL, RDS/Aurora, Azure, Neon, Supabase, Crunchy…).
+Choosing one remains **your decision**; it determines PITR, HA, region and the RPO/RTO you actually get
+(docs/BACKUP_AND_RECOVERY.md). Connection count = instances × `DATABASE_POOL_MAX`; use the provider's
+pooler (PgBouncer in transaction mode works: the code uses no session state outside transactions) when it
+approaches the server's `max_connections`.
+
+**Rejected.** An ORM (Prisma/Drizzle): a heavier dependency and generated client for ~40 queries.
+SQLite: rejected by product decision; it cannot be shared by multiple instances anyway.
+
+## ADR-002 — Append-only SQL migrations with checksums and an advisory lock
+
+**Decision.** `server/db/migrations/NNNN_name.sql`, applied in order inside **one** transaction by
+`server/db/migrate.ts` at startup (`DATABASE_MIGRATE_ON_START=false` to run them as a separate release step).
+`schema_migrations` stores a SHA-256 per file. An edited, already-applied file is a hard error (fix forward).
+A file in the database that is missing from the build (a newer schema) is also an error. `pg_advisory_xact_lock`
+means concurrent instance start-ups apply each migration exactly once (tested with 3 concurrent runners).
+
+**Consequences.** Schema changes must be backward-compatible with the previous release during a rolling
+deploy (expand → migrate → contract). Down-migrations are deliberately absent: rollback = restore or forward fix.
+
+## ADR-003 — Normalized schema around ownership; the API document kept in `jsonb`
+
+**Decision.**
+* `users(id, kind, storage_bytes, project_count)`: every owner (firebase / guest / legacy). Quota counters
+  live on the user row and are updated **in the same transaction** as the project write, under
+  `SELECT … FOR UPDATE` on that row.
+* `projects(id, user_id → users, title, doc jsonb, size_bytes, created_at, updated_at)`. The API document is
+  stored whole in `doc`, so the existing API contract round-trips unchanged (tested, including unicode and
+  nested beats). Ownership, listing and quota fields are real columns.
+* `storage_totals('all' | 'guest')` for the guest-pool and global caps.
+* `subscriptions`, `jobs`, `ai_usage_daily(day, key)`, `rate_buckets`, `window_counters`, `data_migrations`.
+* Indexes follow the actual queries: `projects(user_id, updated_at DESC)` ("my projects"), PK lookups,
+  `jobs(user_id, created_at DESC)`, a partial index on active jobs, and `rate_buckets(refilled_at)` for the sweep.
+
+**Concurrency rules.** Lock order is always `users → projects → storage_totals('all') → ('guest')`, so the code
+cannot deadlock. Quotas are exact under concurrency (tested: 20 parallel saves against a cap of 5 ⇒ exactly 5;
+counters equal the real row sums).
+
+**Consequences / limits.** The `storage_totals('all')` row is a serialization point for writes that change
+total size. That is fine at current scale (sub-millisecond lock hold). If it becomes hot, shard the counter or
+enforce the global cap asynchronously. Admin "all projects" is capped at 5,000 rows.
+
+## ADR-004 — Rate limits, guest-mint budget and AI quota in PostgreSQL (not Redis)
+
+**Context.** Limits must hold across instances and restarts.
+
+**Decision.** Store them in the same PostgreSQL database:
+* token buckets computed with the **database clock** (consistent across instances), one transaction per request
+  touching ≤ 2 rows, all-or-nothing across the user and IP buckets;
+* AI quota: a conditional upsert per key inside one transaction (all-or-nothing reservation, refund on fallback);
+* hourly guest-mint budget: a fixed-window counter.
+
+**Consequences.** No second stateful service to run, secure, back up and monitor. The cost is about one extra
+indexed write per rate-limited request. Revisit (Redis with Lua token buckets) if request volume makes this a
+measurable load.
+**Rejected.** Redis now: an extra managed dependency for a load the database handles easily. In-memory limits:
+they don't hold across instances (FS-008).
+
+## ADR-005 — Data migration: idempotent, verified, dry-runnable, never destructive; rollback by export
+
+**Decision.** `npm run data-migration -- plan | migrate | export <dir>` (server/db/dataMigration.ts).
+* Reads the Phase 1 JSON store and **refuses corrupt files** (no partial migrations).
+* One transaction under an advisory lock. `INSERT … ON CONFLICT DO NOTHING` means a re-run never overwrites
+  rows written in PostgreSQL after go-live; such rows are reported as `diverged` and kept.
+* Verification inside the transaction: every source project exists with the **same owner** and a
+  byte-identical canonical document. Any missing or wrongly-owned record rolls everything back.
+* `plan` runs the whole thing and then rolls back.
+* `migrate` first takes a verified JSON snapshot. The JSON source is never modified or deleted.
+* Rollback: `export` writes the complete PostgreSQL state into a **new, empty** directory in the Phase 1
+  layout and verifies it; then set `STORAGE_BACKEND=json` + `DATA_DIR`. Writes made after go-live are kept
+  (tested).
+
+**Source data retention.** Keep the JSON directory and its pre-migration snapshot until (a) at least one
+encrypted off-site backup of the migrated database has been restored and verified, and (b) the agreed
+observation window has passed (proposal: 30 days). Deleting them needs your explicit approval.
+
+## ADR-006 — Encrypted off-site backups: `pg_dump | age` to S3-compatible storage
+
+**Decision.** `scripts/db-backup.ts` (image: `Dockerfile.backup`, run from the platform's scheduler).
+* `pg_dump -Fc` is piped straight into `age` (X25519 public-key encryption), so **plaintext never touches disk**.
+  The backup job holds only public keys; the private key is kept offline by operators. A compromised server or
+  bucket cannot read backups.
+* The ciphertext goes to `BACKUP_TARGET=s3://bucket/prefix` (AWS S3, R2, B2, GCS interop, MinIO…) with a
+  manifest: SHA-256, size, schema version, per-table row counts. The manifest is written last, so a listed
+  backup is complete.
+* Restore verifies the checksum, decrypts, `pg_restore`s into an **empty** database only, and verifies row
+  counts. Then you switch `DATABASE_URL` (restore-then-switch, never in place).
+* `file://` targets are disabled unless `BACKUP_ALLOW_FILE_TARGET=1` (tests, or a mounted *remote* filesystem).
+  Same-disk backups are never the only copy.
+* Recommended bucket settings: versioning plus object lock (immutability), a lifecycle rule for retention, and a
+  region/provider different from the database.
+
+**Complementary.** Provider PITR (point-in-time recovery from WAL) is the primary tool for "undo the last hour".
+Logical dumps are the off-site, provider-independent copy.
+
+## ADR-007 — Job queue in PostgreSQL: `SKIP LOCKED` claims, heartbeats, reaper
+
+**Decision.** Any instance claims the oldest queued job with `FOR UPDATE SKIP LOCKED`, so no job is handed
+out twice (tested: 15 concurrent claims for 10 jobs). A processing job carries `worker_id` + `heartbeat_at`.
+Workers heartbeat every second and observe cancellation through the heartbeat, killing ffmpeg even when the
+cancel arrived at another instance (tested). Jobs whose heartbeat is older than `JOB_STALE_MS` (30 s) are
+failed honestly by a reaper on any instance. Admission (5 active jobs, render minutes including those reserved
+by queued jobs) is evaluated **atomically with the insert** under the user's row lock (tested: 12 concurrent
+creates across 2 instances ⇒ exactly 5 accepted).
+
+**Known limit (FS-037).** Rendered MP4 files are written to the local disk of the instance that rendered them.
+Behind a load balancer without sticky routing, `/api/render/download/:id` can hit an instance without the file
+(404). The UI does not use server renders today. The fix is object storage for renders (Phase 4, together with
+CDN delivery).
+
+## ADR-008 — JSON backend kept (development default, rollback target)
+
+**Decision.** `JsonRepo` keeps Phase 1 behaviour unchanged and passes the same contract tests as
+`PostgresRepo` (tests/repo_contract.test.ts). It is the zero-dependency development default and the rollback
+target of ADR-005. In production it must be selected explicitly and is single-instance only.
+
+## Not done in Phase 2 (and why)
+* **Provider selection and provisioning** — needs your decision (cost, region, compliance); no infrastructure
+  was created.
+* **PITR** — a provider feature; configured with the provider, not in this repository. It is not testable here.
+* **Object storage for renders** — Phase 4 (FS-037).
+* **Guest data retention** — proposal only (docs/GUEST_DATA_RETENTION_PROPOSAL.md); nothing is deleted.

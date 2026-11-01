@@ -15,7 +15,7 @@
 | Backend | Node 22, Express 4, run via `tsx` (TypeScript, no compile step) | Single file `server.ts` + pure modules in `server/lib/` |
 | AI | Google Gemini via `@google/genai` 2.24 | Text (JSON schema output) + TTS. Models configurable via env |
 | Media | FFmpeg (server render), Canvas + MediaRecorder (client export), Web Audio | |
-| Persistence | JSON files in `DATA_DIR` (atomic write + rename) | Single-process only — see TECHNICAL_DEBT |
+| Persistence | **PostgreSQL** (production; `server/db/*`, ADR-001…008) or per-user JSON shards (`STORAGE_BACKEND=json`, single instance) behind one `Repo` interface | See docs/ARCHITECTURE_DECISIONS.md |
 | External | YouTube oEmbed / InnerTube captions, Pexels video search, Google Drive API (client-side) | All optional; graceful fallbacks |
 
 ## Runtime topology
@@ -28,12 +28,14 @@ Express server (server.ts) ─────────────┬── serv
   │  security headers, request log,     ├── server/lib/security.ts  (SSRF, render-id, range, drawtext escaping)
   │  CORS, JSON body (1 MB), auth gate, ├── server/lib/youtube.ts   (URL/caption parsing, timing estimation)
   │  per-route token-bucket limiter     ├── server/lib/llm.ts       (JSON parse + schema validation)
-  │                                     └── server/lib/storage.ts   (atomic JSON files)
+  │                                     ├── server/lib/repo.ts      (Repo interface; jsonRepo.ts / db/pgRepo.ts)
+  │                                     └── server/db/*             (pool, migrations, data migration, off-site backups)
   ├── Gemini API (timeouts, 2 attempts × N models, metrics)
   ├── YouTube oEmbed / captions (timeouts, host allowlist)
   ├── Pexels API (timeout)
   ├── ffmpeg child processes (argument array, no shell; queue, max concurrency, kill on cancel/timeout)
-  └── DATA_DIR/{projects,jobs,subscriptions}.json, renders/*.mp4 (TTL sweep), .session_secret (dev only)
+  ├── PostgreSQL: users, projects, subscriptions, jobs (SKIP LOCKED queue), ai_usage_daily, rate_buckets, …
+  └── DATA_DIR: renders/*.mp4 (per instance, TTL sweep); JSON backend files when STORAGE_BACKEND=json
 ```
 
 In development the same process mounts Vite middleware; in production it serves `dist/` statically.
