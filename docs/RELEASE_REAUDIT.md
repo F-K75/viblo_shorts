@@ -32,9 +32,9 @@ Readiness is tracked by milestone, not by the score (see the scorecard below). N
 | Blocker | Status |
 |---|---|
 | **Real Gemini generation never demonstrated** (non-negotiable: real API call → render → preview → export) | ❌ open: needs a `GEMINI_API_KEY` |
-| R-03 guest sign-up / guest pool DoS | ❌ open: `docs/ABUSE_PROTECTION_PROPOSAL.md` awaiting approval |
-| R-04 render queue flooding | ❌ open: same proposal |
-| R-13 upload memory pressure (and 1–6 unexplained dropped sockets) | ❌ open: same proposal |
+| R-03 guest sign-up / guest pool DoS | ❌ open: proposal **approved**; implementation plan `docs/PHASE2_5_PLAN.md` §1 awaiting approval (Phase 2.5 PR after PR #3 merges) |
+| R-04 render queue flooding | ❌ open: approved; plan §2 (no guest server renders, fair queue, global cap) |
+| R-13 upload memory pressure (and 1–6 unexplained dropped sockets) | ❌ open: approved; plan §3 (route limits, semaphore, memory guard, streaming upload design) |
 | Fake password reset (R-05) | ❌ open: Phase 3 |
 | Google Drive identity switching (R-06) | ❌ open: Phase 3 |
 | Guest project ownership / migration on sign-up (R-07) | ❌ open: Phase 3 |
