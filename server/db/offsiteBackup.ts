@@ -168,11 +168,40 @@ const sha256File = async (file: string) => {
   return h.digest('hex');
 };
 
-/** Strip TLS query params the CLI tools would misread; pass sslmode through PGSSLMODE instead. */
-function libpqEnv(url: string): { url: string; env: NodeJS.ProcessEnv } {
+// URL query parameters understood by libpq, mapped to their environment variables.
+const LIBPQ_PARAM_ENV: Record<string, string> = {
+  sslmode: 'PGSSLMODE',
+  sslrootcert: 'PGSSLROOTCERT',
+  sslcert: 'PGSSLCERT',
+  sslkey: 'PGSSLKEY',
+  application_name: 'PGAPPNAME',
+  connect_timeout: 'PGCONNECT_TIMEOUT',
+  options: 'PGOPTIONS',
+  target_session_attrs: 'PGTARGETSESSIONATTRS',
+};
+
+/**
+ * R-11: connection settings for pg_dump / pg_restore / psql as libpq ENVIRONMENT variables. The connection URL
+ * (which contains the password) must never be a command-line argument: argv is readable by other processes on
+ * the host via `ps` / /proc/<pid>/cmdline. The child's environment is private to its user.
+ */
+export function libpqEnv(url: string): NodeJS.ProcessEnv {
   const u = new URL(url);
-  const sslmode = u.searchParams.get('sslmode');
-  return { url: u.toString(), env: sslmode ? { PGSSLMODE: sslmode } : {} };
+  if (!/^postgres(ql)?:$/.test(u.protocol)) throw new Error('DATABASE_URL must be a postgres:// URL');
+  const env: NodeJS.ProcessEnv = {};
+  const host = u.hostname.replace(/^\[|\]$/g, '');
+  if (host) env.PGHOST = decodeURIComponent(host);
+  if (u.port) env.PGPORT = u.port;
+  if (u.username) env.PGUSER = decodeURIComponent(u.username);
+  if (u.password) env.PGPASSWORD = decodeURIComponent(u.password);
+  const db = decodeURIComponent(u.pathname.replace(/^\//, ''));
+  if (db) env.PGDATABASE = db;
+  for (const [k, v] of u.searchParams) {
+    const name = LIBPQ_PARAM_ENV[k];
+    if (!name) throw new Error(`unsupported DATABASE_URL parameter "${k}" for backup tools`);
+    env[name] = v;
+  }
+  return env;
 }
 
 export async function rowCounts(url: string): Promise<{ counts: Record<string, number>; schemaVersion: number | null; serverVersion: string }> {
@@ -252,8 +281,8 @@ export async function createBackup(databaseUrl: string, cfg: OffsiteConfig, reci
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-backup-'));
   const cipherFile = path.join(tmpDir, `${name}.dump.age`);
   try {
-    const { url, env } = libpqEnv(databaseUrl);
-    const dump = run(bin('pg_dump'), ['--format=custom', '--no-owner', '--no-acl', '--dbname', url], { env });
+    const env = libpqEnv(databaseUrl);
+    const dump = run(bin('pg_dump'), ['--format=custom', '--no-owner', '--no-acl'], { env });
     const age = run(bin('age'), [...recipients.flatMap((r) => ['-r', r]), '-o', cipherFile], { stdin: dump.proc.stdout! });
     await Promise.all([dump.done, age.done]);
     const bytes = fs.statSync(cipherFile).size;
@@ -330,14 +359,14 @@ export async function restoreBackup(cfg: OffsiteConfig, name: string, targetUrl:
   try {
     const { manifest, file } = await download(cfg, name, tmpDir);
     const t1 = Date.now();
-    const { url, env } = libpqEnv(targetUrl);
+    const env = libpqEnv(targetUrl);
     // age -d | pg_restore -f - (SQL) | drop unknown session SETs | psql --single-transaction ON_ERROR_STOP.
     // A newer pg_dump (the backup image ships 17; CI runners ship 18) emits session settings an older target
     // server rejects (e.g. `SET transaction_timeout = 0;`, PostgreSQL 17+), which made a direct pg_restore abort.
     const dec = run(bin('age'), ['-d', '-i', identityFile, file]);
     const toSql = run(bin('pg_restore'), ['--no-owner', '--no-acl', '--file=-'], { stdin: dec.proc.stdout! });
     const filtered = toSql.proc.stdout!.pipe(dropUnsupportedSessionSettings(await serverMajor(targetUrl)));
-    const apply = run(bin('psql'), ['-X', '-q', '--set=ON_ERROR_STOP=1', '--single-transaction', '--dbname', url], { stdin: filtered, env });
+    const apply = run(bin('psql'), ['-X', '-q', '--set=ON_ERROR_STOP=1', '--single-transaction'], { stdin: filtered, env });
     await Promise.all([dec.done, toSql.done, apply.done]);
     const t2 = Date.now();
     const after = await rowCounts(targetUrl);
