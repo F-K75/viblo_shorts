@@ -116,6 +116,6 @@ jobs:
           test "$c1" = 1 && test "$c2" = 1
       - name: Backup image has the required tools
         run: |
-          docker run --rm --entrypoint sh forge-backup:ci -c 'pg_dump --version && age --version && node --version'
+          docker run --rm --entrypoint sh forge-backup:ci -c 'pg_dump --version && pg_restore --version && psql --version && age --version && node --version'
           docker run --rm --network forge -e DATABASE_URL='postgres://postgres:postgres@db:5432/postgres?sslmode=disable' \
             -e BACKUP_TARGET=s3://bucket/x forge-backup:ci create 2>&1 | grep -q 'BACKUP_AGE_RECIPIENTS must list age public keys'

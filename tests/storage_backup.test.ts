@@ -195,3 +195,19 @@ test('TRUST_PROXY parsing: explicit in production, "true" rejected, hop counts a
   assert.equal(parseTrustProxy('evil.example.com', true).ok, false);
   assert.equal(parseTrustProxy(undefined, false).ok, true, 'development default: no proxy trusted');
 });
+
+test('restore SQL filter: drops only session SETs the target server lacks; COPY data untouched (pg_dump 18 -> server 16, CI regression)', async () => {
+  const { dropUnsupportedSessionSettings } = await import('../server/db/offsiteBackup.ts');
+  const { Readable } = await import('node:stream');
+  const sql = ['SET statement_timeout = 0;', 'SET transaction_timeout = 0;', 'COPY public.projects (id, doc) FROM stdin;', 'proj_1\tSET transaction_timeout = 0;', '\\.', 'SELECT 1;', ''].join('\n');
+  const run = async (major: number) => {
+    let out = '';
+    for await (const c of Readable.from(sql.match(/.{1,5}/gs)!).pipe(dropUnsupportedSessionSettings(major))) out += c;
+    return out;
+  };
+  const on16 = await run(16);
+  assert.ok(!on16.split('\n').includes('SET transaction_timeout = 0;'), 'header SET removed for a 16 server');
+  assert.ok(on16.includes('proj_1\tSET transaction_timeout = 0;'), 'identical text inside COPY data is data, kept');
+  assert.ok(on16.includes('SET statement_timeout = 0;') && on16.includes('SELECT 1;'));
+  assert.equal(await run(17), sql, 'nothing removed for a server that supports it');
+});

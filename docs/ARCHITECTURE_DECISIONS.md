@@ -12,8 +12,10 @@ survive instance loss. The approved direction is *managed* PostgreSQL. The provi
 **Decision.**
 * Plain PostgreSQL (≥ 14; tested on 16), accessed with `pg` (node-postgres). No ORM.
 * One pool per instance: `DATABASE_POOL_MAX` (default 10), connect timeout 5 s, **statement timeout 10 s**
-  (a stuck query cannot hold a request forever), idle clients that lose their connection are logged, never
-  fatal.
+  (a stuck query cannot hold a request forever). Clients that lose their connection, idle or **checked out
+  mid-transaction**, are logged and destroyed, never fatal. CI found that a checked-out client's `error` event
+  was an uncaught exception that killed the instance during a DB outage; `checkout()` now always attaches a
+  listener, and there is a regression test.
 * TLS: production uses TLS with certificate verification unless `sslmode=disable` is stated explicitly.
 * Backend selection: `DATABASE_URL` ⇒ PostgreSQL. Production **refuses to start** without `DATABASE_URL`,
   unless `STORAGE_BACKEND=json` explicitly accepts single-instance JSON storage.
@@ -104,8 +106,12 @@ observation window has passed (proposal: 30 days). Deleting them needs your expl
 * The ciphertext goes to `BACKUP_TARGET=s3://bucket/prefix` (AWS S3, R2, B2, GCS interop, MinIO…) with a
   manifest: SHA-256, size, schema version, per-table row counts. The manifest is written last, so a listed
   backup is complete.
-* Restore verifies the checksum, decrypts, `pg_restore`s into an **empty** database only, and verifies row
-  counts. Then you switch `DATABASE_URL` (restore-then-switch, never in place).
+* Restore verifies the checksum, decrypts, converts with `pg_restore -f -` to SQL, drops only header session
+  settings the target server does not know, and applies it with `psql --single-transaction -v ON_ERROR_STOP=1`
+  into an **empty** database. It then verifies row counts, and you switch `DATABASE_URL` (restore-then-switch,
+  never in place). Why the SQL path: `pg_dump` must be ≥ the server version, but a newer `pg_dump` (17+) writes
+  `SET transaction_timeout`, which a 16 server rejects. CI caught this with `pg_dump` 18 against server 16; a
+  direct `pg_restore` aborted. Every other error still aborts the restore, and no partial restore is left behind.
 * `file://` targets are disabled unless `BACKUP_ALLOW_FILE_TARGET=1` (tests, or a mounted *remote* filesystem).
   Same-disk backups are never the only copy.
 * Recommended bucket settings: versioning plus object lock (immutability), a lifecycle rule for retention, and a

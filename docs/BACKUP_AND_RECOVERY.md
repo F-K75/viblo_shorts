@@ -51,7 +51,9 @@ on), keep hourly for 48 h, daily for 35 days, monthly for 12 months (bucket life
 1. `npm run db-backup -- list` → pick the backup; `npm run db-backup -- verify <name>` (checksum only).
 2. Create a **new empty** database (never restore over the live one).
 3. `BACKUP_AGE_IDENTITY_FILE=/secure/forge-backup-key.txt npm run db-backup -- restore <name> <new-db-url>`.
-   It refuses a non-empty target or a checksum mismatch, and prints row counts versus the manifest plus timings.
+   It refuses a non-empty target or a checksum mismatch, applies everything in ONE transaction (all or
+   nothing), works when the backup tool is newer than the target server (unknown session settings are dropped),
+   and prints row counts versus the manifest plus timings.
 4. Smoke-test the app against the new database (staging instance), then switch `DATABASE_URL` and roll the
    instances. Keep the old database until the incident is closed.
 

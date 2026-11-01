@@ -54,8 +54,18 @@ PostgreSQL. **Behaviour changes:**
 | 7 | AI quota survives restarts and multiple instances | 10 concurrent AI calls over 2 instances vs quota 3 ⇒ exactly 3 real results, 7×429, **stub model called exactly 3 times**; both instances restarted ⇒ usage still 3, further calls 429 on both | ✅ |
 | 8 | Backup restoration against a real database | `pg_dump \| age` → S3 API (stub) → the object contains **no plaintext** (marker absent; `age-encryption.org/v1` header); a backup without recipients is refused; restore refused into a non-empty DB and without the private key; restore into a new DB verified row counts (3 projects); **the application served the restored data and accepted new writes**; a tampered object fails `verify` (checksum mismatch) | ✅ |
 | 9 | Database failure and recovery | TCP-proxy outage: writes ⇒ `503 database_unavailable` in < 5 s (no hang, no crash), `/api/ready` 503, `/api/health` 200; after recovery readiness returns **without a restart**, no data lost, no half-applied write, no unhandled errors. A DB that never comes up ⇒ clear startup failure after the configured retries | ✅ |
-| 10 | Existing API and browser E2E tests pass | Full suite on JSON: **108 tests, 106 pass, 0 fail, 2 skipped** (live Gemini; no key). Full suite with **every server on PostgreSQL: 108 tests, 99 pass, 0 fail, 9 skipped** (2 live Gemini + 7 JSON-file-specific Phase 1 tests whose PostgreSQL equivalents are gates 1-3/8/9). Browser E2E: 1/1 on JSON, 1/1 on PostgreSQL | ✅ |
+| 10 | Existing API and browser E2E tests pass | Full suite on JSON: **110 tests, 108 pass, 0 fail, 2 skipped** (live Gemini; no key). Full suite with **every server on PostgreSQL: 110 tests, 101 pass, 0 fail, 9 skipped** (2 live Gemini + 7 JSON-file-specific Phase 1 tests whose PostgreSQL equivalents are gates 1-3/8/9). Browser E2E: 1/1 on JSON, 1/1 on PostgreSQL | ✅ |
 | 11 | Production build, typecheck and CI | `npm run lint` 0, `npm run build` 0 locally. **CI: pending.** It runs on the Phase 2 PR, and I will not report it green before it is | ⏳ |
+
+**Found by the first CI run of this PR and fixed (both real production bugs, not CI artefacts):**
+* **An instance crashed during a database outage.** node-postgres emits `error` on a *checked-out* client whose
+  connection dies, and nothing listened for it. Reproduced with a probe (the process died with
+  `Connection terminated unexpectedly`). `checkout()` now always attaches a listener and destroys broken
+  clients. Regression test added.
+* **Restore failed when the backup tool was newer than the server.** CI's `pg_dump` 18 against server 16 emits
+  `SET transaction_timeout`, and `pg_restore` aborted. The backup image ships `pg_dump` 17, so this would have
+  hit production. Restore now goes through SQL with a version-aware filter that drops only unknown header
+  settings, applied in one transaction with `ON_ERROR_STOP`. Unit test added; CI verifies the real 18 → 16 path.
 
 Things that broke during development and how they were fixed:
 * The E2E failed under the new "production requires a database" guard. Fixed by having the test declare its backend; the guard was not weakened.

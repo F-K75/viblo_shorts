@@ -59,27 +59,54 @@ export function tlsConfig(connectionString: string): { url: string; ssl: pg.Pool
 }
 
 /** Runs fn inside a transaction (READ COMMITTED). Rolls back on any error and rethrows it. */
-export async function withTx<T>(db: Db, fn: (tx: Tx) => Promise<T>): Promise<T> {
+/**
+ * Checks out a client for exclusive use. node-postgres emits 'error' on a CHECKED-OUT client whose connection
+ * dies (database restart, failover, network cut); without a listener that is an uncaught exception that kills
+ * the process (verified). The listener records the error, and release() then destroys the broken client instead
+ * of returning it to the pool.
+ */
+export async function checkout(db: Db): Promise<{ client: Tx; release: () => void; broken: () => Error | null }> {
   let client: Tx;
   try {
     client = await db.connect();
   } catch (err: any) {
     throw new DatabaseUnavailableError(`cannot connect to database: ${err?.message || err}`);
   }
+  let brokenErr: Error | null = null;
+  const onError = (err: Error) => {
+    brokenErr = err;
+    console.error(JSON.stringify({ level: 'error', event: 'db_client_connection_lost', error: String(err?.message || err).slice(0, 200) }));
+  };
+  client.on('error', onError);
+  return {
+    client,
+    broken: () => brokenErr,
+    release: () => {
+      client.off('error', onError);
+      client.release(brokenErr ?? undefined);
+    },
+  };
+}
+
+/** Runs fn inside a transaction (READ COMMITTED). Rolls back on any error and rethrows it. */
+export async function withTx<T>(db: Db, fn: (tx: Tx) => Promise<T>): Promise<T> {
+  const { client, release, broken } = await checkout(db);
   try {
     await client.query('BEGIN');
     const out = await fn(client);
     await client.query('COMMIT');
     return out;
   } catch (err) {
-    try {
-      await client.query('ROLLBACK');
-    } catch {
-      // connection already broken; the error below is what matters
+    if (!broken()) {
+      try {
+        await client.query('ROLLBACK');
+      } catch {
+        // connection already broken; the error below is what matters
+      }
     }
     throw err;
   } finally {
-    client.release();
+    release();
   }
 }
 

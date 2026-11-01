@@ -9,7 +9,9 @@ import { PostgresRepo } from '../server/db/pgRepo.ts';
 import { ProjectOwnershipError, type Repo } from '../server/lib/repo.ts';
 import { StoreLimitError, type StoreLimits } from '../server/lib/projectStore.ts';
 import { migrate } from '../server/db/migrate.ts';
-import { createTestDatabase, pgSkip, type TestDb } from './helpers/pg.ts';
+import { createTestDatabase, pgSkip, PG_ADMIN_URL, type TestDb } from './helpers/pg.ts';
+import { startTcpProxy } from './helpers/tcpProxy.ts';
+import { checkout, withTx, createPool } from '../server/db/pool.ts';
 
 const KB = 1024;
 const limits: StoreLimits = {
@@ -208,5 +210,42 @@ describe('PostgreSQL specifics', { skip: pgSkip }, () => {
     const ids = claims.filter(Boolean).map((j) => j!.id);
     assert.equal(ids.length, 10);
     assert.equal(new Set(ids).size, 10);
+  });
+
+  test('a connection lost while a client is checked out is an error, never an uncaught exception (CI regression)', async () => {
+    const admin = new URL(PG_ADMIN_URL);
+    const proxy = await startTcpProxy(admin.hostname, Number(admin.port || 5432));
+    const u = new URL(PG_ADMIN_URL);
+    u.hostname = '127.0.0.1';
+    u.port = String(proxy.port);
+    const pool = createPool(u.toString(), { max: 2 });
+    const uncaught: unknown[] = [];
+    const onUncaught = (e: unknown) => uncaught.push(e);
+    process.on('uncaughtException', onUncaught);
+    try {
+      // 1. idle-but-checked-out client (between statements of a transaction)
+      const held = await checkout(pool);
+      await held.client.query('BEGIN');
+      await proxy.down();
+      await new Promise((r) => setTimeout(r, 300));
+      assert.ok(held.broken(), 'loss recorded on the client');
+      held.release(); // destroyed, not returned to the pool
+      // 2. a transaction running while the connection dies rejects cleanly
+      await proxy.up();
+      await assert.rejects(
+        withTx(pool, async (tx) => {
+          await tx.query('SELECT 1');
+          await proxy.down();
+          await tx.query('SELECT pg_sleep(0.2)');
+        }),
+      );
+      await proxy.up();
+      assert.equal((await pool.query('SELECT 1 AS ok')).rows[0].ok, 1, 'pool recovers with fresh connections');
+      assert.deepEqual(uncaught, []);
+    } finally {
+      process.off('uncaughtException', onUncaught);
+      await pool.end().catch(() => {});
+      await proxy.close();
+    }
   });
 });

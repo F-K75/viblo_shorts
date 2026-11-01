@@ -18,7 +18,7 @@ import path from 'path';
 import { readJsonFile, writeJsonFileAtomic } from '../lib/storage.ts';
 import { shardFileName } from '../lib/projectStore.ts';
 import { userKindOf, type ServerJob, type StoredSubscription } from '../lib/repo.ts';
-import { LOCKS, withTx, type Db } from './pool.ts';
+import { LOCKS, checkout, withTx, type Db } from './pool.ts';
 
 export interface JsonSource {
   projects: Array<{ ownerId: string; project: any }>;
@@ -223,7 +223,7 @@ export async function exportPostgresToJson(db: Db, targetDir: string): Promise<E
   }
   fs.mkdirSync(path.join(targetDir, 'projects'), { recursive: true });
   // One REPEATABLE READ snapshot so every table is exported from the same point in time.
-  const client = await db.connect();
+  const { client, release } = await checkout(db);
   try {
     await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
     const projects = (await client.query('SELECT user_id, doc FROM projects ORDER BY user_id, updated_at DESC')).rows;
@@ -264,6 +264,6 @@ export async function exportPostgresToJson(db: Db, targetDir: string): Promise<E
     await client.query('ROLLBACK').catch(() => {});
     throw err;
   } finally {
-    client.release();
+    release();
   }
 }

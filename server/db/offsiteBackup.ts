@@ -14,6 +14,7 @@ import os from 'os';
 import path from 'path';
 import { spawn } from 'child_process';
 import { pipeline } from 'stream/promises';
+import { Transform } from 'stream';
 import { DeleteObjectCommand, GetObjectCommand, ListObjectsV2Command, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import pg from 'pg';
 
@@ -176,6 +177,7 @@ function libpqEnv(url: string): { url: string; env: NodeJS.ProcessEnv } {
 
 export async function rowCounts(url: string): Promise<{ counts: Record<string, number>; schemaVersion: number | null; serverVersion: string }> {
   const c = new pg.Client({ connectionString: url.replace(/[?&]sslmode=disable/, '') });
+  c.on('error', () => {}); // a dropped connection surfaces as a rejected query below, never as an uncaught exception
   await c.connect();
   try {
     const counts: Record<string, number> = {};
@@ -189,6 +191,51 @@ export async function rowCounts(url: string): Promise<{ counts: Record<string, n
   } finally {
     await c.end();
   }
+}
+
+/** Session settings newer pg_dump versions emit in the dump header, with the server major that introduced them. */
+const SESSION_SETTINGS_SINCE: Record<string, number> = { transaction_timeout: 17 };
+
+async function serverMajor(url: string): Promise<number> {
+  const c = new pg.Client({ connectionString: url.replace(/[?&]sslmode=disable/, '') });
+  c.on('error', () => {});
+  await c.connect();
+  try {
+    return Math.floor(Number((await c.query('SHOW server_version_num')).rows[0].server_version_num) / 10000);
+  } finally {
+    await c.end();
+  }
+}
+
+/**
+ * Line filter for pg_restore SQL output: removes only top-level `SET <name> = ...;` lines for settings the target
+ * server major does not know. Data (COPY blocks) and every other statement pass through unchanged.
+ */
+export function dropUnsupportedSessionSettings(targetMajor: number): Transform {
+  const unsupported = Object.entries(SESSION_SETTINGS_SINCE).filter(([, since]) => targetMajor < since).map(([n]) => n);
+  const re = unsupported.length ? new RegExp(`^SET (${unsupported.join('|')}) = [^;]*;$`) : null;
+  let carry = '';
+  let inCopy = false;
+  const handle = (line: string) => {
+    if (inCopy) {
+      if (line === '\\.') inCopy = false;
+      return line;
+    }
+    if (/^COPY .* FROM stdin;$/.test(line)) inCopy = true;
+    return re && re.test(line) ? null : line;
+  };
+  return new Transform({
+    transform(chunk, _enc, cb) {
+      const parts = (carry + chunk.toString('utf8')).split('\n');
+      carry = parts.pop() ?? '';
+      const out = parts.map(handle).filter((l) => l !== null);
+      cb(null, out.length ? out.join('\n') + '\n' : '');
+    },
+    flush(cb) {
+      const last = carry ? handle(carry) : null;
+      cb(null, last ?? '');
+    },
+  });
 }
 
 const bin = (name: string) => process.env[`${name.toUpperCase().replace(/[^A-Z]/g, '_')}_PATH`] || name;
@@ -284,9 +331,14 @@ export async function restoreBackup(cfg: OffsiteConfig, name: string, targetUrl:
     const { manifest, file } = await download(cfg, name, tmpDir);
     const t1 = Date.now();
     const { url, env } = libpqEnv(targetUrl);
+    // age -d | pg_restore -f - (SQL) | drop unknown session SETs | psql --single-transaction ON_ERROR_STOP.
+    // A newer pg_dump (the backup image ships 17; CI runners ship 18) emits session settings an older target
+    // server rejects (e.g. `SET transaction_timeout = 0;`, PostgreSQL 17+), which made a direct pg_restore abort.
     const dec = run(bin('age'), ['-d', '-i', identityFile, file]);
-    const restore = run(bin('pg_restore'), ['--no-owner', '--no-acl', '--exit-on-error', '--dbname', url], { stdin: dec.proc.stdout!, env });
-    await Promise.all([dec.done, restore.done]);
+    const toSql = run(bin('pg_restore'), ['--no-owner', '--no-acl', '--file=-'], { stdin: dec.proc.stdout! });
+    const filtered = toSql.proc.stdout!.pipe(dropUnsupportedSessionSettings(await serverMajor(targetUrl)));
+    const apply = run(bin('psql'), ['-X', '-q', '--set=ON_ERROR_STOP=1', '--single-transaction', '--dbname', url], { stdin: filtered, env });
+    await Promise.all([dec.done, toSql.done, apply.done]);
     const t2 = Date.now();
     const after = await rowCounts(targetUrl);
     const verified = Object.entries(manifest.rowCounts).every(([t, n]) => after.counts[t] === n);
