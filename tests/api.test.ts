@@ -4,7 +4,7 @@
 import { test, before, after, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import { startTestServer, guestToken, type TestServer } from './helpers/server.ts';
+import { startTestServer, guestToken, healthDetails, type TestServer } from './helpers/server.ts';
 
 let srv: TestServer;
 let A: string; // alice (guest)
@@ -28,10 +28,11 @@ after(async () => {
 });
 
 describe('health, readiness, config', () => {
-  test('health reports services, memory and AI metrics', async () => {
+  test('public health is liveness only; diagnostics (services, memory, AI metrics) need the diagnostics token', async () => {
     const r = await api('/api/health');
     assert.equal(r.status, 200);
-    const d = await r.json();
+    assert.deepEqual(await r.json(), { status: 'ok' });
+    const d = await healthDetails(srv.baseUrl);
     assert.equal(d.status, 'ok');
     assert.equal(d.services.geminiLlm, 'fallback-engine');
     assert.ok(d.system.heapUsedMb > 0);
@@ -43,10 +44,9 @@ describe('health, readiness, config', () => {
     assert.equal(r.status, 200, JSON.stringify(d));
     assert.deepEqual(d.checks, { storage: true, ffmpeg: true, stores: true });
   });
-  test('config does not leak keys', async () => {
+  test('config exposes feature flags only (no keys, model names or provider details)', async () => {
     const d = await (await api('/api/config')).json();
-    assert.equal(d.hasGeminiKey, false);
-    assert.ok(!JSON.stringify(d).match(/AIza|sk-/));
+    assert.deepEqual(d, { features: { ai: false, stockFootage: false, billing: 'disabled' } });
   });
   test('security headers present, x-powered-by removed', async () => {
     const r = await api('/api/health');

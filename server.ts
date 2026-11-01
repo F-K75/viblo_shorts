@@ -34,7 +34,7 @@ import { utcDay } from './server/lib/usage.ts';
 import { JsonRepo } from './server/lib/jsonRepo.ts';
 import { ProjectOwnershipError, type Repo, type ServerJob, type StoredSubscription } from './server/lib/repo.ts';
 import { PostgresRepo } from './server/db/pgRepo.ts';
-import { createPool, isUnavailable, isRetryableTxError } from './server/db/pool.ts';
+import { createPool, isUnavailable, isRetryableTxError, txRetryCount } from './server/db/pool.ts';
 import { migrate } from './server/db/migrate.ts';
 import { createSnapshot, listSnapshots, pruneSnapshots, writeServerLock, removeServerLock } from './server/lib/backup.ts';
 import { cleanAndParseJSON, validateScript, normalizeHashtags, quoteUserInput } from './server/lib/llm.ts';
@@ -281,7 +281,7 @@ const fetchWithTimeout = (url: string, init: RequestInit = {}, timeoutMs = 8000)
 // ==========================================
 // AUTHENTICATION
 // ==========================================
-const PUBLIC_API = new Set(['/api/health', '/api/ready', '/api/config', '/api/auth/guest']);
+const PUBLIC_API = new Set(['/api/health', '/api/live', '/api/ready', '/api/health/details', '/api/config', '/api/auth/guest']);
 
 app.use('/api', async (req, res, next) => {
   try {
@@ -807,7 +807,56 @@ function checkFfmpeg(): Promise<boolean> {
   });
 }
 
-app.get('/api/health', async (_req, res) => {
+// ---------- R-12: public probes are minimal, cheap and throttled; diagnostics need a credential ----------
+// In-memory per-IP buckets: these endpoints must not create database load (the shared limiter writes to the DB).
+const probeBuckets = new Map<string, { tokens: number; at: number }>();
+function probeLimit(maxPerMinute: number) {
+  return (req: express.Request, res: express.Response, next: express.NextFunction) => {
+    const key = `${req.path}:${clientIp(req)}`;
+    const now = Date.now();
+    const b = probeBuckets.get(key) || { tokens: maxPerMinute, at: now };
+    b.tokens = Math.min(maxPerMinute, b.tokens + ((now - b.at) / 60000) * maxPerMinute);
+    b.at = now;
+    probeBuckets.set(key, b);
+    if (b.tokens < 1) {
+      res.setHeader('Retry-After', '1');
+      return res.status(429).json({ error: 'Too many requests' });
+    }
+    b.tokens -= 1;
+    next();
+  };
+}
+const probeSweep = setInterval(() => {
+  const cutoff = Date.now() - 5 * 60000;
+  for (const [k, b] of probeBuckets) if (b.at < cutoff) probeBuckets.delete(k);
+}, 60000);
+probeSweep.unref();
+const PROBE_LIMIT_PER_MIN = envNum('PROBE_RATE_LIMIT_PER_MIN', 600, 10);
+
+// Liveness: the process is up and serving. No dependencies, no internals.
+const liveness = (_req: express.Request, res: express.Response) => res.json({ status: 'ok' });
+app.get('/api/live', probeLimit(PROBE_LIMIT_PER_MIN), liveness);
+app.get('/api/health', probeLimit(PROBE_LIMIT_PER_MIN), liveness);
+
+// Diagnostics require HEALTH_DETAILS_TOKEN (>= 32 chars, compared in constant time) or an admin identity.
+const HEALTH_DETAILS_TOKEN = process.env.HEALTH_DETAILS_TOKEN?.trim() || '';
+if (HEALTH_DETAILS_TOKEN && HEALTH_DETAILS_TOKEN.length < 32) {
+  console.error('[Config] HEALTH_DETAILS_TOKEN must be at least 32 characters.');
+  process.exit(1);
+}
+function hasDiagnosticsAccess(req: express.Request): boolean {
+  if (isAdmin(req)) return true;
+  if (!HEALTH_DETAILS_TOKEN) return false;
+  const m = /^Bearer\s+(\S+)$/i.exec(String(req.headers.authorization || ''));
+  if (!m) return false;
+  const a = crypto.createHash('sha256').update(m[1]).digest();
+  const b = crypto.createHash('sha256').update(HEALTH_DETAILS_TOKEN).digest();
+  return crypto.timingSafeEqual(a, b);
+}
+
+app.get('/api/health/details', probeLimit(60), async (req, res) => {
+  // 404, not 401/403: do not advertise that a diagnostics endpoint exists.
+  if (!hasDiagnosticsAccess(req)) return res.status(404).json({ error: 'Not found' });
   const mem = process.memoryUsage();
   const storeHealth = await repo.health();
   res.json({
@@ -845,11 +894,31 @@ app.get('/api/health', async (_req, res) => {
     backups: repo.kind === 'json' ? backupStatus() : { mode: 'database', note: 'PostgreSQL: encrypted off-site backups (scripts/db-backup.ts) and provider PITR; see docs/BACKUP_AND_RECOVERY.md' },
     proxy: { trust: trustProxy.ok ? trustProxy.description : 'invalid', untrustedForwardedRequests: proxyDiagnostics.untrustedForwardedRequests },
     guestMintsThisHour,
+    database: repo.kind === 'postgres' ? { txRetries: txRetryCount } : undefined,
+    readinessComputations,
   });
 });
 
 // Readiness: storage writable + ffmpeg present. Returns 503 when the instance cannot serve renders/saves.
-app.get('/api/ready', async (_req, res) => {
+let readyCache: { at: number; body: { ready: boolean; checks: Record<string, boolean> } } | null = null;
+let readyInFlight: Promise<{ ready: boolean; checks: Record<string, boolean> }> | null = null;
+const READY_CACHE_MS = envNum('READY_CACHE_MS', 1000, 0);
+
+app.get('/api/ready', probeLimit(PROBE_LIMIT_PER_MIN), async (_req, res) => {
+  // At most one real check per READY_CACHE_MS per instance, however many probes arrive (R-12).
+  if (!readyCache || Date.now() - readyCache.at > READY_CACHE_MS) {
+    readyInFlight ||= computeReadiness().finally(() => {
+      readyInFlight = null;
+    });
+    readyCache = { at: Date.now(), body: await readyInFlight };
+  }
+  const body = readyCache.body;
+  res.status(body.ready ? 200 : 503).json(body);
+});
+
+let readinessComputations = 0;
+async function computeReadiness() {
+  readinessComputations++;
   let storage = false;
   try {
     const probe = path.join(DATA_DIR, `.ready-${process.pid}`);
@@ -864,17 +933,17 @@ app.get('/api/ready', async (_req, res) => {
   // A single corrupt JSON user shard does not fail readiness.
   const stores = (await repo.health()).ok;
   const ready = storage && ffmpeg && stores;
-  res.status(ready ? 200 : 503).json({ ready, checks: { storage, ffmpeg, stores } });
-});
+  return { ready, checks: { storage, ffmpeg, stores } };
+}
 
-app.get('/api/config', (_req, res) => {
+// Public feature flags only (no model names, provider fingerprints or key details).
+app.get('/api/config', probeLimit(PROBE_LIMIT_PER_MIN), (_req, res) => {
   res.json({
-    llmProvider: 'gemini',
-    llmModel: LLM_MODELS[0],
-    hasGeminiKey: Boolean(resolveGeminiApiKey()),
-    hasPexelsKey: hasPexelsKey(),
-    defaultVoice: process.env.TTS_VOICE || 'Kore',
-    billingConfigured: BILLING_MODE === 'demo' ? 'demo' : false,
+    features: {
+      ai: Boolean(resolveGeminiApiKey()),
+      stockFootage: hasPexelsKey(),
+      billing: BILLING_MODE === 'demo' ? 'demo' : 'disabled',
+    },
   });
 });
 

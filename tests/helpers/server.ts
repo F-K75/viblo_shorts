@@ -35,6 +35,10 @@ async function freePort(): Promise<number> {
 }
 
 const TEST_SIGNING_KEYS = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 });
+/** Diagnostics credential for /api/health/details in tests (R-12: details are not public). */
+export const HEALTH_TOKEN = crypto.randomBytes(24).toString('hex');
+export const healthDetails = async (baseUrl: string) =>
+  (await fetch(`${baseUrl}/api/health/details`, { headers: { authorization: `Bearer ${HEALTH_TOKEN}` } })).json() as Promise<any>;
 
 export async function startTestServer(extraEnv: Record<string, string> = {}): Promise<TestServer> {
   const port = await freePort();
@@ -66,6 +70,7 @@ export async function startTestServer(extraEnv: Record<string, string> = {}): Pr
       FIREBASE_CERTS_FILE: certsFile,
       GEMINI_API_KEY: '',
       PEXELS_API_KEY: '',
+      HEALTH_DETAILS_TOKEN: HEALTH_TOKEN,
       ...env,
     },
     stdio: ['ignore', 'pipe', 'pipe'],

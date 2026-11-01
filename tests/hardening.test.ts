@@ -10,6 +10,7 @@ import pg from 'pg';
 import { createTestDatabase, pgSkip, PG_ADMIN_URL, type TestDb } from './helpers/pg.ts';
 import { startS3Stub } from './helpers/s3Stub.ts';
 import { createBackup, libpqEnv, restoreBackup } from '../server/db/offsiteBackup.ts';
+import { startTestServer, HEALTH_TOKEN, healthDetails } from './helpers/server.ts';
 
 const cleanups: Array<() => Promise<unknown>> = [];
 after(async () => {
@@ -90,5 +91,39 @@ describe('R-11: database credentials never appear in process arguments', () => {
       assert.ok(!/postgres(ql)?:\/\//.test(l), `connection URL in argv: ${l}`);
     }
     assert.ok(lines.filter((l) => /^(pg_dump|psql) /.test(l)).every((l) => l.endsWith('PGPASSWORD_SET=yes')), 'password delivered via the environment');
+  });
+});
+
+describe('R-12: public probes are minimal, cheap and throttled; diagnostics are gated', () => {
+  test('no internals in public responses; details 404 without the token or with a wrong one', async () => {
+    const s = await startTestServer({ PROBE_RATE_LIMIT_PER_MIN: '600' });
+    cleanups.push(() => s.stop());
+    const pub = await (await fetch(`${s.baseUrl}/api/health`)).text();
+    assert.equal(pub, '{"status":"ok"}');
+    assert.equal(await (await fetch(`${s.baseUrl}/api/live`)).text(), '{"status":"ok"}');
+    const ready = await (await fetch(`${s.baseUrl}/api/ready`)).json();
+    assert.deepEqual(Object.keys(ready).sort(), ['checks', 'ready']);
+    for (const body of [pub, JSON.stringify(ready), await (await fetch(`${s.baseUrl}/api/config`)).text()]) {
+      assert.doesNotMatch(body, /instance|hostname|pool|heap|rss|guestMints|proxy|gemini-|model/i);
+    }
+    assert.equal((await fetch(`${s.baseUrl}/api/health/details`)).status, 404);
+    assert.equal((await fetch(`${s.baseUrl}/api/health/details`, { headers: { authorization: `Bearer ${'x'.repeat(48)}` } })).status, 404);
+    const guest = (await (await fetch(`${s.baseUrl}/api/auth/guest`, { method: 'POST' })).json()).token;
+    assert.equal((await fetch(`${s.baseUrl}/api/health/details`, { headers: { authorization: `Bearer ${guest}` } })).status, 404, 'a normal user is not an admin');
+    const ok = await fetch(`${s.baseUrl}/api/health/details`, { headers: { authorization: `Bearer ${HEALTH_TOKEN}` } });
+    assert.equal(ok.status, 200);
+    assert.ok((await ok.json()).system.heapUsedMb > 0);
+  });
+
+  test('a readiness flood triggers at most one real check per cache window, and probes are throttled per IP', async () => {
+    const s = await startTestServer({ PROBE_RATE_LIMIT_PER_MIN: '200', READY_CACHE_MS: '2000' });
+    cleanups.push(() => s.stop());
+    const before = (await healthDetails(s.baseUrl)).readinessComputations;
+    const codes = await Promise.all(Array.from({ length: 300 }, () => fetch(`${s.baseUrl}/api/ready`).then((r) => r.status)));
+    const after = (await healthDetails(s.baseUrl)).readinessComputations;
+    assert.ok(after - before <= 2, `real readiness checks during the flood: ${after - before}`);
+    assert.ok(codes.filter((c) => c === 200).length <= 200 && codes.includes(429), `throttled: ${codes.filter((c) => c === 429).length} x 429`);
+    const h = await Promise.all(Array.from({ length: 250 }, () => fetch(`${s.baseUrl}/api/health`).then((r) => r.status)));
+    assert.ok(h.includes(429), 'liveness flood from one IP is throttled');
   });
 });

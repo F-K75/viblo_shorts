@@ -87,8 +87,9 @@ jobs:
           docker run -d --name db --network forge -e POSTGRES_PASSWORD=postgres postgres:16
           for i in $(seq 1 30); do docker exec db pg_isready -U postgres && break; sleep 2; done
           SECRET=$(openssl rand -hex 32)
+          HEALTH_TOKEN=$(openssl rand -hex 32)
           for n in 1 2; do
-            docker run -d --name app$n --network forge -p 300$n:3000 -e SESSION_SECRET=$SECRET -e TRUST_PROXY=none \
+            docker run -d --name app$n --network forge -p 300$n:3000 -e SESSION_SECRET=$SECRET -e TRUST_PROXY=none -e HEALTH_DETAILS_TOKEN=$HEALTH_TOKEN \
               -e DATABASE_URL='postgres://postgres:postgres@db:5432/postgres?sslmode=disable' forge-studio:ci
           done
           for n in 1 2; do for i in $(seq 1 30); do curl -fsS localhost:300$n/api/ready && break; sleep 2; done; done
@@ -97,7 +98,10 @@ jobs:
           curl -fsS -X POST localhost:3001/api/projects -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' -d '{"title":"ci smoke"}'
           # the project saved on instance 1 is served by instance 2 (shared database)
           curl -fsS localhost:3002/api/projects -H "authorization: Bearer $TOKEN" | grep -q 'ci smoke'
-          curl -fsS localhost:3002/api/health | grep -q '"backend":"postgres"'
+          curl -fsS localhost:3002/api/health/details -H "authorization: Bearer $HEALTH_TOKEN" | grep -q '"backend":"postgres"'
+          # diagnostics are not public
+          test "$(curl -s -o /dev/null -w '%{http_code}' localhost:3002/api/health/details)" = 404
+          test "$(curl -fsS localhost:3002/api/health)" = '{"status":"ok"}'
           docker logs app1
       - name: Container smoke test (explicit single-instance JSON backend + volume backup CLI)
         run: |

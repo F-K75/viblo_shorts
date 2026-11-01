@@ -7,7 +7,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import pg from 'pg';
-import { startTestServer, guestToken, TEST_BACKEND, type TestServer } from './helpers/server.ts';
+import { startTestServer, guestToken, TEST_BACKEND, healthDetails, type TestServer } from './helpers/server.ts';
 import { createTestDatabase } from './helpers/pg.ts';
 
 // These tests exercise the JSON file backend directly (corrupting files, on-volume snapshots). On PostgreSQL the
@@ -262,7 +262,7 @@ describe('Backups', () => {
     const s = await boot();
     let backups: any = null;
     for (let i = 0; i < 20 && !backups?.last; i++) {
-      backups = (await (await call(s, '/api/health')).json()).backups;
+      backups = (await healthDetails(s.baseUrl)).backups;
       if (!backups?.last) await new Promise((r) => setTimeout(r, 100));
     }
     assert.ok(backups.last, JSON.stringify(backups));
@@ -358,7 +358,7 @@ describe('FS-008 proxy configuration', () => {
     const s = await boot();
     const g = await guestToken(s.baseUrl);
     await call(s, '/api/projects', g, { headers: { 'x-forwarded-for': '1.2.3.4' } });
-    const h = await (await call(s, '/api/health')).json();
+    const h = await healthDetails(s.baseUrl);
     assert.ok(h.proxy.untrustedForwardedRequests >= 1);
   });
 });

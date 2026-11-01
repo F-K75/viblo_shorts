@@ -8,7 +8,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import pg from 'pg';
-import { startTestServer, guestToken, type TestServer } from './helpers/server.ts';
+import { startTestServer, guestToken, healthDetails, type TestServer } from './helpers/server.ts';
 import { createTestDatabase, pgSkip, PG_ADMIN_URL, type TestDb } from './helpers/pg.ts';
 import { startGeminiStub } from './helpers/geminiStub.ts';
 import { startS3Stub } from './helpers/s3Stub.ts';
@@ -342,8 +342,8 @@ describe('Gate 9: database failure and recovery', { skip: pgSkip }, () => {
     assert.equal((await call(s, '/api/projects', u)).status, 503);
     assert.equal((await call(s, '/api/ready')).status, 503, 'instance leaves the load balancer rotation');
     const health = await call(s, '/api/health');
-    assert.equal(health.status, 200, 'process alive');
-    assert.equal((await health.json()).storage.ok, false);
+    assert.equal(health.status, 200, 'process alive (liveness has no dependencies)');
+    assert.equal((await healthDetails(s.baseUrl)).storage.ok, false, 'diagnostics report the database down');
 
     await proxy.up();
     let recovered = false;

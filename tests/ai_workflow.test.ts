@@ -3,7 +3,7 @@
 // as fallbacks, and the server never fabricates "transcriptions" of audio it has not heard.
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { startTestServer, guestToken, type TestServer } from './helpers/server.ts';
+import { startTestServer, guestToken, type TestServer, healthDetails } from './helpers/server.ts';
 
 let srv: TestServer;
 let T: string;
@@ -129,6 +129,6 @@ test('stock footage search returns curated results without a Pexels key', async 
 });
 
 test('health exposes AI fallback metrics', async () => {
-  const h = await (await fetch(`${srv.baseUrl}/api/health`)).json();
+  const h = await healthDetails(srv.baseUrl);
   assert.ok(h.ai.fallbacksServed >= 1);
 });
