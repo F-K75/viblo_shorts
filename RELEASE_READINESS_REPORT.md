@@ -23,8 +23,8 @@ no features beyond what the code already promised.
 |---|---|
 | `GEMINI_API_KEY` (none configured) | **Real LLM output was never observed.** All AI tests exercise the real code path down to the provider call, then the fallback. `tests/llm.live.test.ts` exists and reports **SKIPPED (not passed)** without a key |
 | YouTube, Pexels, Mixkit, Unsplash, dicebear, Firebase Auth endpoints (blocked by sandbox egress) | Caption auto-fetch, oEmbed, stock search, remote media and real Firebase sign-in are untested. Firebase **token verification** is tested with locally generated RSA keys |
-| Docker daemon | `Dockerfile` is unbuilt. The container CMD was run directly (`NODE_ENV=production node --import tsx server.ts`) and verified |
-| GitHub Actions | `ci.yml` was written and YAML-validated, and every step was run locally, but the workflow has not run on GitHub |
+| Docker daemon (sandbox only) | Not available locally. **Resolved in CI:** the image built and passed the container smoke test (readiness + guest session) in [run 41295088510](https://github.com/F-K75/viblo_shorts/actions/runs/41295088510). `docker-compose.yml` hardening (read-only FS, limits) is still untested |
+| GitHub Actions | **Resolved:** first run on PR #1 green — `test` (typecheck, unit/integration, build, Playwright E2E, audit gate) and `docker` passed in [run 41295088510](https://github.com/F-K75/viblo_shorts/actions/runs/41295088510). `live-llm` skipped (runs on pushes to `main` only; needs `GEMINI_API_KEY` secret) |
 | Google Drive OAuth | Drive export is untested |
 
 ## 2. Scores
@@ -38,7 +38,7 @@ no features beyond what the code already promised.
 | Security | 5 | 72 | P0/P1 fixed (below). Remaining: no CSP, free guest minting, single-tenant JSON store |
 | Performance | 45 | 62 | Measured (§6). Vendor chunk split. Export is real-time by design |
 | Testing | 15 | 70 | 55 passing + 2 explicitly skipped + 1 browser E2E. Tests import real code. Load script |
-| DevOps | 10 | 55 | Dockerfile, compose, CI, readiness probe, env docs, fail-fast secrets. All unexecuted in the real platforms |
+| DevOps | 10 | 62 | Dockerfile, compose, CI, readiness probe, env docs, fail-fast secrets. CI and Docker image build + smoke test green on GitHub; no deploy pipeline, monitoring or backups |
 | Scalability | 15 | 30 | Bounded queues and caps; still single-process JSON storage and in-memory state |
 | Production readiness | 5 | 40 | See blockers |
 
@@ -109,7 +109,7 @@ Breakdown of remaining: **P0: 0 · P1: 4 · P2: 5 · P3: 3** (details in `docs/T
 * SSRF: caption URLs from YouTube responses pass an allowlist + private-range/IPv6/decimal-IP blocklist.
 * Secrets: keys only read from env; `/api/config` exposes presence booleans only; `.dev.env.json` ignored in production. The Firebase web config in the repo is a public client identifier, not a secret.
 * CORS: same-origin in production unless `ALLOWED_ORIGINS` is set (preflight from a foreign origin returns no ACAO — verified).
-* Container: non-root user, read-only root FS + tmpfs in compose, tini, resource limits (unbuilt).
+* Container: non-root user, tini, healthcheck — image built and smoke-tested in CI. Compose read-only root FS + tmpfs + resource limits not yet exercised.
 * "AI-generated code execution" isolation: **N/A** — the product executes no generated code. The only subprocess is ffmpeg with sanitized parameters, a 120 s kill timeout and a concurrency cap.
 
 ## 6. Performance (measured, `npm run test:load`, 20 concurrent clients, sandbox)
@@ -143,13 +143,13 @@ The store is tiny in these runs; JSON-file latency grows linearly with total dat
 
 ## 8. Deployment readiness
 Ready: Dockerfile (multi-stage, non-root, healthcheck on `/api/ready`), compose, CI (lint → tests → build → E2E → audit gate → docker smoke), `.env.example`, fail-fast config, graceful shutdown, restart-safe jobs.
-Not ready: image never built here, CI never run on GitHub, no backup job, no monitoring/alerting, no rollback procedure beyond redeploying the previous image tag.
+Verified on GitHub: CI pipeline and Docker image build + smoke test pass. Not ready: no deploy pipeline or image registry push, compose hardening untested, no backup job, no monitoring/alerting, no rollback procedure beyond redeploying the previous image tag.
 
 ## 9. Release blockers (must clear before launch)
 1. Run `npm run test:live` with the production Gemini key; confirm model ids, output quality, latency and cost.
 2. Decide the YouTube-source export story (or reposition the product copy).
 3. Replace JSON storage with a managed DB, or explicitly accept single-instance operation with volume snapshots.
-4. Build the Docker image and run CI on GitHub; wire log shipping and alerting on `/api/ready` and error rate.
+4. Wire log shipping and alerting on `/api/ready` and error rate; add a deploy/rollback pipeline (CI and Docker build are already green).
 5. Integrate payments or remove paid-plan UI.
 6. Verify Firebase sign-in and Drive export against the real project (authorized domains, App Check).
 
