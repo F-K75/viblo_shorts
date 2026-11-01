@@ -25,7 +25,7 @@ Readiness is tracked by milestone, not by the score (see the scorecard below). N
 | Browser E2E (JSON, PostgreSQL) | 1/1, 1/1 |
 | Load test (PostgreSQL) | 0 × 5xx; p95: health 31 ms, save 235 ms, list 203 ms, generate-script 147 ms |
 | Regression of every earlier finding | ✅ covered by the suites above |
-| CI on the PR head | ⏳ **pending this push** (will be reported only after the logs are read) |
+| CI on the PR head | ✅ **green on `34b2501`** ([run 41339748515](https://github.com/F-K75/viblo_shorts/actions/runs/41339748515)), logs read. `test`: `pg_dump` 18.6 vs server 16, JSON 122/120/0/2, PostgreSQL 122/113/0/9 (identical to local); the R-02, R-11, R-12 and R-14 suites pass on both; E2E 1/1 on both. `docker`: two instances apply migrations 0001+0002 once, diagnostics 404 without the token and `{"status":"ok"}` public liveness asserted, unsafe configs refused. The first CI run of this round (`1524c44`) failed one **test** of mine: a throttle bound that ignored token-bucket refill (201 vs ≤ 200 allowed; throttle working, 99 × 429). Fixed in `34b2501` with the exact allowance, 5/5 local re-runs green |
 | `bun audit` | unchanged: 3 known advisories (FS-022) |
 
 ### Still open — explicitly tracked release blockers
