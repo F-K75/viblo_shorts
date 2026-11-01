@@ -119,10 +119,16 @@ describe('R-12: public probes are minimal, cheap and throttled; diagnostics are 
     const s = await startTestServer({ PROBE_RATE_LIMIT_PER_MIN: '200', READY_CACHE_MS: '2000' });
     cleanups.push(() => s.stop());
     const before = (await healthDetails(s.baseUrl)).readinessComputations;
+    const t0 = performance.now();
     const codes = await Promise.all(Array.from({ length: 300 }, () => fetch(`${s.baseUrl}/api/ready`).then((r) => r.status)));
+    const elapsedS = (performance.now() - t0) / 1000;
     const after = (await healthDetails(s.baseUrl)).readinessComputations;
-    assert.ok(after - before <= 2, `real readiness checks during the flood: ${after - before}`);
-    assert.ok(codes.filter((c) => c === 200).length <= 200 && codes.includes(429), `throttled: ${codes.filter((c) => c === 429).length} x 429`);
+    assert.ok(after - before <= Math.ceil(elapsedS / 2) + 1, `real readiness checks during the flood: ${after - before} in ${elapsedS.toFixed(2)} s`);
+    // Token bucket: capacity 200 plus refill during the burst (200/min). The first CI run of this test assumed no
+    // refill and failed with 201 successes on a slower runner; the bound below is the exact allowance.
+    const allowed = 200 + Math.ceil(elapsedS * (200 / 60)) + 1;
+    const ok = codes.filter((c) => c === 200).length;
+    assert.ok(ok <= allowed && codes.includes(429), `${ok} x 200 (allowed ${allowed} in ${elapsedS.toFixed(2)} s), ${codes.filter((c) => c === 429).length} x 429`);
     const h = await Promise.all(Array.from({ length: 250 }, () => fetch(`${s.baseUrl}/api/health`).then((r) => r.status)));
     assert.ok(h.includes(429), 'liveness flood from one IP is throttled');
   });
