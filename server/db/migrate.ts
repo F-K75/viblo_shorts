@@ -1,8 +1,15 @@
-// Schema migration runner (ADR-002).
-//  * Files: server/db/migrations/NNNN_name.sql, applied in order, each in its own transaction.
+// Schema migration runner (ADR-002, R-14).
+//  * Files: server/db/migrations/NNNN_name.sql, applied in order. ALL pending files run in ONE transaction:
+//    a failure (error, timeout, lock timeout) rolls everything back, leaving schema and schema_migrations exactly
+//    as before, so a fixed re-run always recovers. A partially applied migration is impossible.
 //  * schema_migrations records version + SHA-256; an applied file that was later edited is a hard error
 //    (migrations are append-only: fix forward with a new file).
 //  * A transaction-scoped advisory lock makes concurrent instance start-ups safe: one applies, the rest wait.
+//  * Timeouts are migration-specific (R-14): the request pool's 10 s statement timeout (and node-postgres'
+//    client-side query timeout) must not cancel a long DDL/backfill midway. Lock waits on tables are bounded
+//    separately, so DDL cannot block live traffic indefinitely.
+//  * Statements that cannot run in a transaction (CREATE INDEX CONCURRENTLY, VACUUM, ...) are rejected up front,
+//    before anything is applied; run those as a separate, manual release step.
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
@@ -18,6 +25,22 @@ export interface MigrationFile {
   checksum: string;
 }
 
+export interface MigrateOptions {
+  /** Max duration of any single migration statement (default MIGRATION_STATEMENT_TIMEOUT_MS or 30 min). */
+  statementTimeoutMs?: number;
+  /** Max wait for a table lock taken by DDL (default MIGRATION_LOCK_TIMEOUT_MS or 60 s). */
+  lockTimeoutMs?: number;
+}
+
+const NON_TRANSACTIONAL = [
+  /\bCONCURRENTLY\b/i,
+  /^\s*VACUUM\b/im,
+  /^\s*CREATE\s+DATABASE\b/im,
+  /^\s*DROP\s+DATABASE\b/im,
+  /^\s*ALTER\s+SYSTEM\b/im,
+  /^\s*(BEGIN|COMMIT|ROLLBACK)\s*;/im,
+];
+
 export function loadMigrations(dir = MIGRATIONS_DIR): MigrationFile[] {
   return fs
     .readdirSync(dir)
@@ -29,33 +52,53 @@ export function loadMigrations(dir = MIGRATIONS_DIR): MigrationFile[] {
     });
 }
 
-export async function migrate(db: Db, dir = MIGRATIONS_DIR): Promise<{ applied: string[]; current: number }> {
+const envMs = (name: string, def: number) => {
+  const n = Number(process.env[name]);
+  return Number.isFinite(n) && n > 0 ? n : def;
+};
+
+export async function migrate(db: Db, dir = MIGRATIONS_DIR, opts: MigrateOptions = {}): Promise<{ applied: string[]; current: number }> {
   const files = loadMigrations(dir);
-  return withTx(db, async (tx) => {
-    await tx.query('SELECT pg_advisory_xact_lock($1)', [LOCKS.migrations]);
-    await tx.query(`CREATE TABLE IF NOT EXISTS schema_migrations (
-      version integer PRIMARY KEY, name text NOT NULL, checksum text NOT NULL, applied_at timestamptz NOT NULL DEFAULT now())`);
-    const { rows } = await tx.query<{ version: number; name: string; checksum: string }>('SELECT version, name, checksum FROM schema_migrations ORDER BY version');
-    const done = new Map(rows.map((r) => [r.version, r]));
-    for (const r of rows) {
-      const f = files.find((x) => x.version === r.version);
-      if (!f) throw new Error(`database has migration ${r.name} that is not in this build (newer schema?); refusing to run`);
-      if (f.checksum !== r.checksum) throw new Error(`migration ${r.name} was modified after it was applied; add a new migration instead`);
-    }
-    const applied: string[] = [];
-    for (const f of files) {
-      if (done.has(f.version)) continue;
-      // Savepoint per file so the error names the failing migration; the outer tx keeps all-or-nothing.
-      await tx.query('SAVEPOINT m');
-      try {
-        await tx.query(f.sql);
-      } catch (err: any) {
-        throw new Error(`migration ${f.name} failed: ${err?.message || err}`);
+  for (const f of files) {
+    const bad = NON_TRANSACTIONAL.find((re) => re.test(f.sql));
+    if (bad) throw new Error(`migration ${f.name} contains a statement that cannot run inside the migration transaction (${bad}); run it as a separate manual step`);
+  }
+  const statementTimeoutMs = Math.floor(opts.statementTimeoutMs ?? envMs('MIGRATION_STATEMENT_TIMEOUT_MS', 30 * 60000));
+  const lockTimeoutMs = Math.floor(opts.lockTimeoutMs ?? envMs('MIGRATION_LOCK_TIMEOUT_MS', 60000));
+  // Client-side timer slightly above the server-side one, so the server reports the precise error first.
+  const q = (text: string, values?: any[]) => ({ text, values, query_timeout: statementTimeoutMs + 5000 });
+
+  return withTx(
+    db,
+    async (tx) => {
+      await tx.query(q(`SET LOCAL statement_timeout = ${statementTimeoutMs}`));
+      // Waiting for another instance's migration is bounded by the migration timeout, not the request timeout.
+      await tx.query(q(`SET LOCAL lock_timeout = ${statementTimeoutMs}`));
+      await tx.query(q('SELECT pg_advisory_xact_lock($1)', [LOCKS.migrations]));
+      await tx.query(q(`SET LOCAL lock_timeout = ${lockTimeoutMs}`));
+      await tx.query(q(`CREATE TABLE IF NOT EXISTS schema_migrations (
+        version integer PRIMARY KEY, name text NOT NULL, checksum text NOT NULL, applied_at timestamptz NOT NULL DEFAULT now())`));
+      const { rows } = await tx.query<{ version: number; name: string; checksum: string }>(q('SELECT version, name, checksum FROM schema_migrations ORDER BY version'));
+      const done = new Map(rows.map((r) => [r.version, r]));
+      for (const r of rows) {
+        const f = files.find((x) => x.version === r.version);
+        if (!f) throw new Error(`database has migration ${r.name} that is not in this build (newer schema?); refusing to run`);
+        if (f.checksum !== r.checksum) throw new Error(`migration ${r.name} was modified after it was applied; add a new migration instead`);
       }
-      await tx.query('RELEASE SAVEPOINT m');
-      await tx.query('INSERT INTO schema_migrations (version, name, checksum) VALUES ($1, $2, $3)', [f.version, f.name, f.checksum]);
-      applied.push(f.name);
-    }
-    return { applied, current: files.length ? files[files.length - 1].version : 0 };
-  });
+      const applied: string[] = [];
+      for (const f of files) {
+        if (done.has(f.version)) continue;
+        try {
+          await tx.query(q(f.sql));
+        } catch (err: any) {
+          const why = err?.code === '57014' ? 'statement timeout' : err?.code === '55P03' ? 'lock timeout (a table is busy)' : err?.message || String(err);
+          throw new Error(`migration ${f.name} failed (${why}); nothing was applied — the schema is unchanged and a fixed re-run will recover`);
+        }
+        await tx.query(q('INSERT INTO schema_migrations (version, name, checksum) VALUES ($1, $2, $3)', [f.version, f.name, f.checksum]));
+        applied.push(f.name);
+      }
+      return { applied, current: files.length ? files[files.length - 1].version : 0 };
+    },
+    { attempts: 1 }, // never auto-retry DDL; a deadlock here is reported and the operator re-runs
+  );
 }

@@ -127,3 +127,70 @@ describe('R-12: public probes are minimal, cheap and throttled; diagnostics are 
     assert.ok(h.includes(429), 'liveness flood from one IP is throttled');
   });
 });
+
+describe('R-14: migrations have their own timeouts and can never be partially applied', { skip: pgSkip }, () => {
+  const realMigrations = path.join(import.meta.dirname, '..', 'server', 'db', 'migrations');
+  const migDir = (extra: Record<string, string>) => {
+    const d = tmp('mig-');
+    for (const f of fs.readdirSync(realMigrations)) fs.copyFileSync(path.join(realMigrations, f), path.join(d, f));
+    for (const [name, sql] of Object.entries(extra)) fs.writeFileSync(path.join(d, name), sql);
+    return d;
+  };
+
+  test('a migration longer than the request pool timeouts succeeds (request statement timeout 500 ms, migration takes 3 s)', async () => {
+    const { migrate } = await import('../server/db/migrate.ts');
+    const { createPool } = await import('../server/db/pool.ts');
+    const db = await createTestDatabase({ migrate: false });
+    cleanups.push(() => db.drop());
+    const prev = process.env.DATABASE_STATEMENT_TIMEOUT_MS;
+    process.env.DATABASE_STATEMENT_TIMEOUT_MS = '500'; // request pool: 500 ms server-side, 2.5 s client-side
+    const pool = createPool(db.url, { max: 2 });
+    if (prev === undefined) delete process.env.DATABASE_STATEMENT_TIMEOUT_MS;
+    else process.env.DATABASE_STATEMENT_TIMEOUT_MS = prev;
+    cleanups.push(() => pool.end());
+    await assert.rejects(pool.query('SELECT pg_sleep(1)'), 'the request pool really enforces its short timeout');
+    const out = await migrate(pool, migDir({ '9001_slow_backfill.sql': 'SELECT pg_sleep(3);\nCREATE TABLE slow_ok (id int);' }));
+    assert.ok(out.applied.includes('9001_slow_backfill.sql'));
+    assert.equal((await pool.query("SELECT to_regclass('public.slow_ok') AS t")).rows[0].t, 'slow_ok');
+  });
+
+  test('a migration that times out leaves the schema unchanged (no partial state) and a fixed re-run recovers', async () => {
+    const { migrate } = await import('../server/db/migrate.ts');
+    const db = await createTestDatabase(); // already at the current schema
+    cleanups.push(() => db.drop());
+    const versionsBefore = (await db.pool.query('SELECT version FROM schema_migrations ORDER BY version')).rows.map((r) => r.version);
+    const dir = migDir({ '9001_a.sql': 'CREATE TABLE part_a (id int);', '9002_b.sql': 'CREATE TABLE part_b (id int);\nSELECT pg_sleep(2);' });
+    await assert.rejects(migrate(db.pool, dir, { statementTimeoutMs: 500 }), /9002_b\.sql failed \(statement timeout\); nothing was applied/);
+    assert.deepEqual((await db.pool.query('SELECT version FROM schema_migrations ORDER BY version')).rows.map((r) => r.version), versionsBefore);
+    assert.equal((await db.pool.query("SELECT to_regclass('public.part_a') AS t")).rows[0].t, null, '9001 rolled back with 9002 (all-or-nothing)');
+    const ok = await migrate(db.pool, dir, { statementTimeoutMs: 10000 });
+    assert.deepEqual(ok.applied, ['9001_a.sql', '9002_b.sql']);
+  });
+
+  test('a DDL migration that cannot get its table lock fails fast (lock timeout) instead of blocking traffic, and leaves nothing behind', async () => {
+    const { migrate } = await import('../server/db/migrate.ts');
+    const db = await createTestDatabase();
+    cleanups.push(() => db.drop());
+    const holder = await db.pool.connect();
+    await holder.query('BEGIN');
+    await holder.query('LOCK TABLE projects IN ACCESS SHARE MODE'); // a long-running reader
+    try {
+      const dir = migDir({ '9001_alter.sql': 'ALTER TABLE projects ADD COLUMN archived boolean;' });
+      await assert.rejects(migrate(db.pool, dir, { lockTimeoutMs: 300 }), /lock timeout/);
+    } finally {
+      await holder.query('ROLLBACK');
+      holder.release();
+    }
+    const cols = (await db.pool.query("SELECT column_name FROM information_schema.columns WHERE table_name = 'projects' AND column_name = 'archived'")).rows;
+    assert.deepEqual(cols, []);
+  });
+
+  test('statements that cannot run in a transaction are rejected before anything is applied', async () => {
+    const { migrate } = await import('../server/db/migrate.ts');
+    const db = await createTestDatabase({ migrate: false });
+    cleanups.push(() => db.drop());
+    const dir = migDir({ '9001_idx.sql': 'CREATE INDEX CONCURRENTLY projects_title_idx ON projects (title);' });
+    await assert.rejects(migrate(db.pool, dir), /cannot run inside the migration transaction/);
+    assert.equal((await db.pool.query("SELECT to_regclass('public.schema_migrations') AS t")).rows[0].t, null, 'not even the bookkeeping table was created');
+  });
+});
