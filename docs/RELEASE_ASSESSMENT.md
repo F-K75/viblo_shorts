@@ -1,12 +1,110 @@
-# Forge Studio — Phase 0 Release Assessment
+# Forge Studio — Release Assessment
 
-**Date:** 2026-11-01 · **Commit audited:** `98cdc30` (`main`, after PR #1) · **Mode:** discovery only. No code, configuration, data or infrastructure was changed.
+**Current status:** Phase 1 ("Stop the bleed") implemented and at its validation gate · **Date:** 2026-11-01 ·
+**Branch:** `claude/keen-feynman-xtbvz2` · Nothing was deployed.
 
-**Evidence standard:** every finding cites code I read or a command I ran. The earlier `RELEASE_READINESS_REPORT.md` was used only as a lead list. Its claims were re-checked, and several new issues were found that it does not mention.
+The Phase 0 discovery report follows unchanged in Part B. Part A records what Phase 1 changed, the evidence,
+and what is still open.
+
+## FORGE STUDIO RELEASE READINESS SCORE: 53/100 (Phase 0: 40)
+
+## Verdict: **NOT READY FOR RELEASE**
+
+The P0 abuse and data-loss holes are closed for a single-instance deployment and proven by regression tests.
+Release is still blocked by FS-003 (real AI never observed), by the Phase 2 durability work (PostgreSQL,
+off-host backups) and by the Phase 3 product and auth fixes.
 
 ---
 
-## 0. What was executed (evidence base)
+# Part A — Phase 1 results
+
+## A1. Approved product decisions (recorded; implemented in Phase 3, not Phase 1)
+| Decision | Approved direction |
+|---|---|
+| Payments | Hide paid plans and checkout claims until a real provider, payment verification, webhooks and subscription lifecycle are implemented and tested |
+| YouTube workflow | User-uploaded source videos with server-side compositing; keep original audio only where the user has rights; remove claims about extracting original YouTube footage/audio |
+| Database | Managed PostgreSQL for production. SQLite is **not** used as a production stop-gap |
+
+## A2. What changed
+| Area | Change | Files |
+|---|---|---|
+| Fail-closed storage (FS-002) | `readJsonFile` throws `StoreUnavailableError` on corruption instead of returning an empty fallback, and keeps one forensic copy per file version (not one per request). Writes are temp + fsync + rename + dir fsync. The error handler maps it to `503 store_unavailable`; `/api/ready` reports `stores` | `server/lib/storage.ts`, `server.ts` |
+| Per-user project shards (FS-001, FS-002, FS-018) | `projects/<userId>.json` plus an in-memory id→owner index. A request reads only its own shard, so one user's data volume or corruption no longer affects others. Same API and the same owner/404 semantics | `server/lib/projectStore.ts`, `server.ts` |
+| Verified migration | At first boot: verified `pre-migration` snapshot → split by owner → read back and count → marker → legacy file **renamed, not deleted**. A corrupt legacy file is never migrated or touched (project routes 503) | `server/lib/projectStore.ts` |
+| Storage limits (FS-001) | Per project 512 KB; guest 10 projects / 5 MB; user 200 / 25 MB; all guests together 512 MB (signed-in users unaffected); global 4 GB; free-disk floor 256 MB. Only growth is blocked: existing data can still be edited and deleted | `projectStore.ts`, `.env.example` |
+| Guest abuse (FS-001) | Global guest-mint budget (1000/hour) in addition to 10/min/IP. Default free subscriptions are no longer persisted per guest (`subscriptions.json` grew without bound) | `server.ts` |
+| Snapshots + restore | Verified snapshots (SHA-256 manifest, written to a temp dir, re-hashed, then renamed) at boot and every 6 h with retention 28. CLI `npm run backup -- create/list/verify/restore`. Restore refuses unverified snapshots and a running server, takes a `pre-restore` snapshot and moves current files aside. Health reports the last backup | `server/lib/backup.ts`, `scripts/backup.ts` |
+| AI quota (FS-007) | Persistent ledger (`usage.json`). Synchronous reserve (check + increment with no `await` between) makes concurrent overrun impossible in-process. A reservation is refunded unless the handler returns real model output, so fallbacks, provider errors and 4xx are free. Aborted requests keep the charge (the model may have run) | `server/lib/usage.ts`, `server.ts` |
+| Proxy / rate limits (FS-008) | `TRUST_PROXY` is **required** in production (`none`, hop count or CIDRs); `true` is rejected. Buckets are keyed per user *and* per IP (IP = 4× user limit), so rotating `X-Forwarded-For` no longer resets a user's limit. Untrusted `X-Forwarded-For` is counted in `/api/health` and logged | `server/lib/security.ts`, `server.ts` |
+| Crash scenarios (FS-016, FS-017) | All route handlers forward async rejections to the error handler. Render-job bookkeeping can no longer throw unhandled. `unhandledRejection`/`uncaughtException` handlers log (uncaught → clean exit). Publishing pack validates beats (was a 500) | `server.ts` |
+| Limit bypasses (FS-015, FS-032) | Job retry goes through the same admission check as create (5-active cap + render minutes). Queued jobs reserve their minutes. Render download is rate limited | `server.ts` |
+| Test support | `GEMINI_BASE_URL` (optional endpoint override) lets tests run the real AI code path against a local stub | `server.ts`, `tests/helpers/geminiStub.ts` |
+| Ops config | CI smoke test sets `TRUST_PROXY=none`, runs the backup CLI in the container, and asserts that production refuses to start without `TRUST_PROXY`. Image ships the backup CLI. README and `.env.example` updated | `.github/workflows/ci.yml`, `Dockerfile`, `README.md`, `.env.example` |
+
+**Behaviour changes to be aware of:**
+1. Production will not start without `TRUST_PROXY`.
+2. A client-supplied project id that does not exist gets a fresh server id. The UI already adopts the returned id, and ids were always server-issued.
+3. Guests are capped at 10 projects / 5 MB.
+4. Readiness returns 503 when a shared store is corrupt.
+5. Saves are slower: p50 27.8 → 59.3 ms in the load test. This is most likely the two fsyncs per write; I did not measure it separately.
+
+## A3. Validation gate evidence (all commands executed in this session)
+| # | Gate requirement | Evidence | Result |
+|---|---|---|---|
+| 1 | Guest storage abuse blocked | `tests/phase1.test.ts` › FS-001: guest stopped at 2 MB (409 `storage_quota_exceeded`); guest pool full → 507 `guest_storage_full`; 11th guest project → 409; >1 MB body → 413; >512 KB project → 413; guest mint budget → 429 `guest_capacity` | ✅ |
+| 2 | Normal users unaffected by another user's storage | Same 27.7 MB of attacker data, same test: **old code** victim p95 5.9 → **163.6 ms** (test fails); **new code** 4.9 → 3.4 ms (full-suite run: 9.5 → 7.4 ms). Victim sees only own data | ✅ |
+| 3 | Corruption cannot cause global data loss | Corrupt user file: **old code** answers 200 with empty data (and the Phase 0 probe showed the next save wiping all users); **new code** 503 for that user only, file byte-for-byte unchanged, other users keep saving, readiness stays up, one forensic copy. Corrupt `jobs.json` → 503 + readiness 503, file untouched. Corrupt legacy file → no migration, untouched | ✅ |
+| 4 | Backup restore restores original projects | Integration test: 3 projects → `backup create` → all deleted via API → restore **refused while server running** → server stopped → restore → restart → the original 3 projects are back. Unit tests: tampered snapshot refused; restore moves current data aside; migration snapshot verifies (`backup verify` exit 0) | ✅ |
+| 5 | Concurrent quota requests cannot exceed limits | 10 concurrent AI calls against quota 3 (stub model with 400 ms latency so all are in flight): exactly 3 × 200 real results, 7 × 429, **model called exactly 3 times**. Restart → usage still 3, next call 429 | ✅ |
+| 6 | Failed AI calls do not consume quota | Stub returns 500: 4 fallbacks, provider really called (≥4), `dailyQuotaUsed` = 0; invalid request (400) free; after recovery 1 real call → used = 1 | ✅ |
+| 7 | All existing tests still pass | `npm test`: **84 tests, 82 pass, 0 fail, 2 skipped** (the live-Gemini tests: no key). 3 existing tests were updated deliberately, not weakened: readiness now also asserts `stores: true`; the storage unit test now asserts fail-closed (the old assertion encoded the FS-002 bug); the E2E sets `TRUST_PROXY=none` as production now requires | ✅ |
+| 8 | New regression tests pass | `tests/phase1.test.ts` 17/17, `tests/storage_backup.test.ts` 10/10. **Red-before-green:** the same Phase 1 suite run against unmodified `98cdc30` failed 17/17 | ✅ |
+| 9 | Production build and typecheck | `npm run lint` exit 0 (now also typechecks `scripts/backup.ts`); `npm run build` exit 0; browser E2E on the production build 1/1 pass | ✅ |
+
+Other runs: `npm run test:load` completed, with no regression on reads (list p50 19.0 ms vs 20.0 ms) and save p50 59.3 ms (see A2). 10 of the 60 saves returned 409 because the 5 load-test guests hit the new 10-project guest cap. `bun audit`: unchanged (3 advisories, see FS-022).
+**Not verified here:** the Dockerfile/CI changes. There is no Docker daemon in this sandbox, so they will be proven by the CI `docker` job when the branch is pushed in a PR.
+
+## A4. Issue status after Phase 1
+| ID | Status | Notes |
+|---|---|---|
+| FS-001 | **Mitigated (interim)** | Bounded and isolated per user; durable fix is PostgreSQL (Phase 2). CAPTCHA/App Check for guest mint still recommended (Phase 3) |
+| FS-002 | **Mitigated (interim)** | Fail closed + verified snapshots + tested restore. Still open: backups on the same volume, no PITR/off-host copy (Phase 2) |
+| FS-007 | **Resolved for single instance** | Persistent ledger with refunds; multi-instance needs Redis/PostgreSQL (Phase 2). Up to ~1 s of usage can be lost on a hard crash (under-count) |
+| FS-008 | **Resolved** | Explicit config and per-user buckets. Rate-limit buckets are still in memory (reset on restart; per-minute only) |
+| FS-015 | **Resolved** | Tested |
+| FS-016 | **Resolved** | Tested for async routes; process handlers added |
+| FS-017 | **Resolved** | Tested |
+| FS-018 | **Mostly resolved** | Per-request reads bounded by the user's own shard. Admin "all projects" is still O(total) |
+| FS-032 | **Resolved** | Rate limited |
+| FS-003, FS-004–FS-006, FS-009–FS-014, FS-019–FS-031, FS-033 | **Open** | Unchanged; scheduled for Phases 2–5 |
+
+**New observations from Phase 1 (added to the register):**
+* **FS-034 (P2):** guest data has no retention. After a guest token expires (30 days) its shard is unreachable but kept. Growth is bounded by `GUEST_POOL_MAX_MB`, but once that pool is full, new guests cannot save. A retention policy deletes user data, so it needs your approval.
+* **FS-035 (P3):** `/api/health` is public and now exposes more operational detail (storage totals, guest-mint count, proxy diagnostics). Restrict detailed health to an internal port or token in Phase 4.
+* **FS-036 (P3):** restoring inside Docker needs `--force`, because the server lock was written by another container. This is documented, but an operator must make sure the service is stopped.
+
+## A5. Updated score
+| Dimension | Weight | Phase 0 | Phase 1 | Why it moved |
+|---|---:|---:|---:|---|
+| Core functionality | 20 | 9 | 9 | No product changes (by design) |
+| Security | 20 | 11 | 14 | DoS bounded, proxy spoofing and limit bypasses closed; CSP, identity-swap and guest-token issues remain |
+| Data reliability | 15 | 3 | 8 | Fail closed, per-user isolation, verified snapshots and restore; still JSON files, same-volume backups |
+| Testing | 10 | 6 | 8 | 27 new regression tests with red-before-green proof; still no frontend tests and no live AI |
+| Infra / deploy / ops | 15 | 5 | 6 | Backup CLI, safer config; no CD, monitoring or off-host backups |
+| Performance / scale | 10 | 3 | 5 | Per-request cost no longer grows with total data; still single instance |
+| Product / legal readiness | 10 | 3 | 3 | Phase 3 |
+| **Total** | **100** | **40** | **53** | |
+
+## A6. Next phase (awaiting your authorization)
+Phase 2: managed PostgreSQL (projects, jobs, subscriptions, `ai_usage`) with migrations; import from the
+shards with verified counts and a pre-import snapshot; PITR and off-host backups; persistent rate limits and
+quotas (Redis or PostgreSQL); object storage for renders. I will not start it until you approve.
+
+---
+
+# Part B — Phase 0 discovery report (2026-11-01, baseline `98cdc30`, unchanged)
+
+### 0. What was executed (evidence base)
 
 | Check | Command | Result |
 |---|---|---|
@@ -22,7 +120,7 @@
 
 ---
 
-## 1. Executive summary
+### 1. Executive summary
 
 Forge Studio is an **AI YouTube Shorts studio**. A user enters an idea, or a YouTube link plus transcript. The app produces a scripted, captioned 9:16 Short with kinetic captions, B-roll, optional TTS and music, and the browser exports it. The product is not a code-generation or agent platform. It has no workspaces, teams, WebSockets or agent orchestration.
 
@@ -41,7 +139,7 @@ The previous hardening pass fixed the worst problems: client-trusted identity, p
 
 ---
 
-## 2. Architecture overview (verified from code)
+### 2. Architecture overview (verified from code)
 
 ```
 Browser SPA (React 19 + Vite 6 + Tailwind 4; no router, all state in App.tsx)
@@ -74,7 +172,7 @@ Used by the UI: `auth/guest`, `projects` (list/get/save/delete/duplicate), `gene
 
 ---
 
-## 3. Feature inventory
+### 3. Feature inventory
 
 Legend: ✅ verified by execution · ⚠️ works with defects/limits · ❌ broken or fake · 🔒 unverifiable here (counts as *not verified*) · — not applicable
 
@@ -111,7 +209,7 @@ Legend: ✅ verified by execution · ⚠️ works with defects/limits · ❌ bro
 
 ---
 
-## 4. Critical bugs and missing functionality
+### 4. Critical bugs and missing functionality
 
 * **Storage engine can be exhausted or wiped:** see FS-001 and FS-002.
 * **Account recovery is missing and the UI misreports it:** FS-004.
@@ -123,7 +221,7 @@ Legend: ✅ verified by execution · ⚠️ works with defects/limits · ❌ bro
 
 ---
 
-## 5. Security findings
+### 5. Security findings
 
 | Area | Status | Notes |
 |---|---|---|
@@ -146,7 +244,7 @@ Legend: ✅ verified by execution · ⚠️ works with defects/limits · ❌ bro
 
 ---
 
-## 6. Infrastructure and deployment gaps
+### 6. Infrastructure and deployment gaps
 
 * No deployment pipeline, image registry, staging environment, release tagging or documented rollback (FS-012).
 * The container runs TypeScript via `tsx` at runtime and ships **devDependencies** (vite, typescript, tailwind) because `node_modules` is copied whole from the build stage. The build stage runs `bunx vite build` and skips the typecheck. Base images use floating tags, not digests (FS-021).
@@ -158,7 +256,7 @@ Legend: ✅ verified by execution · ⚠️ works with defects/limits · ❌ bro
 
 ---
 
-## 7. Testing gaps
+### 7. Testing gaps
 
 * **No real-provider coverage:** Gemini, YouTube, Pexels, Firebase and Drive are never exercised. The CI live job turns green when skipped (FS-003, FS-023).
 * **Frontend:** no component or unit tests. A single happy-path E2E covers guest → prompt → save → My Projects → export. Not covered: YouTube flow UI, trimmer, caption style editor, TTS, Drive, billing modal, mobile viewport, Firefox/Safari.
@@ -168,7 +266,7 @@ Legend: ✅ verified by execution · ⚠️ works with defects/limits · ❌ bro
 
 ---
 
-## 8. Performance and scalability
+### 8. Performance and scalability
 
 * **O(total data) per request:** every project read or write and every AI call (via `getUserSubscription`) does a sync read + parse of a whole JSON file, and writes re-serialize it with indentation. Measured: 30 MB store → ~140 ms blocking per `GET /api/projects` for an unrelated user. This grows linearly, and memory use is several times the file size.
 * **LLM latency ceiling:** up to `models × 2 attempts × 25 s` plus backoff, about 100 s for one request with no overall deadline. The client has no cancel. Token counts are aggregated in memory only, with no per-user, per-endpoint or cost ($) tracking and no persistence (FS-011, FS-019).
@@ -178,7 +276,7 @@ Legend: ✅ verified by execution · ⚠️ works with defects/limits · ❌ bro
 
 ---
 
-## 9. Issue register
+### 9. Issue register
 
 Severity: **P0** = must fix before any public exposure · **P1** = must fix before GA · **P2** = fix soon after / before scale · **P3** = hygiene.
 
@@ -304,7 +402,7 @@ Severity: **P0** = must fix before any public exposure · **P1** = must fix befo
 
 ---
 
-## 10. Recommended roadmap
+### 10. Recommended roadmap
 
 Each phase ends with a gate. Nothing moves to the next phase until its validation criteria are met.
 
@@ -339,7 +437,7 @@ Decisions I need from you before Phase 3: **(a)** payments now, or hide paid tie
 
 ---
 
-## Score
+### Score (Phase 0 baseline)
 
 | Dimension | Weight | Score | Rationale |
 |---|---:|---:|---|
@@ -352,6 +450,4 @@ Decisions I need from you before Phase 3: **(a)** payments now, or hide paid tie
 | Product / legal readiness | 10 | 3 | Fake reset, unsold paid tiers, no legal pages |
 | **Total** | **100** | **40** | |
 
-## FORGE STUDIO RELEASE READINESS SCORE: 40/100
-
-## Verdict: **NOT READY FOR RELEASE**
+### Phase 0 baseline score: 40/100 — NOT READY FOR RELEASE (superseded by the Phase 1 score above)
