@@ -1,5 +1,12 @@
 # Forge Studio — Independent Re-audit + Corrective Round
 
+## PR #3 code review (2026-11-01): NOT ready to merge
+I reviewed the actual diff (docs/PR3_CODE_REVIEW.md). There are **2 new P1 defects in backup/restore, both reproduced**: F1, manifest row counts are
+not taken from the dump's snapshot, so every restore under traffic reports `verified:false`; F2, a failed restore stage
+commits a partial restore. There are also P2 findings: F3 (target URL in argv), F4 (backup authenticity) and F5 (old
+builds refuse a newer schema, which blocks rollback). The score of 55 is **provisional** and will be rescored after the
+fixes. Phase 2.5 design is approved with conditions (PHASE2_5_PLAN §7); it is not implemented.
+
 ## Corrective round (2026-11-01): R-02, R-11, R-12, R-14 fixed in PR #3 — awaiting your review
 
 **Status: FORGE STUDIO RELEASE READINESS SCORE: 55/100 (re-audit: 51) — NOT READY FOR RELEASE.**

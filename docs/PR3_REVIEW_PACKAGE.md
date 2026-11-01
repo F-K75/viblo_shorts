@@ -1,5 +1,7 @@
 # PR #3 Review Package — Phase 2 (durable architecture) + corrective round
 
+> **Update:** the line-by-line code review is in `docs/PR3_CODE_REVIEW.md`. It found 2 reproduced P1 defects in backup/restore (F1, F2), so this PR is **not ready to merge** until they are fixed.
+
 **PR:** [F-K75/viblo_shorts#3](https://github.com/F-K75/viblo_shorts/pull/3) · **Head:** `6fd474d` · **Base:** Phase 1 branch
 `claude/keen-feynman-xtbvz2` @ `194f5c5` (PR #2, not yet merged) · **CI:** green on `6fd474d`
 ([run 41340655795](https://github.com/F-K75/viblo_shorts/actions/runs/41340655795)) · **Status:** awaiting your review.

@@ -1,6 +1,7 @@
 # Phase 2.5: Abuse Protection Implementation Plan (R-03 / R-04 / R-13)
 
-> **Status: plan only. Not implemented. Waiting for your approval.**
+> **Status: engineering design APPROVED with conditions (2026-11-01, §7). Not implemented.** Implementation
+> starts only after PR #3 merges; code is reviewed separately and is not pre-approved for merge.
 > Starts only after PR #3 is reviewed and merged. Delivered as **its own PR**, branched from `main` after that merge.
 > Validation follows docs/VALIDATION_STANDARD.md: red-first reproduction, non-vacuous assertions, a concurrency
 > matrix, failure injection, abuse tests and an independent re-audit before the gate.
@@ -16,7 +17,9 @@
 | **R-04** guest render | `POST /api/render/video` and `/api/jobs/create` accept guest tokens. Admission is 5 active jobs/user plus render minutes (`server.ts:1376`). Unlimited free guest identities × 5 jobs gives effectively unbounded ffmpeg CPU. Workers claim FIFO, so one user's backlog starves others. | [R] still reproduces |
 | **R-13** body/memory | One global `express.json({limit:'1mb'})` (`server.ts:276`). There is no concurrency bound on large bodies and no memory guard. **No file-upload endpoint exists yet**; user uploads are an approved future feature. | [R] large-body flood raises RSS |
 
-The UI never calls server render today (guests export client-side), so R-04 changes no current guest UX.
+The UI never calls server render today, so R-04 changes no current guest UX. **Browser-side export is not verified**:
+the previous audit found the Drive export broken. No claim that it produces a playable MP4 is made until an exported
+file is verified (ffprobe + playback).
 
 ---
 
@@ -93,7 +96,7 @@ request looks like the load balancer's IP. A startup warning fires when producti
 ### 2.1 Policy
 * **No server-side rendering for guests.** `POST /api/render/video`, `/api/jobs/create` and `/api/jobs/:id/retry`
   return `403 {error:'sign_in_required', ...}` for guest and legacy principals. Guests keep everything else:
-  studio, scripts, project editing, client-side preview and client-side export (unchanged UI path). The UI shows
+  studio, scripts, project editing and the browser-side preview/export paths as they exist today (export **unverified**, see §0). The UI shows
   "Sign in to render on our servers" only where a server render is offered.
 * No paid-priority claims anywhere (UI copy, API, docs) until billing exists. All signed-in users get the same
   scheduling class.
@@ -112,7 +115,7 @@ request looks like the load balancer's IP. A startup warning fires when producti
 | Cancellation | Existing heartbeat-observed cancel (works cross-instance). Cancelling a queued job releases its reserved minutes immediately. | — |
 | Input limits | Duration ≤ 180 s, resolution ≤ 1080×1920, beats ≤ 60, total asset bytes bounded. Validated before admission. | — |
 
-Index added: `jobs(status, user_id, created_at)`, in a new **append-only migration `0003`** (expand-only, safe
+Index added: `jobs(status, user_id, created_at)`, in a new **append-only migration `0004`** (expand-only, safe
 under rolling deploy).
 
 ### 2.3 R-04 regression tests
@@ -182,8 +185,8 @@ under rolling deploy).
 | Step | Commit(s) | Gate |
 |---|---|---|
 | 1 | Red-first tests for R-03/R-04/R-13 (marked expected-fail), so CI shows them failing on the old code | Red evidence recorded |
-| 2 | R-03: verifier, redemption table (migration 0003a), hierarchical budgets, breaker semantics, client widget | R-03 tests green |
-| 3 | R-04: guest render block, admission caps, fair claim, timeouts, migration 0003b index | R-04 tests green |
+| 2 | R-03: verifier, redemption table (migration `0003_captcha_redemptions.sql`), hierarchical budgets, breaker semantics, client widget | R-03 tests green |
+| 3 | R-04: guest render block, admission caps, fair claim, timeouts, migration `0004_jobs_fair_queue.sql` (names must match `^\d{4}_[a-z0-9_]+\.sql$`; see PR3_CODE_REVIEW F6) | R-04 tests green |
 | 4 | R-13: route limits, semaphore, memory guard, server timeouts | R-13 tests green |
 | 5 | Upload module skeleton (library plus tests; **no public route** until the upload feature) | Module tests green |
 | 6 | Docs: ADR-010 (abuse model), `.env.example`, runbook (CAPTCHA outage, queue-full alerts), RELEASE_REAUDIT update | Independent re-audit |
@@ -251,3 +254,62 @@ To deliver before any paid resource exists:
 * verification of Mumbai-region service availability and recovery capabilities (PITR window, cross-region
   snapshot copy, Multi-AZ failover time) against AWS documentation. This environment cannot reach
   docs.aws.amazon.com, so the figures will be marked [K] until you or a session with access confirms them.
+
+---
+
+## 7. Your decisions (2026-11-01) and the conditions they add
+
+| Item | Decision |
+|---|---|
+| Turnstile, single-use tokens, server-side verification | Approved |
+| Per-device / IP / IPv4 /24 / IPv6 /48 limits, enforced across all instances | Approved |
+| Global soft threshold (more challenges + alerts, never blocks verified users) | Approved |
+| 10× hard ceiling | **Conditional:** the value comes from **measured normal peak**, not 10 000 as a guess |
+| Device cookie | Approved with requirements below |
+| ASN / MaxMind | **Deferred.** No new recurring cost without demonstrated need |
+| No guest server renders; fair queue; 1 running / 3 queued per user; global 200 | Approved; **all limits configurable** |
+| Request/memory protection | Approved. **No upload system in this phase**; the upload design (§3.2) is moved to a separate architecture document |
+
+**Conditions this adds to the implementation:**
+1. **Hard ceiling from measurement.** Mints per hour are recorded (the existing `window_counters('guest-mint')`
+   rows, kept 48 h, extended to a 30-day hourly series). The ceiling is configured as `GUEST_MINT_HARD_PER_HOUR`.
+   Until there is production data, the default is derived from staging/load-test peak and **labelled provisional**.
+   The ceiling is set to 10× the measured p99 hourly peak once at least 14 days of data exist, and its
+   derivation is recorded in the runbook.
+2. **Device cookie:**
+   * `__Host-fs_dev`: first-party, `Secure`, `HttpOnly`, `SameSite=Lax`, `Path=/`, no `Domain`;
+   * value: 128-bit random, base64url, opaque, with **no personal information** and nothing derived from the user/IP/UA;
+   * the server stores only `sha256(value)` in rate-limit keys, which expire with the buckets;
+   * not used for analytics or cross-site tracking;
+   * lifetime 1 year;
+   * purpose documented in the privacy policy as strictly necessary (security).
+3. **CAPTCHA outage:** pauses new guest registrations only. Existing guest sessions and authenticated users are
+   never affected (test: siteverify down → `/api/auth/me`, project save and AI calls still succeed).
+4. **Exactly-once settlement for renders**, matching the AI ledger:
+   * render minutes become a reservation at admission (`render_reservations`), committed on successful
+     completion **in the same transaction** as `finishJob` (fixes PR3_CODE_REVIEW F7);
+   * refunded exactly once on cancel, timeout, failure or reaper action;
+   * conditional status transitions make duplicates no-ops.
+5. **Crash recovery of abandoned jobs:**
+   * the reaper requeues a job whose worker died (heartbeat stale) **once** (`attempts < 2`), otherwise fails it
+     and refunds;
+   * the test kills a worker process mid-render on a 2-instance setup and asserts the job completes on the other
+     instance or fails with exactly one refund.
+6. **No paid-priority wording** anywhere.
+
+**Validation required at the Phase 2.5 gate.** Each vulnerability needs a test that fails on the previous
+implementation:
+
+| # | Test | Covers |
+|---|---|---|
+| 1 | Guest registration flood | §1.3 (1) |
+| 2 | Verified-user lockout prevention | §1.3 (1) victim path |
+| 3 | CAPTCHA replay across 2 instances | §1.3 (2) |
+| 4 | Multi-instance rate limits | §1.3 (3) |
+| 5 | Render starvation | §2.3 (3) |
+| 6 | Concurrent queue admission | §2.3 (4) |
+| 7 | Cancellation with exactly-once refund | §2.3 (6) and condition 4 |
+| 8 | Crash recovery | Condition 5 |
+| 9 | Memory pressure | §3.3 (2) |
+| 10 | Full existing regression suite on both backends | — |
+| 11 | Browser E2E | — |
