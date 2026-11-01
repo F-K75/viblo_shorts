@@ -62,8 +62,13 @@ jobs:
       - run: docker build -t forge-studio:ci .
       - name: Container smoke test
         run: |
-          docker run -d --name fs -p 3000:3000 -e SESSION_SECRET=$(openssl rand -hex 32) forge-studio:ci
+          docker run -d --name fs -p 3000:3000 -e SESSION_SECRET=$(openssl rand -hex 32) -e TRUST_PROXY=none forge-studio:ci
           for i in $(seq 1 30); do curl -fsS localhost:3000/api/ready && break; sleep 2; done
           curl -fsS localhost:3000/api/ready
           curl -fsS -X POST localhost:3000/api/auth/guest | grep -q token
+          # backup CLI is shipped in the image and can snapshot the live volume
+          docker exec fs node --import tsx scripts/backup.ts create | grep -q '"created"'
+          # production must refuse to start without an explicit TRUST_PROXY
+          set +e; timeout 60 docker run --rm -e SESSION_SECRET=$(openssl rand -hex 32) forge-studio:ci; code=$?; set -e
+          test "$code" = 1
           docker logs fs

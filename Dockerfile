@@ -20,6 +20,7 @@ COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
 COPY package.json server.ts firebase-applet-config.json ./
 COPY server ./server
+COPY scripts/backup.ts ./scripts/backup.ts
 COPY assets ./assets
 RUN mkdir -p /data && chown -R node:node /data /app
 USER node

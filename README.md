@@ -34,12 +34,26 @@ Without `GEMINI_API_KEY` the app still works, using built-in template content th
 
 ```bash
 docker build -t forge-studio .
-docker run -p 3000:3000 -e SESSION_SECRET=$(openssl rand -hex 32) -v forge-data:/data forge-studio
+docker run -p 3000:3000 -e SESSION_SECRET=$(openssl rand -hex 32) -e TRUST_PROXY=none -v forge-data:/data forge-studio
 ```
 
 * Health: `GET /api/health` (liveness + metrics), `GET /api/ready` (storage + ffmpeg).
-* Runs as a **single instance** (JSON-file storage in `/data`). Back up the volume.
-* Behind a load balancer set `TRUST_PROXY=1`; restrict cross-origin callers with `ALLOWED_ORIGINS`.
+* Runs as a **single instance** (per-user JSON shards in `/data/projects`). PostgreSQL replaces this in Phase 2.
+* `TRUST_PROXY` is **required** in production: `none` when clients connect directly, `1` behind one load
+  balancer (or proxy CIDRs). `true` is rejected because it lets clients spoof their IP.
+* Storage is bounded per guest, per user, for all guests together, globally, and by free disk (see `.env.example`).
+* Backups: verified snapshots every `BACKUP_INTERVAL_HOURS` into `BACKUP_DIR` (default `/data/backups`, same
+  volume — copy them off-host). Operator CLI:
+
+  ```bash
+  npm run backup -- list
+  npm run backup -- verify <snapshot>
+  npm run backup -- restore <snapshot>   # server must be stopped; current data is snapshotted and moved aside first
+  ```
+
+  In Docker, run the restore in a one-off container against the stopped service's volume:
+  `docker run --rm -v forge-data:/data forge-studio node --import tsx scripts/backup.ts restore <snapshot> --force`
+  (`--force` is needed because the lock was written by a different container; make sure the service is stopped).
 * All settings: [.env.example](.env.example).
 
 ## Documentation
