@@ -11,28 +11,48 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 40
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      # Real PostgreSQL for every test that needs it. REQUIRE_PG_TESTS=1 turns a missing database into a
+      # failure, so PostgreSQL tests can never be silently skipped in CI.
+      TEST_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres?sslmode=disable
+      REQUIRE_PG_TESTS: '1'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
       - uses: oven-sh/setup-bun@v2
-      - name: Install system deps (ffmpeg)
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: Install system deps (ffmpeg, age, PostgreSQL client tools)
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg age postgresql-client
+      - name: Tool versions
+        run: ffmpeg -version | head -1 && age --version && pg_dump --version && psql "$TEST_DATABASE_URL" -tAc 'select version()'
       - name: Install dependencies
         run: bun install --frozen-lockfile
       - name: Typecheck (frontend + server)
         run: npm run lint
-      - name: Unit + integration tests
+      - name: Unit + integration tests (JSON backend; PostgreSQL contract + Phase 2 gate tests)
         run: npm test
+      - name: Integration tests with every server on PostgreSQL
+        run: npm test
+        env:
+          TEST_STORAGE_BACKEND: postgres
       - name: Production build
         run: npm run build
-      - name: Browser E2E (Playwright)
+      - name: Browser E2E (Playwright) on JSON and on PostgreSQL
         run: |
           npm install --no-save playwright@1
           npx playwright install --with-deps chromium
           npm run test:e2e
+          TEST_STORAGE_BACKEND=postgres npm run test:e2e
       - name: Dependency audit (high+ fails the build)
         # GHSA-m9gg-hp2v-232j: @grpc/grpc-js via firebase/firestore, which this app never imports
         # (only firebase/app + firebase/auth). Re-evaluate on every firebase upgrade.
@@ -60,15 +80,42 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: docker build -t forge-studio:ci .
-      - name: Container smoke test
+      - run: docker build -f Dockerfile.backup -t forge-backup:ci .
+      - name: Container smoke test (PostgreSQL backend, two instances)
         run: |
-          docker run -d --name fs -p 3000:3000 -e SESSION_SECRET=$(openssl rand -hex 32) -e TRUST_PROXY=none forge-studio:ci
+          docker network create forge
+          docker run -d --name db --network forge -e POSTGRES_PASSWORD=postgres postgres:16
+          for i in $(seq 1 30); do docker exec db pg_isready -U postgres && break; sleep 2; done
+          SECRET=$(openssl rand -hex 32)
+          for n in 1 2; do
+            docker run -d --name app$n --network forge -p 300$n:3000 -e SESSION_SECRET=$SECRET -e TRUST_PROXY=none \
+              -e DATABASE_URL='postgres://postgres:postgres@db:5432/postgres?sslmode=disable' forge-studio:ci
+          done
+          for n in 1 2; do for i in $(seq 1 30); do curl -fsS localhost:300$n/api/ready && break; sleep 2; done; done
+          curl -fsS localhost:3001/api/ready && curl -fsS localhost:3002/api/ready
+          TOKEN=$(curl -fsS -X POST localhost:3001/api/auth/guest | sed -E 's/.*"token":"([^"]+)".*/\1/')
+          curl -fsS -X POST localhost:3001/api/projects -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' -d '{"title":"ci smoke"}'
+          # the project saved on instance 1 is served by instance 2 (shared database)
+          curl -fsS localhost:3002/api/projects -H "authorization: Bearer $TOKEN" | grep -q 'ci smoke'
+          curl -fsS localhost:3002/api/health | grep -q '"backend":"postgres"'
+          docker logs app1
+      - name: Container smoke test (explicit single-instance JSON backend + volume backup CLI)
+        run: |
+          docker run -d --name fs -p 3000:3000 -e SESSION_SECRET=$(openssl rand -hex 32) -e TRUST_PROXY=none -e STORAGE_BACKEND=json forge-studio:ci
           for i in $(seq 1 30); do curl -fsS localhost:3000/api/ready && break; sleep 2; done
           curl -fsS localhost:3000/api/ready
           curl -fsS -X POST localhost:3000/api/auth/guest | grep -q token
-          # backup CLI is shipped in the image and can snapshot the live volume
           docker exec fs node --import tsx scripts/backup.ts create | grep -q '"created"'
-          # production must refuse to start without an explicit TRUST_PROXY
-          set +e; timeout 60 docker run --rm -e SESSION_SECRET=$(openssl rand -hex 32) forge-studio:ci; code=$?; set -e
-          test "$code" = 1
-          docker logs fs
+      - name: Production refuses unsafe configuration
+        run: |
+          set +e
+          timeout 60 docker run --rm -e SESSION_SECRET=$(openssl rand -hex 32) -e DATABASE_URL=postgres://x@db/x forge-studio:ci; c1=$?
+          timeout 60 docker run --rm -e SESSION_SECRET=$(openssl rand -hex 32) -e TRUST_PROXY=none forge-studio:ci; c2=$?
+          set -e
+          echo "no TRUST_PROXY -> $c1 ; no DATABASE_URL/STORAGE_BACKEND -> $c2"
+          test "$c1" = 1 && test "$c2" = 1
+      - name: Backup image has the required tools
+        run: |
+          docker run --rm --entrypoint sh forge-backup:ci -c 'pg_dump --version && age --version && node --version'
+          docker run --rm --network forge -e DATABASE_URL='postgres://postgres:postgres@db:5432/postgres?sslmode=disable' \
+            -e BACKUP_TARGET=s3://bucket/x forge-backup:ci create 2>&1 | grep -q 'BACKUP_AGE_RECIPIENTS must list age public keys'
