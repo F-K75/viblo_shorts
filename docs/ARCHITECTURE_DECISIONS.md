@@ -55,8 +55,12 @@ deploy (expand → migrate → contract). Down-migrations are deliberately absen
 * Indexes follow the actual queries: `projects(user_id, updated_at DESC)` ("my projects"), PK lookups,
   `jobs(user_id, created_at DESC)`, a partial index on active jobs, and `rate_buckets(refilled_at)` for the sweep.
 
-**Concurrency rules.** Lock order is always `users → projects → storage_totals('all') → ('guest')`, so the code
-cannot deadlock. Quotas are exact under concurrency (tested: 20 parallel saves against a cap of 5 ⇒ exactly 5;
+**Concurrency rules.** Lock order for storage writes is always `users → projects → storage_totals('all') →
+('guest')`. *Correction (re-audit R-02):* this ADR originally claimed "the code cannot deadlock". **That was
+false.** The AI quota path (`ai_usage_daily`) was outside this order: reserve locked `user:` → `ip:` while refund
+updated both rows in scan order, and concurrent requests behind one IP deadlocked (500s, lost refunds). Fixed by
+ADR-009. The general rule is now: every table has a documented lock order, every writer to a table follows it,
+and each pair of writers is covered by a concurrency test (docs/VALIDATION_STANDARD.md). Quotas are exact under concurrency (tested: 20 parallel saves against a cap of 5 ⇒ exactly 5;
 counters equal the real row sums).
 
 **Consequences / limits.** The `storage_totals('all')` row is a serialization point for writes that change
@@ -140,6 +144,30 @@ CDN delivery).
 **Decision.** `JsonRepo` keeps Phase 1 behaviour unchanged and passes the same contract tests as
 `PostgresRepo` (tests/repo_contract.test.ts). It is the zero-dependency development default and the rollback
 target of ADR-005. In production it must be selected explicitly and is single-instance only.
+
+## ADR-009 — AI quota reservation ledger and transaction retry (R-02)
+
+**Context.** The re-audit reproduced `deadlock detected` between quota reservation and refund (3/45 requests),
+with failed refunds charging users for fallbacks.
+
+**Decision.**
+* One global lock order on the quota path: the call's own `ai_reservations` row, then `ai_usage_daily` rows in
+  **ascending key order**, for reserve, settle and expiry alike.
+* `ai_reservations(id, day, keys, status reserved|committed|refunded)`. Reserve inserts the row first
+  (`ON CONFLICT DO NOTHING`, so a retried reserve with the same id is a no-op) and then increments the counters.
+  Settle is a conditional `reserved → committed|refunded` transition, so a duplicate settle is a no-op and
+  nothing is ever double-refunded or double-charged. Only refunds decrement.
+* Outcome rule: real model output or a client abort → commit; a complete response without model output
+  (fallback, 4xx/5xx) → refund. Reservations never settled (crash, failed settle) are refunded after
+  `AI_RESERVATION_TTL_MS` (15 min). A failure cannot consume quota permanently; at worst a successful call is
+  not charged.
+* `withTx` retries `40P01`/`40001` (≤ 3 attempts, jittered). This is safe because the server rolled the
+  transaction back and transaction bodies are pure DB work. Exhausted retries → `503 conflict_retry`. Migrations
+  are never auto-retried.
+
+**Evidence.** Red-first HTTP storm (2 instances, 80 concurrent fallbacks from one IP): 500s/503s before, 0 after
+(3/3 runs). Repository storm of 200 reserve→settle cycles: 0 errors, exact counters. A real `40P01` is produced and
+retried in a test.
 
 ## Not done in Phase 2 (and why)
 * **Provider selection and provisioning** — needs your decision (cost, region, compliance); no infrastructure

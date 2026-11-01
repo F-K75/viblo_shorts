@@ -1,4 +1,74 @@
-# Forge Studio — Independent Re-audit (discovery restart)
+# Forge Studio — Independent Re-audit + Corrective Round
+
+## Corrective round (2026-11-01): R-02, R-11, R-12, R-14 fixed in PR #3 — awaiting your review
+
+**Status: FORGE STUDIO RELEASE READINESS SCORE: 55/100 (re-audit: 51) — NOT READY FOR RELEASE.**
+Readiness is tracked by milestone, not by the score (see the scorecard below). Nothing was merged or deployed.
+
+### What was fixed (one commit each, branch `claude/keen-feynman-xtbvz2-phase2`)
+| ID | Commit | Root cause → fix | Evidence |
+|---|---|---|---|
+| **R-02** (P1) quota deadlock + lost refunds | `101b073` | Reserve locked `user:`→`ip:`; refund updated both via `key = ANY(…)` (scan order) → lock cycle. **Transaction redesign:** one global lock order (own reservation row → counters ascending by key) on reserve, settle and expiry; an `ai_reservations` ledger (migration 0002) makes reserve idempotent per id (no double charge) and settle a conditional `reserved→committed\|refunded` transition (no double refund); never-settled reservations are refunded by expiry (no permanent charge for failures); `withTx` retries `40P01`/`40001` safely as a backstop (residual → 503, not 500) | **Red first:** a 2-instance HTTP storm (80 concurrent fallbacks behind one IP) gave 500s and 503s on the old code. **Green:** 3/3 runs, 0 errors, every reservation refunded; mixed real/fallback storm charges exactly the 30 model calls; 200-cycle repo storm with exact counters; a real `40P01` produced and retried (asserted non-vacuously); idempotency + expiry contract tests on both backends. Original reproduction 45/45 × 200 (was 3 deadlocks). Load test: `generate-script` 15 × 200, p95 147 ms (was 2 × 500, p95 5,074 ms) |
+| **R-11** (P2) DB password in argv | `7489fad` | `pg_dump`/`psql` got `--dbname <URL>`. Connection now passed as libpq env (`PGHOST/PGUSER/PGPASSWORD/PGDATABASE/PGSSL*`), URL percent-decoded, unknown params rejected | Wrappers around the real binaries record every argv during a full encrypted backup + restore with a password-bearing URL: no password or URL in any argv; password delivered via env; restore verified. *Red evidence is the old source (`'--dbname', url`); the new test cannot run against the old module (new export)* |
+| **R-12** (P2) health disclosure + DB-per-request + unthrottled | `3be15b1` | `/api/health` + `/api/live` = liveness `{"status":"ok"}` (no deps); `/api/ready` cached with a single in-flight check; `/api/health/details` behind `HEALTH_DETAILS_TOKEN` (≥ 32 chars, constant-time) or an admin, 404 otherwise; `/api/config` feature flags only; in-memory per-IP throttling (no DB load) | Probe re-run: health flood **1,387/2,000 throttled** (was 0); public disclosure **`{}`** (was hostname, pool, guest counter, memory); a 300-request ready flood → ≤ 2 real checks; details 404 without/with a wrong token and for a normal user. CI asserts details are not public |
+| **R-14** (P3) migrations under the request timeout | `10c4485` | Migration-specific `statement_timeout` (30 min) + client query timeout; bounded advisory-lock wait; `lock_timeout` (60 s) for DDL; all pending migrations in one never-retried transaction; non-transactional statements rejected up front | **Red 0/4 → green 4/4:** 3 s migration under a 500 ms request pool succeeds; a timeout leaves the schema unchanged and a re-run recovers; a busy table fails fast on lock timeout with nothing left behind; `CONCURRENTLY` rejected before anything is applied |
+
+### Validation gate (executed this session; standard: docs/VALIDATION_STANDARD.md)
+| Layer | Result |
+|---|---|
+| Typecheck / build | ✅ / ✅ |
+| Unit + integration, JSON backend (`REQUIRE_PG_TESTS=1`) | **122 tests: 120 pass, 0 fail, 2 skipped** (live Gemini; no key) |
+| Same suite, every server on PostgreSQL | **122 tests: 113 pass, 0 fail, 9 skipped** (2 live Gemini + 7 JSON-file-specific, each with a stated reason) |
+| Concurrency (new `tests/concurrency.test.ts` + repo storms) | ✅ 3 consecutive green runs |
+| Failure injection (DB outage, mid-transaction loss, migration timeout / lock timeout, crash-before-settle via expiry) | ✅ |
+| Security / abuse probes re-run | R-12 fixed; **R-03 and R-04 still reproduce** (out of this round's scope; proposal written) |
+| Browser E2E (JSON, PostgreSQL) | 1/1, 1/1 |
+| Load test (PostgreSQL) | 0 × 5xx; p95: health 31 ms, save 235 ms, list 203 ms, generate-script 147 ms |
+| Regression of every earlier finding | ✅ covered by the suites above |
+| CI on the PR head | ⏳ **pending this push** (will be reported only after the logs are read) |
+| `bun audit` | unchanged: 3 known advisories (FS-022) |
+
+### Still open — explicitly tracked release blockers
+| Blocker | Status |
+|---|---|
+| **Real Gemini generation never demonstrated** (non-negotiable: real API call → render → preview → export) | ❌ open: needs a `GEMINI_API_KEY` |
+| R-03 guest sign-up / guest pool DoS | ❌ open: `docs/ABUSE_PROTECTION_PROPOSAL.md` awaiting approval |
+| R-04 render queue flooding | ❌ open: same proposal |
+| R-13 upload memory pressure (and 1–6 unexplained dropped sockets) | ❌ open: same proposal |
+| Fake password reset (R-05) | ❌ open: Phase 3 |
+| Google Drive identity switching (R-06) | ❌ open: Phase 3 |
+| Guest project ownership / migration on sign-up (R-07) | ❌ open: Phase 3 |
+| Drive "video" export uploads no video (R-18) | ❌ open: Phase 3 |
+| Payments unimplemented while paid plans are advertised (R-08) | ❌ open: decided "hide paid plans"; Phase 3 |
+| Privacy policy, terms, account deletion (R-09) | ❌ open: Phase 4 |
+| Production monitoring, alerting, deployment pipeline (R-10) | ❌ open: Phase 4 |
+| Managed DB provider, KMS-encrypted off-site backups, measured RPO 15 min / RTO 4 h | ⏳ proposal: `docs/DATABASE_PROVIDER_COMPARISON.md` (needs the hosting-platform decision) |
+
+### Milestone scorecard
+| Milestone | Required outcome | Status |
+|---|---|---|
+| Phase 1 | Storage safety and data integrity | ✅ implemented, CI green, PR #2 awaiting review |
+| Phase 2 | Durable PostgreSQL architecture | ✅ implemented + corrective round (this section); **pending your review**; provider not provisioned |
+| Phase 2.5 | Abuse protection and concurrency | 🟡 concurrency hardened (R-02); abuse controls proposed, not implemented |
+| Phase 3 | Functional AI product and user journeys | ⬜ not started (real Gemini still unverified) |
+| Phase 4 | Security, compliance and operations | ⬜ not started |
+| Phase 5 | Production deployment and verification | ⬜ not started |
+
+### Process change
+`docs/VALIDATION_STANDARD.md` now defines the mandatory gate layers: real DB, a concurrency matrix of every writer
+pair, failure injection, free-tier abuse scenarios, red-before-green, non-vacuous assertions, and an independent
+re-audit before merging storage/auth/limit changes. The Phase 2 gate missed R-02 because it tested the
+scenarios its author imagined rather than every pair of writers to a shared row.
+
+### Score movement (51 → 55)
+Data reliability 10 → 11 (quota integrity under concurrency), Security 12 → 13 (credentials out of argv,
+diagnostics gated), Testing 7 → 8 (concurrency matrix and failure injection), Performance 6 → 7 (no deadlocks; AI
+p95 5.1 s → 0.15 s under load). Core functionality, Infra/ops and Product/legal are unchanged.
+
+---
+
+# Part R — Independent re-audit (discovery restart, unchanged below)
+
 
 **Date:** 2026-11-01 · **Code audited:** `13e54e5` (head of `claude/keen-feynman-xtbvz2-phase2`, which contains Phase 1) —
 the code that would ship. `main` (`98cdc30`) is the original baseline. **Mode:** discovery only. No code,

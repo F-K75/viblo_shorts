@@ -37,6 +37,23 @@
 * Tests: claim moves exactly the guest's projects; expired-then-claimed restores everything; deletion never
   touches signed-in users or held ids.
 
+## 4a. Update after your review (2026-11-01)
+Your direction: **30 days of inactivity** as the proposed expiry threshold, a recovery grace period, account
+claiming, user notification where applicable, secure deletion after the approved period, and **no deletion of
+existing data until you approve**. The proposal above already uses 30 days since *last activity* (R4) plus a
+30-day recovery window (R5). Specifics added:
+* **Inactivity** = no authenticated request with that guest token (reads count) for 30 days; tracked in
+  `users.last_seen_at` (already maintained on writes in PostgreSQL; reads to be added).
+* **Notification:** guests have no e-mail, so notice is in-app: a banner from day 23 ("sign up to keep your
+  projects"), and on soft-expiry a restore notice if the same browser returns. Claimed accounts are never
+  subject to guest expiry.
+* **Secure deletion:** hard delete in batches inside transactions (project rows, then user row), recorded in an
+  audit table with counts only. Data then ages out of backups within the backup retention (≤ 35 days), which the
+  privacy policy must state. Storage-level deletion relies on the provider's encrypted-at-rest guarantees
+  (CMK; key destruction is not per-user).
+* **Existing guest data:** the first run is **dry-run only** and reports counts for your approval. Nothing is soft-
+  or hard-deleted before that approval.
+
 ## 5. Decisions needed
 1. Approve R1–R8 (or adjust the 30 + 30 day windows).
 2. Confirm the privacy-policy wording for guest data (FS-014).
