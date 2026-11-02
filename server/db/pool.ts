@@ -136,4 +136,6 @@ export const LOCKS = {
   dataMigration: 7_311_000_002,
   jobReaper: 7_311_000_003,
   maintenance: 7_311_000_004,
+  /** Track B: serializes job admission so the global queue cap is exact across instances. */
+  jobAdmission: 7_311_000_005,
 } as const;

@@ -5,8 +5,8 @@
 //  * rate limits: token buckets computed with the database clock (consistent across instances)
 //  * jobs: FOR UPDATE SKIP LOCKED claim, worker heartbeats, reaper for dead workers
 import { StoreLimitError, type StoreLimits } from '../lib/projectStore.ts';
-import { ProjectOwnershipError, userKindOf, type AiSettlement, type HeartbeatResult, type JobAdmission, type JobDenial, type QuotaEntry, type Repo, type ServerJob, type StoredSubscription } from '../lib/repo.ts';
-import { withTx, type Db, type Tx } from './pool.ts';
+import { ProjectOwnershipError, userKindOf, type AdmissionContext, type AiSettlement, type HeartbeatResult, type JobAdmission, type JobDenial, type QuotaEntry, type ReapResult, type Repo, type ServerJob, type StoredSubscription } from '../lib/repo.ts';
+import { LOCKS, withTx, type Db, type Tx } from './pool.ts';
 
 const dayDate = (day: number) => new Date(day * 86400000).toISOString().slice(0, 10);
 const iso = (v: any) => (v instanceof Date ? v.toISOString() : v ?? undefined);
@@ -23,6 +23,9 @@ function rowToJob(r: any): ServerJob {
     result: r.result ?? undefined,
     error: r.error ?? undefined,
     workerId: r.worker_id ?? undefined,
+    attempts: r.attempts ?? 0,
+    queuedAt: iso(r.queued_at),
+    claimedAt: iso(r.claimed_at),
     createdAt: iso(r.created_at),
     completedAt: iso(r.completed_at),
   };
@@ -276,31 +279,62 @@ export class PostgresRepo implements Repo {
     const { rows } = await this.db.query("SELECT * FROM jobs WHERE user_id = $1 AND status IN ('queued', 'processing')", [userId]);
     return rows.map(rowToJob);
   }
-  // Admission + insert under the user's row lock: concurrent creates/retries on any instance are serialized per user.
+  /** Admission context, read under the jobAdmission advisory lock (so it cannot change before the insert commits). */
+  private async admissionContext(tx: Tx): Promise<AdmissionContext> {
+    const r = await tx.query("SELECT count(*)::int AS n FROM jobs WHERE status = 'queued'");
+    return { globalQueued: r.rows[0].n };
+  }
+  // Admission + insert: every admission on every instance is serialized by one advisory lock, then the user's row
+  // lock. So both the per-user limit and the global queue cap are exact under concurrency (tests/render_queue.test.ts B3).
   async insertJob(job: ServerJob, admit?: JobAdmission): Promise<JobDenial | null> {
     return withTx(this.db, async (tx) => {
+      if (admit) await tx.query('SELECT pg_advisory_xact_lock($1)', [LOCKS.jobAdmission]);
       await ensureUser(tx, job.userId);
       await tx.query('SELECT 1 FROM users WHERE id = $1 FOR UPDATE', [job.userId]);
       if (admit) {
         const active = (await tx.query("SELECT * FROM jobs WHERE user_id = $1 AND status IN ('queued', 'processing')", [job.userId])).rows.map(rowToJob);
-        const denied = admit(active);
+        const denied = admit(active, await this.admissionContext(tx));
         if (denied) return denied;
       }
       await tx.query(
-        `INSERT INTO jobs (id, user_id, type, status, progress, step_message, payload, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8)`,
+        `INSERT INTO jobs (id, user_id, type, status, progress, step_message, payload, created_at, queued_at) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, now())`,
         [job.id, job.userId, job.type, job.status, job.progress, job.stepMessage ?? null, JSON.stringify(job.payload ?? null), job.createdAt],
       );
       return null;
     });
   }
-  async claimNextJob(workerId: string) {
-    const r = await this.db.query(
-      `UPDATE jobs SET status = 'processing', worker_id = $1, heartbeat_at = now(), progress = 20, step_message = 'Rendering...'
-       WHERE id = (SELECT id FROM jobs WHERE status = 'queued' ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1)
-       RETURNING *`,
-      [workerId],
+  // Fair claim (R-04). Candidates: users with queued jobs and fewer than maxRunningPerUser processing jobs, least
+  // recently served first (a user never served before goes first), then oldest job. Each candidate is tried in its own
+  // short transaction: the user's row is locked (waiting if another claim/admission holds it), the running count is
+  // re-checked, then one queued job is claimed with SKIP LOCKED. Two instances can therefore never start more than
+  // maxRunningPerUser jobs of one user, and since a transaction holds at most one user lock, claims cannot deadlock.
+  async claimNextJob(workerId: string, maxRunningPerUser = 1) {
+    const { rows: candidates } = await this.db.query(
+      `SELECT q.user_id, min(q.created_at) AS oldest, (SELECT max(c.claimed_at) FROM jobs c WHERE c.user_id = q.user_id) AS last_served
+         FROM jobs q WHERE q.status = 'queued'
+        GROUP BY q.user_id
+       HAVING (SELECT count(*) FROM jobs p WHERE p.user_id = q.user_id AND p.status = 'processing') < $1
+        ORDER BY last_served ASC NULLS FIRST, oldest ASC
+        LIMIT 20`,
+      [maxRunningPerUser],
     );
-    return r.rows[0] ? rowToJob(r.rows[0]) : null;
+    for (const c of candidates) {
+      const claimed = await withTx(this.db, async (tx) => {
+        await tx.query('SELECT 1 FROM users WHERE id = $1 FOR UPDATE', [c.user_id]);
+        const running = (await tx.query("SELECT count(*)::int AS n FROM jobs WHERE user_id = $1 AND status = 'processing'", [c.user_id])).rows[0].n;
+        if (running >= maxRunningPerUser) return null;
+        const r = await tx.query(
+          `UPDATE jobs SET status = 'processing', worker_id = $1, heartbeat_at = now(), claimed_at = now(), attempts = attempts + 1,
+                  progress = 20, step_message = 'Rendering...'
+            WHERE id = (SELECT id FROM jobs WHERE user_id = $2 AND status = 'queued' ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1)
+            RETURNING *`,
+          [workerId, c.user_id],
+        );
+        return r.rows[0] ? rowToJob(r.rows[0]) : null;
+      });
+      if (claimed) return claimed;
+    }
+    return null;
   }
   async heartbeat(jobId: string, workerId: string, progress: number, stepMessage: string): Promise<HeartbeatResult> {
     const r = await this.db.query(
@@ -319,6 +353,35 @@ export class PostgresRepo implements Repo {
     );
     return (r.rowCount ?? 0) > 0;
   }
+  // F7: completion and charge commit together or not at all. A cancel that won the race leaves rowCount 0: no charge.
+  async completeJob(job: ServerJob, workerId: string, billSeconds: number, defaults: StoredSubscription) {
+    return withTx(this.db, async (tx) => {
+      await ensureUser(tx, job.userId);
+      await tx.query('SELECT 1 FROM users WHERE id = $1 FOR UPDATE', [job.userId]);
+      const r = await tx.query(
+        `UPDATE jobs SET status = 'completed', progress = $3, step_message = $4, result = $5::jsonb, error = NULL, completed_at = $6, worker_id = NULL, heartbeat_at = NULL
+         WHERE id = $1 AND worker_id = $2 AND status = 'processing'`,
+        [job.id, workerId, job.progress, job.stepMessage ?? null, JSON.stringify(job.result ?? null), job.completedAt ?? new Date().toISOString()],
+      );
+      if (!r.rowCount) return false;
+      await tx.query(
+        `INSERT INTO subscriptions (user_id, plan, status, monthly_render_minutes_used, current_period_end, demo)
+         VALUES ($1, $2, 'active', $3, $4, false)
+         ON CONFLICT (user_id) DO UPDATE SET monthly_render_minutes_used = subscriptions.monthly_render_minutes_used + EXCLUDED.monthly_render_minutes_used, updated_at = now()`,
+        [job.userId, defaults.plan, +(billSeconds / 60).toFixed(2), defaults.currentPeriodEnd],
+      );
+      return true;
+    });
+  }
+  async releaseJob(jobId: string, workerId: string) {
+    const r = await this.db.query(
+      `UPDATE jobs SET status = 'queued', worker_id = NULL, heartbeat_at = NULL, attempts = greatest(attempts - 1, 0), progress = 5,
+              step_message = 'Re-queued: the server rendering it was restarted.', queued_at = now()
+       WHERE id = $1 AND worker_id = $2 AND status = 'processing'`,
+      [jobId, workerId],
+    );
+    return (r.rowCount ?? 0) > 0;
+  }
   async cancelJob(jobId: string) {
     const r = await this.db.query(
       `UPDATE jobs SET status = 'cancelled', step_message = 'Job cancelled by user request.', completed_at = now()
@@ -329,29 +392,49 @@ export class PostgresRepo implements Repo {
   }
   async requeueJob(jobId: string, admit?: JobAdmission): Promise<{ job: ServerJob | null; denied?: JobDenial }> {
     return withTx(this.db, async (tx) => {
+      if (admit) await tx.query('SELECT pg_advisory_xact_lock($1)', [LOCKS.jobAdmission]);
       const owner = (await tx.query('SELECT user_id FROM jobs WHERE id = $1', [jobId])).rows[0];
       if (!owner) return { job: null };
       await tx.query('SELECT 1 FROM users WHERE id = $1 FOR UPDATE', [owner.user_id]);
       if (admit) {
         const active = (await tx.query("SELECT * FROM jobs WHERE user_id = $1 AND id <> $2 AND status IN ('queued', 'processing')", [owner.user_id, jobId])).rows.map(rowToJob);
-        const denied = admit(active);
+        const denied = admit(active, await this.admissionContext(tx));
         if (denied) return { job: null, denied };
       }
       const r = await tx.query(
         `UPDATE jobs SET status = 'queued', progress = 5, error = NULL, result = NULL, completed_at = NULL, worker_id = NULL, heartbeat_at = NULL,
-           step_message = 'Re-queued for rendering...'
+           step_message = 'Re-queued for rendering...', attempts = 0, queued_at = now()
          WHERE id = $1 AND status IN ('failed', 'cancelled') RETURNING *`,
         [jobId],
       );
       return { job: r.rows[0] ? rowToJob(r.rows[0]) : null };
     });
   }
-  async reapStaleJobs(staleMs: number) {
+  // Crash recovery: a stale job goes back to the queue (another instance renders it) until it has used its attempts.
+  async reapStaleJobs(staleMs: number, maxAttempts: number): Promise<ReapResult> {
     const r = await this.db.query(
-      `UPDATE jobs SET status = 'failed', error = 'Render worker stopped responding (instance restart or crash)',
-         step_message = 'Failed: render worker stopped responding — retry to run again.', completed_at = now(), worker_id = NULL
-       WHERE status = 'processing' AND heartbeat_at < now() - ($1::int * interval '1 millisecond')`,
-      [staleMs],
+      `UPDATE jobs SET
+         status       = CASE WHEN attempts < $2 THEN 'queued' ELSE 'failed' END,
+         error        = CASE WHEN attempts < $2 THEN NULL ELSE 'Render worker stopped responding (instance restart or crash) on every attempt' END,
+         step_message = CASE WHEN attempts < $2 THEN 'Re-queued: the server rendering it stopped responding.'
+                             ELSE 'Failed: render worker stopped responding — retry to run again.' END,
+         completed_at = CASE WHEN attempts < $2 THEN NULL ELSE now() END,
+         queued_at    = CASE WHEN attempts < $2 THEN now() ELSE queued_at END,
+         progress     = CASE WHEN attempts < $2 THEN 5 ELSE progress END,
+         worker_id = NULL, heartbeat_at = NULL
+       WHERE id IN (SELECT id FROM jobs WHERE status = 'processing' AND heartbeat_at < now() - ($1::int * interval '1 millisecond') FOR UPDATE SKIP LOCKED)
+       RETURNING status`,
+      [staleMs, maxAttempts],
+    );
+    const requeued = r.rows.filter((x: any) => x.status === 'queued').length;
+    return { requeued, failed: r.rows.length - requeued };
+  }
+  async expireQueuedJobs(ttlMs: number) {
+    const r = await this.db.query(
+      `UPDATE jobs SET status = 'failed', error = 'Expired: waited too long in the render queue', step_message = 'Expired: waited too long in the render queue — retry to queue it again.',
+              completed_at = now()
+       WHERE id IN (SELECT id FROM jobs WHERE status = 'queued' AND coalesce(queued_at, created_at) < now() - ($1::int * interval '1 millisecond') FOR UPDATE SKIP LOCKED)`,
+      [ttlMs],
     );
     return r.rowCount ?? 0;
   }

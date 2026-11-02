@@ -18,14 +18,14 @@ Rate limits are per client IP per route group (token bucket / minute). **AI** = 
 | POST | /api/projects | user | 60 | Create/update (field allowlist, 512 KB cap, 200/user) |
 | DELETE | /api/projects/:id | user | 60 | Owner/admin only |
 | POST | /api/projects/:id/duplicate | user | 60 | Copy own or sample |
-| POST | /api/render/video | user | 10 | Synchronous caption render (503 when at capacity, 402 when minutes exhausted) |
+| POST | /api/render/video | signed-in user | 10 | Caption render through the job queue; waits for the job (`RENDER_SYNC_WAIT_S`, default 50 s, then 202 + job id). Guests 403 `sign_in_required`; 429 `user_queue_full` / `queue_full` + Retry-After; 402 minutes exhausted. Client disconnect cancels the job |
 | GET | /api/render/download/:renderId | capability URL | – | MP4 download, Range/416 |
 | GET | /api/render/probe/:renderId | user | 60 | Metadata |
 | GET | /api/jobs | user | 120 | Own jobs |
-| POST | /api/jobs/create | user | 20 | `render_video` / `render_short` only |
+| POST | /api/jobs/create | signed-in user | 20 | `render_video` / `render_short` only. Guests 403 `sign_in_required`; per user 1 running + 3 queued (429 `user_queue_full`); global queue cap (429 `queue_full`); both with Retry-After |
 | GET | /api/jobs/:id | user | 240 | Owner only |
 | POST | /api/jobs/:id/cancel | user | 60 | Kills ffmpeg |
-| POST | /api/jobs/:id/retry | user | 20 | Failed/cancelled only; real re-render |
+| POST | /api/jobs/:id/retry | signed-in user | 20 | Failed/cancelled only; real re-render; same admission limits as create |
 | POST | /api/publish/generate-pack | user | 30 | Platform copy + SRT/VTT |
 | POST | /api/tts | user | 25 AI | Gemini TTS (or `fallback: true`) |
 | POST | /api/generate-script | user | 15 AI | Script JSON (`source`, `isFallback`) |

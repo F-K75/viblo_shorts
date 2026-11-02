@@ -11,6 +11,8 @@ export interface StoredSubscription {
   monthlyRenderMinutesUsed: number;
   currentPeriodEnd: string;
   demo?: boolean;
+  /** JSON backend only: completed jobs already charged (makes the charge idempotent across a crash). */
+  billedJobIds?: string[];
 }
 
 export interface ServerJob {
@@ -26,6 +28,16 @@ export interface ServerJob {
   result?: any;
   payload?: any;
   workerId?: string;
+  /** How many times a worker claimed this job (crash recovery gives up after RENDER_MAX_ATTEMPTS). */
+  attempts?: number;
+  /** When the job (re-)entered the queue; jobs waiting longer than RENDER_QUEUE_TTL_S expire. */
+  queuedAt?: string;
+  /** When a worker last claimed it (fairness: the least recently served user goes first). */
+  claimedAt?: string;
+  /** JSON backend: render seconds charged for this completed job (exactly-once reconciliation on start). */
+  billedSeconds?: number;
+  /** JSON backend: the subscription to create if the user has none when the charge is reconciled. */
+  billingDefaults?: StoredSubscription;
 }
 
 export type AiSettlement = 'commit' | 'refund';
@@ -37,8 +49,18 @@ export interface QuotaEntry {
 
 export type HeartbeatResult = 'ok' | 'cancelled' | 'lost';
 export type JobDenial = [number, Record<string, unknown>];
+/** What the admission rule sees besides the user's own active jobs (counted atomically with the insert). */
+export interface AdmissionContext {
+  /** Jobs waiting in the queue across all users and instances (processing jobs are not counted). */
+  globalQueued: number;
+}
 /** Synchronous predicate over the user's other active jobs; returns a denial or null. */
-export type JobAdmission = (activeJobs: ServerJob[]) => JobDenial | null;
+export type JobAdmission = (activeJobs: ServerJob[], ctx: AdmissionContext) => JobDenial | null;
+/** Outcome of a crash-recovery pass: stale jobs either go back to the queue or, after too many attempts, fail. */
+export interface ReapResult {
+  requeued: number;
+  failed: number;
+}
 
 /** Thrown when a project id exists but belongs to someone else (callers answer 404). */
 export class ProjectOwnershipError extends Error {
@@ -99,21 +121,37 @@ export interface Repo {
   getJob(id: string): Promise<ServerJob | null>;
   activeJobs(userId: string): Promise<ServerJob[]>;
   /**
-   * Inserts a job. When `admit` is given it is evaluated against the user's active jobs atomically with the
-   * insert (no other job of this user can be admitted in between, on any instance); a non-null result is a
+   * Inserts a job. When `admit` is given it is evaluated against the user's active jobs and the global queue length
+   * atomically with the insert (no other job can be admitted in between, on any instance); a non-null result is a
    * denial ([httpStatus, body]) and nothing is inserted.
    */
   insertJob(job: ServerJob, admit?: JobAdmission): Promise<JobDenial | null>;
-  /** Atomically moves the oldest queued job to processing for this worker. */
-  claimNextJob(workerId: string): Promise<ServerJob | null>;
+  /**
+   * Atomically claims one queued job for this worker (attempts + 1). Fair: the queued job of the user served least
+   * recently goes first (FIFO within a user), and a user who already has `maxRunningPerUser` processing jobs is
+   * skipped, so one user's backlog can never starve the others.
+   */
+  claimNextJob(workerId: string, maxRunningPerUser?: number): Promise<ServerJob | null>;
   heartbeat(jobId: string, workerId: string, progress: number, stepMessage: string): Promise<HeartbeatResult>;
-  /** Final state written only if this worker still owns the job (a cancel in between wins). */
+  /** Final state written only if this worker still owns the job (a cancel in between wins). Never used for success. */
   finishJob(job: ServerJob, workerId: string): Promise<boolean>;
+  /**
+   * F7: marks the job completed AND charges `billSeconds` render seconds exactly once. PostgreSQL: one transaction,
+   * so a completed-but-unbilled job is impossible. JSON: the job records `billedSeconds`; the subscription records
+   * the job id; init() charges any completed job whose id is missing (a crash between the two writes).
+   * Returns false (nothing charged) if this worker no longer owns the job, e.g. it was cancelled. Throws if the
+   * charge cannot be written; the job is then not completed (PostgreSQL) or is reconciled on restart (JSON).
+   */
+  completeJob(job: ServerJob, workerId: string, billSeconds: number, defaults: StoredSubscription): Promise<boolean>;
+  /** Graceful shutdown: hands a processing job back to the queue (the attempt is not counted). */
+  releaseJob(jobId: string, workerId: string): Promise<boolean>;
   cancelJob(jobId: string): Promise<ServerJob | null>;
-  /** Failed/cancelled -> queued, subject to `admit` (evaluated atomically, excluding this job). */
+  /** Failed/cancelled -> queued, subject to `admit` (evaluated atomically, excluding this job). Resets attempts. */
   requeueJob(jobId: string, admit?: JobAdmission): Promise<{ job: ServerJob | null; denied?: JobDenial }>;
-  /** Marks processing jobs whose worker stopped heart-beating as failed. Returns how many. */
-  reapStaleJobs(staleMs: number): Promise<number>;
+  /** Processing jobs whose worker stopped heart-beating go back to the queue, or fail once attempts >= maxAttempts. */
+  reapStaleJobs(staleMs: number, maxAttempts: number): Promise<ReapResult>;
+  /** Fails queued jobs that waited longer than ttlMs (never charged). Returns how many. */
+  expireQueuedJobs(ttlMs: number): Promise<number>;
 
   // ---- housekeeping (expired buckets/windows/old usage rows) ----
   sweep(): Promise<void>;

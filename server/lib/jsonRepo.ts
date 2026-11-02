@@ -1,10 +1,13 @@
 // JSON-file Repo (Phase 1 storage, single instance). Kept as the development default and as the
-// rollback target of the PostgreSQL migration. Behaviour is unchanged from Phase 1.
+// rollback target of the PostgreSQL migration.
+// Track B: fair claim, per-user running cap, queue cap, bounded crash retries and exactly-once billing. A completed
+// job records billedSeconds; the subscription records the job id when charged; init() charges any completed job whose
+// id is missing (crash between the two writes), so the charge happens exactly once.
 import path from 'path';
 import { ProjectStore, type StoreLimits } from './projectStore.ts';
 import { readJsonFile, writeJsonFileAtomic } from './storage.ts';
 import { UsageLedger } from './usage.ts';
-import { ProjectOwnershipError, type AiSettlement, type HeartbeatResult, type JobAdmission, type JobDenial, type QuotaEntry, type Repo, type ServerJob, type StoredSubscription } from './repo.ts';
+import { ProjectOwnershipError, type AiSettlement, type HeartbeatResult, type JobAdmission, type JobDenial, type QuotaEntry, type ReapResult, type Repo, type ServerJob, type StoredSubscription } from './repo.ts';
 
 const MAX_STORED_JOBS = 500;
 
@@ -18,32 +21,75 @@ export class JsonRepo implements Repo {
   private windows = new Map<string, { windowId: number; count: number }>();
   private heartbeats = new Map<string, number>(); // jobId -> last heartbeat (ms)
 
-  constructor(dataDir: string, backupDir: string, limits: StoreLimits, ledgerFlushMs: number) {
+  constructor(
+    dataDir: string,
+    backupDir: string,
+    limits: StoreLimits,
+    ledgerFlushMs: number,
+    /** RENDER_MAX_ATTEMPTS: a job left processing by a dead process is requeued until it has used this many claims. */
+    private readonly maxAttempts = 2,
+  ) {
     this.store = new ProjectStore(dataDir, backupDir, limits);
     this.ledger = new UsageLedger(path.join(dataDir, 'usage.json'), ledgerFlushMs);
     this.jobsFile = path.join(dataDir, 'jobs.json');
     this.subsFile = path.join(dataDir, 'subscriptions.json');
   }
 
-  /** Runs the Phase 1 store init (incl. legacy migration) and marks jobs orphaned by a previous process. */
+  /**
+   * Runs the Phase 1 store init (incl. legacy migration), recovers jobs orphaned by a previous process and charges
+   * completed jobs whose charge was not recorded (crash between completion and charge).
+   */
   init() {
     const report = this.store.init();
     try {
       const jobs = this.jobs();
       let changed = false;
-      // Single instance: a job left "processing" by a previous process has no live worker. Queued jobs stay
-      // queued and are picked up by this process's worker loop.
+      // Single instance: a job left "processing" by a previous process has no live worker. It goes back to the queue
+      // unless it already used its attempts (a job that crashes the process every time must not loop forever).
       for (const j of jobs) {
-        if (j.status === 'processing') {
-          Object.assign(j, { status: 'failed', error: 'Interrupted by server restart', stepMessage: 'Interrupted by server restart — retry to run again.', workerId: undefined });
-          changed = true;
+        if (j.status !== 'processing') continue;
+        changed = true;
+        if ((j.attempts ?? 0) < this.maxAttempts) {
+          Object.assign(j, { status: 'queued', workerId: undefined, progress: 5, stepMessage: 'Re-queued: the server restarted while rendering it.', queuedAt: new Date().toISOString() });
+        } else {
+          Object.assign(j, { status: 'failed', workerId: undefined, error: 'Interrupted by server restart on every attempt', stepMessage: 'Interrupted by server restart — retry to run again.', completedAt: new Date().toISOString() });
         }
       }
       if (changed) writeJsonFileAtomic(this.jobsFile, jobs);
+      this.reconcileCharges(jobs);
     } catch (err: any) {
       console.error(JSON.stringify({ level: 'error', event: 'job_recovery_skipped', error: String(err?.message || err) }));
     }
     return report;
+  }
+
+  /** F7 (JSON): charge every completed job that is not yet in its user's billedJobIds. Idempotent. */
+  private reconcileCharges(jobs: ServerJob[]) {
+    const subs = this.subs();
+    const retained = new Set(jobs.map((j) => j.id));
+    let changed = false;
+    let charged = 0;
+    for (const j of jobs) {
+      if (j.status !== 'completed' || !(j.billedSeconds! > 0)) continue;
+      const cur = subs[j.userId];
+      if (cur?.billedJobIds?.includes(j.id)) continue;
+      const base = cur || this.defaultsFor(j);
+      subs[j.userId] = { ...base, monthlyRenderMinutesUsed: +((base.monthlyRenderMinutesUsed || 0) + j.billedSeconds! / 60).toFixed(2), billedJobIds: [...(base.billedJobIds || []), j.id] };
+      changed = true;
+      charged++;
+    }
+    // Ids of jobs no longer retained in jobs.json can never be reconciled again: drop them (bounded file size).
+    for (const s of Object.values(subs)) {
+      if (s.billedJobIds?.some((id) => !retained.has(id))) {
+        s.billedJobIds = s.billedJobIds.filter((id) => retained.has(id));
+        changed = true;
+      }
+    }
+    if (changed) writeJsonFileAtomic(this.subsFile, subs);
+    if (charged) console.warn(JSON.stringify({ level: 'warn', event: 'render_charges_reconciled', count: charged }));
+  }
+  private defaultsFor(j: ServerJob): StoredSubscription {
+    return j.billingDefaults ?? { plan: 'free', status: 'active', monthlyRenderMinutesUsed: 0, currentPeriodEnd: new Date(Date.now() + 30 * 864e5).toISOString() };
   }
 
   async health() {
@@ -90,11 +136,15 @@ export class JsonRepo implements Repo {
     return readJsonFile<Record<string, StoredSubscription>>(this.subsFile, {});
   }
   async getSubscription(userId: string) {
-    return this.subs()[userId] || null;
+    const s = this.subs()[userId];
+    if (!s) return null;
+    const { billedJobIds: _b, ...pub } = s;
+    return pub;
   }
   async putSubscription(userId: string, sub: StoredSubscription) {
     const subs = this.subs();
-    subs[userId] = sub;
+    // billedJobIds is the exactly-once record of charges: a plan change or monthly reset must not erase it.
+    subs[userId] = { ...sub, billedJobIds: subs[userId]?.billedJobIds };
     writeJsonFileAtomic(this.subsFile, subs);
   }
   async addRenderMinutes(userId: string, seconds: number, defaults: StoredSubscription) {
@@ -170,21 +220,33 @@ export class JsonRepo implements Repo {
   async activeJobs(userId: string) {
     return this.jobs().filter((j) => j.userId === userId && (j.status === 'queued' || j.status === 'processing'));
   }
+  private static active(j: ServerJob) {
+    return j.status === 'queued' || j.status === 'processing';
+  }
   // Read-check-write with no await in between: atomic within this single process.
   async insertJob(job: ServerJob, admit?: JobAdmission): Promise<JobDenial | null> {
     const jobs = this.jobs();
-    const denied = admit?.(jobs.filter((j) => j.userId === job.userId && (j.status === 'queued' || j.status === 'processing'))) ?? null;
+    const denied = admit?.(jobs.filter((j) => j.userId === job.userId && JsonRepo.active(j)), { globalQueued: jobs.filter((j) => j.status === 'queued').length }) ?? null;
     if (denied) return denied;
-    jobs.unshift(job);
+    jobs.unshift({ ...job, attempts: 0, queuedAt: new Date().toISOString() });
     this.writeJobs(jobs);
     return null;
   }
-  async claimNextJob(workerId: string) {
+  // Fair claim: least recently served user first (never-served first), FIFO within a user, per-user running cap.
+  async claimNextJob(workerId: string, maxRunningPerUser = 1) {
     const jobs = this.jobs();
-    // jobs are stored newest first; the queue is FIFO
-    const next = [...jobs].reverse().find((j) => j.status === 'queued');
+    const lastServed = new Map<string, number>();
+    const running = new Map<string, number>();
+    for (const j of jobs) {
+      if (j.claimedAt) lastServed.set(j.userId, Math.max(lastServed.get(j.userId) ?? 0, Date.parse(j.claimedAt)));
+      if (j.status === 'processing') running.set(j.userId, (running.get(j.userId) ?? 0) + 1);
+    }
+    // jobs are stored newest first; oldest first within a user
+    const queued = [...jobs].reverse().filter((j) => j.status === 'queued' && (running.get(j.userId) ?? 0) < maxRunningPerUser);
+    queued.sort((a, b) => (lastServed.get(a.userId) ?? -1) - (lastServed.get(b.userId) ?? -1) || Date.parse(a.createdAt) - Date.parse(b.createdAt));
+    const next = queued[0];
     if (!next) return null;
-    Object.assign(next, { status: 'processing', workerId, progress: 20, stepMessage: 'Rendering...' });
+    Object.assign(next, { status: 'processing', workerId, progress: 20, stepMessage: 'Rendering...', attempts: (next.attempts ?? 0) + 1, claimedAt: new Date().toISOString() });
     this.writeJobs(jobs);
     this.heartbeats.set(next.id, Date.now());
     return { ...next };
@@ -212,6 +274,35 @@ export class JsonRepo implements Repo {
       }),
     );
   }
+  // Two writes, made exactly-once by reconciliation: (1) the job is completed WITH billedSeconds (the durable intent),
+  // (2) the subscription is charged and records the job id. A crash after (1) is charged by init(); (2) never
+  // charges a job id twice.
+  async completeJob(job: ServerJob, workerId: string, billSeconds: number, defaults: StoredSubscription) {
+    this.heartbeats.delete(job.id);
+    const done = this.update(job.id, (j) => {
+      if (j.status !== 'processing' || j.workerId !== workerId) return false;
+      Object.assign(j, { ...job, status: 'completed', workerId: undefined, error: undefined, billedSeconds: billSeconds, billingDefaults: defaults });
+      return true;
+    });
+    if (!done) return false;
+    const subs = this.subs();
+    const cur = subs[job.userId] || defaults;
+    if (!cur.billedJobIds?.includes(job.id)) {
+      subs[job.userId] = { ...cur, monthlyRenderMinutesUsed: +((cur.monthlyRenderMinutesUsed || 0) + billSeconds / 60).toFixed(2), billedJobIds: [...(cur.billedJobIds || []), job.id] };
+      writeJsonFileAtomic(this.subsFile, subs);
+    }
+    return true;
+  }
+  async releaseJob(jobId: string, workerId: string) {
+    this.heartbeats.delete(jobId);
+    return Boolean(
+      this.update(jobId, (j) => {
+        if (j.status !== 'processing' || j.workerId !== workerId) return false;
+        Object.assign(j, { status: 'queued', workerId: undefined, progress: 5, attempts: Math.max(0, (j.attempts ?? 1) - 1), stepMessage: 'Re-queued: the server rendering it was restarted.', queuedAt: new Date().toISOString() });
+        return true;
+      }),
+    );
+  }
   async cancelJob(jobId: string) {
     return this.update(jobId, (j) => {
       if (j.status !== 'queued' && j.status !== 'processing') return false;
@@ -224,26 +315,45 @@ export class JsonRepo implements Repo {
     const all = this.jobs();
     const job = this.update(jobId, (j) => {
       if (j.status !== 'failed' && j.status !== 'cancelled') return false;
-      denied = admit?.(all.filter((x) => x.userId === j.userId && x.id !== j.id && (x.status === 'queued' || x.status === 'processing'))) ?? null;
+      denied = admit?.(all.filter((x) => x.userId === j.userId && x.id !== j.id && JsonRepo.active(x)), { globalQueued: all.filter((x) => x.status === 'queued').length }) ?? null;
       if (denied) return false;
-      Object.assign(j, { status: 'queued', progress: 5, error: undefined, result: undefined, completedAt: undefined, workerId: undefined, stepMessage: 'Re-queued for rendering...' });
+      Object.assign(j, { status: 'queued', progress: 5, error: undefined, result: undefined, completedAt: undefined, workerId: undefined, attempts: 0, queuedAt: new Date().toISOString(), stepMessage: 'Re-queued for rendering...' });
       return true;
     });
     return denied ? { job: null, denied } : { job };
   }
-  async reapStaleJobs(staleMs: number) {
-    // Single process: a processing job whose heartbeat stopped belongs to a crashed render in this process.
+  async reapStaleJobs(staleMs: number, maxAttempts: number): Promise<ReapResult> {
+    // Single process: a processing job whose heartbeat stopped belongs to a hung render in this process.
     const now = Date.now();
     const stale = [...this.heartbeats].filter(([, t]) => now - t > staleMs).map(([id]) => id);
-    let n = 0;
+    const out = { requeued: 0, failed: 0 };
     for (const id of stale) {
       this.heartbeats.delete(id);
-      if (this.update(id, (j) => {
+      this.update(id, (j) => {
         if (j.status !== 'processing') return false;
-        Object.assign(j, { status: 'failed', error: 'Render worker stopped responding', stepMessage: 'Failed: render worker stopped responding — retry to run again.', completedAt: new Date().toISOString() });
+        if ((j.attempts ?? 0) < maxAttempts) {
+          Object.assign(j, { status: 'queued', workerId: undefined, progress: 5, stepMessage: 'Re-queued: the render worker stopped responding.', queuedAt: new Date().toISOString() });
+          out.requeued++;
+        } else {
+          Object.assign(j, { status: 'failed', workerId: undefined, error: 'Render worker stopped responding on every attempt', stepMessage: 'Failed: render worker stopped responding — retry to run again.', completedAt: new Date().toISOString() });
+          out.failed++;
+        }
         return true;
-      })) n++;
+      });
     }
+    return out;
+  }
+  async expireQueuedJobs(ttlMs: number) {
+    const jobs = this.jobs();
+    const cutoff = Date.now() - ttlMs;
+    let n = 0;
+    for (const j of jobs) {
+      if (j.status === 'queued' && Date.parse(j.queuedAt || j.createdAt) < cutoff) {
+        Object.assign(j, { status: 'failed', error: 'Expired: waited too long in the render queue', stepMessage: 'Expired: waited too long in the render queue — retry to queue it again.', completedAt: new Date().toISOString() });
+        n++;
+      }
+    }
+    if (n) this.writeJobs(jobs);
     return n;
   }
 
