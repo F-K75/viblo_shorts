@@ -10,8 +10,16 @@
   * slow headers and slow bodies disconnected.
 * **Exit criterion:** the same attack costs +15 to 18 MB RSS instead of +102 MB.
 * **Evidence:** `docs/PHASE2_5_TRACK_C.md`.
-* **Still open from R-13:** the earlier "1 to 6 unexplained dropped sockets" note. Follow-up: client auto-retry
-  for 503 `busy` / `memory_pressure`.
+* **Review corrections:**
+  * the memory guard now reserves ffmpeg render memory (`L = 0.8 x M - R x S`; 1 GB with 2 renders → 307 MB),
+    and insufficient or invalid budgets stop the server;
+  * recovery is proven with **real** RSS: 561 → 105 MB, and readiness returns only below 90 %.
+* **Still open:**
+  * R-13's earlier "1 to 6 unexplained dropped sockets" note (not reproduced in 13 bursts);
+  * intermittent `EPIPE` in the exit test (test-helper hypothesis);
+  * client auto-retry for 503 `busy` / `memory_pressure`;
+  * Docker-level coverage (Track D);
+  * JS-heap retention not measured.
 
 ## Integration (2026-11-02): PR #2 merged; PR #3 retargeted to `main`; awaiting final PR #3 decision
 * **PR #2:**

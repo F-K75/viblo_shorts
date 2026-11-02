@@ -116,3 +116,88 @@ test asserting the old exact `checks` shape (§5).
   is checked. It is bounded by the route limit and the concurrency cap.
 * R-13's earlier note of "1 to 6 unexplained dropped sockets" under load was not reproduced or explained in this
   track. It stays open.
+
+## 8. Corrections requested in review (2026-11-02): REQUEST CHANGES on PR #4
+### 8.1 Correction 1: the memory guard accounts for ffmpeg render memory
+* **Finding:** ffmpeg renders are separate processes. Their memory is never part of Node's RSS but counts against the
+  same container limit. Measured worst case: a 60 s 1080p render with 40 captions peaked at **169 MB**. The old
+  default threshold (80 % of the container, applied to Node alone) let Node reach ~819 MB in a 1 GB container
+  while two renders (~340 MB) ran beside it, so the kernel could kill the container before the guard reacted.
+* **Fix (`computeMemoryBudget`):** `L = floor(0.8 x M - R x S)`.
+  * `M`: the container memory (cgroup, or `MEMORY_CONTAINER_LIMIT_MB`, else host memory).
+  * `R`: `MAX_CONCURRENT_RENDERS`.
+  * `S`: `RENDER_MEMORY_RESERVE_MB`, default 256.
+  * 1 GB, 2 renders → **307 MB** for Node; with 1 render → 563 MB.
+* **No double counting:**
+  * an explicit `MEMORY_SOFT_LIMIT_MB` is used as-is, with no reserve subtracted;
+  * Node's RSS covers only the Node process, never the ffmpeg children.
+* **Invalid or insufficient budgets stop the server at startup** with an explanation. Examples:
+  * 512 MB with 2 renders, because nothing is left for Node;
+  * 768 MB with 2 renders, which leaves 102 MB, under `MEMORY_MIN_NODE_MB` (192);
+  * a non-numeric or fractional `MAX_CONCURRENT_RENDERS`, which previously became `NaN` and would have disabled the
+    guard silently;
+  * negative values.
+* `/api/health/details` → `system.memoryGuard` now shows the budget: `softLimitMb`, `source`, `memoryMb`,
+  `reservedForRendersMb`, `maxConcurrentRenders` and `renderReserveMb`.
+* **Limitation:** the reserve is a planning number, not a hard cap on ffmpeg. A render using more than its reserve
+  is not stopped by this guard (Track B adds per-job timeouts). The 256 MB default is 1.5× the measured worst case.
+
+### 8.2 Correction 2: recovery from REAL memory pressure
+The earlier recovery test used injected RSS values. The new test allocates **genuine** memory inside the server
+process (8 MB buffers filled with non-zero bytes, so the pages are really resident). It uses a test-only hook that
+exists only when `NODE_ENV=test` **and** `MEMORY_TEST_HOOKS=1`; a test asserts the hook is absent otherwise. The
+test then:
+1. takes the baseline (real RSS ~99 MB) with the limit at 400 MB, and checks readiness is 200;
+2. retains 450 MB: real RSS ~561 MB → the guard trips **on the sampler's real reading**, readiness is 503
+   (`checks.memory: false`), and a large request gets `503 memory_pressure`;
+3. releases the buffers and runs `gc()` twice (`--expose-gc`): real RSS falls to ~105 MB;
+4. polls: readiness returns to 200 **only** when the guard's real reading is below 360 MB (90 %), and every
+   earlier poll was 503. A large request then succeeds.
+
+Thresholds were not changed to make it pass. **Result: Node did release the memory** for Buffer allocations (the
+kind request bodies use). This was not measured for retained JS-heap objects; V8 may keep heap pages longer, which
+could keep an instance drained. That stays listed as a risk.
+
+### 8.3 Red → green
+| Test | Before (PR head `b0328ad`; tests-only commit `3a11c7b`) | After |
+|---|---|---|
+| Budget unit tests (7) | fail: `computeMemoryBudget` does not exist | pass |
+| 1 GB / 2 renders in the running server | **threshold 12,873 MB** (80 % of host memory) | 307 MB; guard and readiness act at 320 MB, stay guarded at 290 MB (hysteresis), recover at 250 MB |
+| Reserve override / explicit override | (no reserve concept) | 563 MB / 700 MB explicit, nothing subtracted |
+| 512 MB container, 2 renders; `MAX_CONCURRENT_RENDERS=abc` | **server starts anyway** | refuses to start with an explanation |
+| Real memory recovery | fails only because the hook does not exist (**a trivial red**: the guard logic it exercises already existed) | pass with genuine RSS: 561 → 105 MB, readiness back only below 360 MB |
+| Hook absent without the flags | pass | pass |
+
+### 8.4 Intermittent `EPIPE` in the exit-criterion test (investigated, not changed: outside the two corrections)
+* **Seen:** twice in about 20 full-suite runs, one oversized upload in the exit test was recorded as `write EPIPE`
+  instead of its 413.
+* **Server side ruled out:** in 1,600 controlled oversized uploads (fast and trickled, `Connection: close` and
+  keep-alive clients), every client received its 413.
+* **Most likely cause:** the test's own `send()` helper. After a socket error it waits only 50 ms for the response;
+  under full-suite load the 413 can take longer than that to be processed, so the helper records the error. This
+  is a hypothesis consistent with all observations, not proven.
+* **Proposed fix (for your decision):** let `send()` wait for the response up to the request timeout after a write
+  error, still requiring a 413. No server change.
+
+### 8.5 Validation of the corrections (local)
+| Run | Backend | Correction tests (7 unit + 5 server) | Real RSS held → after release | Recovered |
+|---|---|---|---|---|
+| 1 | JSON | 12/12 | 564.1 → 107.8 MB | yes |
+| 2 | PostgreSQL | 12/12 | 566.0 → 109.7 MB | yes |
+| 3 | JSON | 12/12 | 571.6 → 114.9 MB | yes |
+
+* Full suites: JSON **192 tests: 190 pass, 0 fail, 2 skipped**; PostgreSQL **192: 183 pass, 0 fail, 9 skipped**.
+* Typecheck ✅, build ✅, E2E 1/1 on both backends.
+* A first gate run failed only with `ECONNREFUSED 127.0.0.1:55432` (52×): the local test database had stopped (a
+  container recycle). It passed after a restart with no code change.
+
+### 8.6 Risk register (Track C)
+| Risk | Status |
+|---|---|
+| ffmpeg memory outside the guard | **Mitigated** by the render reserve (correction 1). Residual: the reserve is a planning number, not a hard cap per render |
+| Guard never exercised on real memory | **Closed for Buffer memory** (correction 2). Residual: retained JS-heap objects not measured; V8 may keep pages longer |
+| Intermittent `EPIPE` in the exit test | **Open**; test-helper hypothesis (§8.4); fix proposed, not applied (out of scope) |
+| No automatic client retry on 503 | **Open** follow-up (`Retry-After` is always sent) |
+| Dropped sockets (R-13 note) | **Open**: not reproduced in 7 + 6 bursts (§ PR review) |
+| No Docker-level test of Track C | **Open**, Track D |
+| Live Gemini | **Open**, release blocker R-01 |
