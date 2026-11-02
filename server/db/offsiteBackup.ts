@@ -445,15 +445,19 @@ export async function restoreBackup(cfg: OffsiteConfig, name: string, targetUrl:
     try {
       await apply.done;
     } catch (err: any) {
-      // psql failed. Before COMMIT (SQL error, lost connection) nothing is committed; a failure DURING COMMIT has an
-      // unknown outcome. Never guess: look at the target and say which case this is.
-      const now = await rowCounts(targetUrl).catch(() => null);
-      const state = !now
-        ? 'the target could not be inspected: check it before retrying (it must be empty to restore into)'
-        : Object.keys(now.counts).length === 0
+      // psql failed after COMMIT was sent. Either the server never got COMMIT (rolled back: empty) or COMMIT took
+      // effect and only the acknowledgement was lost (complete). Never guess: inspect the target and compare it with
+      // the manifest, so the operator gets one of three exact states.
+      const check = await verifyRestoredDatabase(cfg, name, targetUrl).catch(() => null);
+      const state = !check
+        ? 'the target could not be inspected; run `db-backup verify-restore <name>` before doing anything else'
+        : check.state === 'empty'
           ? 'nothing was committed (target database is unchanged)'
-          : 'the target is NOT empty (the failure happened during COMMIT): verify it or drop and recreate it before retrying';
-      throw new Error(`restore failed; ${state}: ${err?.message || err}`);
+          : check.state === 'complete'
+            ? 'the target is NOT empty and its row counts MATCH the backup manifest (COMMIT took effect); confirm with `db-backup verify-restore <name>`'
+            : 'the target is NOT empty and its row counts DO NOT match the backup manifest; drop and recreate it before retrying';
+      const when = check?.state === 'empty' ? 'restore failed;' : 'restore failed after COMMIT was sent;';
+      throw new Error(`${when} ${state}: ${err?.message || err}`);
     }
     const t2 = Date.now();
     const after = await rowCounts(targetUrl);
@@ -462,6 +466,31 @@ export async function restoreBackup(cfg: OffsiteConfig, name: string, targetUrl:
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
+}
+
+export interface RestoredDatabaseCheck {
+  name: string;
+  /** empty: no application tables (safe to restore into). complete: every manifest count matches. mismatch: anything else. */
+  state: 'empty' | 'complete' | 'mismatch';
+  verified: boolean;
+  differences: Array<{ table: string; expected: number; actual: number | null }>;
+}
+
+/**
+ * Operator check (`db-backup verify-restore <name>`): compares a database with a backup's manifest without changing
+ * anything. Used after any failed or interrupted restore to learn the exact state of the target.
+ */
+export async function verifyRestoredDatabase(cfg: OffsiteConfig, name: string, targetUrl: string): Promise<RestoredDatabaseCheck> {
+  const manifest = await openTarget(cfg).getJson<BackupManifest>(`${name}.manifest.json`);
+  const now = await rowCounts(targetUrl);
+  if (Object.keys(now.counts).length === 0) {
+    return { name, state: 'empty', verified: false, differences: Object.entries(manifest.rowCounts).map(([table, expected]) => ({ table, expected, actual: null })) };
+  }
+  const tables = [...new Set([...Object.keys(manifest.rowCounts), ...Object.keys(now.counts)])].sort();
+  const differences = tables
+    .filter((t) => manifest.rowCounts[t] !== now.counts[t])
+    .map((table) => ({ table, expected: manifest.rowCounts[table] ?? 0, actual: now.counts[table] ?? null }));
+  return { name, state: differences.length ? 'mismatch' : 'complete', verified: differences.length === 0, differences };
 }
 
 /** Deletes backups older than keepDays, always keeping the newest `keepMin`. Prefer bucket lifecycle rules. */

@@ -5,13 +5,15 @@
 //   npm run db-backup -- verify <name>             download + SHA-256 check (no key needed)
 //   npm run db-backup -- restore <name>            decrypt (BACKUP_AGE_IDENTITY_FILE) into RESTORE_DATABASE_URL (an EMPTY
 //                                                  database) in one transaction, then verify row counts
+//   npm run db-backup -- verify-restore <name>    compare RESTORE_DATABASE_URL with the backup's manifest (read-only):
+//                                                  state empty | complete | mismatch (exit 0 only for complete)
 //   npm run db-backup -- prune <keepDays>          delete older backups (keeps the newest 3); prefer bucket lifecycle rules
 //
 // Env: DATABASE_URL, BACKUP_TARGET=s3://bucket/prefix, S3_ENDPOINT/S3_REGION + AWS credentials,
 //      BACKUP_AGE_RECIPIENTS=age1...,age1...  (create)   BACKUP_AGE_IDENTITY_FILE=/secure/key.txt (restore)
 //      RESTORE_DATABASE_URL (restore target). Database URLs are only ever read from the environment: command-line
 //      arguments are visible to every user on the host (ps, /proc/<pid>/cmdline).
-import { createBackup, listBackups, offsiteConfigFromEnv, pruneBackups, restoreBackup, verifyBackup } from '../server/db/offsiteBackup.ts';
+import { createBackup, listBackups, offsiteConfigFromEnv, pruneBackups, restoreBackup, verifyBackup, verifyRestoredDatabase } from '../server/db/offsiteBackup.ts';
 
 const [cmd, a, b] = process.argv.slice(2);
 const cfg = offsiteConfigFromEnv();
@@ -45,12 +47,21 @@ async function main() {
       if (!r.verified) process.exitCode = 1;
       break;
     }
+    case 'verify-restore': {
+      if (b !== undefined) throw new Error('verify-restore takes only the backup name; the database comes from RESTORE_DATABASE_URL');
+      if (!a) throw new Error('usage: RESTORE_DATABASE_URL=<db url> db-backup verify-restore <name>');
+      if (!process.env.RESTORE_DATABASE_URL) throw new Error('RESTORE_DATABASE_URL is required');
+      const r = await verifyRestoredDatabase(cfg, a, process.env.RESTORE_DATABASE_URL);
+      console.log(JSON.stringify(r, null, 2));
+      if (r.state !== 'complete') process.exitCode = 1;
+      break;
+    }
     case 'prune':
       if (!a || !(Number(a) >= 1)) throw new Error('usage: prune <keepDays>=1+>');
       console.log(JSON.stringify({ removed: await pruneBackups(cfg, Number(a)) }, null, 2));
       break;
     default:
-      throw new Error('usage: db-backup <create|list|verify <name>|restore <name> (target: RESTORE_DATABASE_URL)|prune <days>>');
+      throw new Error('usage: db-backup <create|list|verify <name>|restore <name>|verify-restore <name> (database: RESTORE_DATABASE_URL)|prune <days>>');
   }
 }
 
