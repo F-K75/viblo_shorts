@@ -38,8 +38,26 @@ SQLite: rejected by product decision; it cannot be shared by multiple instances 
 A file in the database that is missing from the build (a newer schema) is also an error. `pg_advisory_xact_lock`
 means concurrent instance start-ups apply each migration exactly once (tested with 3 concurrent runners).
 
-**Consequences.** Schema changes must be backward-compatible with the previous release during a rolling
-deploy (expand → migrate → contract). Down-migrations are deliberately absent: rollback = restore or forward fix.
+**File rules (F6).** Every `*.sql` file in the directory must be named `NNNN_lower_snake_case.sql` with a unique
+version; anything else is an error before anything runs (a misnamed file used to be skipped silently).
+
+**Rolling deploys and rollback (F5).** A migration that the previous release can run against declares it with a
+line `-- forge:backward-compatible`; the applying build records that in `schema_migrations.backward_compatible`.
+A build that finds applied migrations it does not have starts **only** if all of them are newer than its own
+newest migration **and** declared backward-compatible. It then applies nothing and logs
+`schema_newer_than_build`. Everything else (an undeclared newer migration, a diverged history) still refuses to
+start. A migration may carry the marker only if it is expand-only:
+* allowed: new tables, new indexes, new nullable columns, new columns with a default, new constraints that
+  existing writes already satisfy;
+* never: drop/rename of a table or column, type changes, `NOT NULL` without a default, changed semantics of
+  existing data. Those are split into expand (marked) → code change → contract (unmarked, next release).
+
+The application writes with explicit column lists (no `INSERT … VALUES` without columns), which is what makes
+added columns safe for the previous release. Tested: tests/migrations.test.ts boots this build against a schema
+with an added table and a `NOT NULL DEFAULT` column and serves reads and writes.
+
+**Consequences.** Down-migrations are deliberately absent: rollback = previous image (when the newer migrations
+are backward-compatible), otherwise restore or forward fix.
 
 ## ADR-003 — Normalized schema around ownership; the API document kept in `jsonb`
 

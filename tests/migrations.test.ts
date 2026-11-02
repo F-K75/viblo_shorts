@@ -9,6 +9,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { createTestDatabase, pgSkip } from './helpers/pg.ts';
 import { loadMigrations, migrate } from '../server/db/migrate.ts';
+import { startTestServer } from './helpers/server.ts';
 
 const cleanups: Array<() => Promise<unknown>> = [];
 after(async () => {
@@ -38,6 +39,19 @@ describe('F5: previous release can run against a newer, backward-compatible sche
     assert.deepEqual(out.applied, []);
     assert.deepEqual(out.newerCompatible, ['9100_add_optional_column.sql']);
     assert.deepEqual((await d.pool.query('SELECT version, checksum FROM schema_migrations ORDER BY version')).rows, before);
+  });
+
+  test('the running application (this build) starts and serves reads and writes against the newer schema', async () => {
+    const d = await db();
+    await migrate(d.pool, dir({ '9105_add_optional_table.sql': '-- forge:backward-compatible\nCREATE TABLE project_tags (project_id text, tag text);\nALTER TABLE projects ADD COLUMN pinned boolean NOT NULL DEFAULT false;\n' }));
+    const s = await startTestServer({ DATABASE_URL: d.url, DATA_DIR: fs.mkdtempSync(path.join(os.tmpdir(), 'mig-srv-')) });
+    cleanups.push(() => s.stop());
+    assert.equal((await fetch(`${s.baseUrl}/api/ready`)).status, 200);
+    const token = s.signFirebaseToken({ sub: 'compat-user' });
+    const save = await fetch(`${s.baseUrl}/api/projects`, { method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' }, body: JSON.stringify({ title: 'written by N-1' }) });
+    assert.equal(save.status, 200);
+    const list = await (await fetch(`${s.baseUrl}/api/projects`, { headers: { authorization: `Bearer ${token}` } })).json();
+    assert.ok(list.projects.some((p: any) => p.title === 'written by N-1'));
   });
 
   test('a newer migration that is not declared backward-compatible is still refused', async () => {

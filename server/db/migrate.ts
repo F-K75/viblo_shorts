@@ -23,6 +23,8 @@ export interface MigrationFile {
   name: string;
   sql: string;
   checksum: string;
+  /** Declared with a `-- forge:backward-compatible` line: the previous release can run against this schema. */
+  backwardCompatible: boolean;
 }
 
 export interface MigrateOptions {
@@ -42,6 +44,7 @@ const NON_TRANSACTIONAL = [
 ];
 
 const MIGRATION_NAME = /^\d{4}_[a-z0-9_]+\.sql$/;
+const BACKWARD_COMPATIBLE = /^--\s*forge:backward-compatible\s*$/m;
 
 /**
  * Reads the migration files. F6: every *.sql file must be named NNNN_lower_snake_case.sql and versions must be
@@ -54,7 +57,7 @@ export function loadMigrations(dir = MIGRATIONS_DIR): MigrationFile[] {
   if (bad.length) throw new Error(`${bad.join(', ')}: not a valid migration file name (expected NNNN_lower_snake_case.sql); nothing was applied`);
   const files = sqlFiles.sort().map((f) => {
     const sql = fs.readFileSync(path.join(dir, f), 'utf8');
-    return { version: Number(f.slice(0, 4)), name: f, sql, checksum: crypto.createHash('sha256').update(sql).digest('hex') };
+    return { version: Number(f.slice(0, 4)), name: f, sql, checksum: crypto.createHash('sha256').update(sql).digest('hex'), backwardCompatible: BACKWARD_COMPATIBLE.test(sql) };
   });
   for (let i = 1; i < files.length; i++) {
     if (files[i].version === files[i - 1].version) {
@@ -69,7 +72,7 @@ const envMs = (name: string, def: number) => {
   return Number.isFinite(n) && n > 0 ? n : def;
 };
 
-export async function migrate(db: Db, dir = MIGRATIONS_DIR, opts: MigrateOptions = {}): Promise<{ applied: string[]; current: number }> {
+export async function migrate(db: Db, dir = MIGRATIONS_DIR, opts: MigrateOptions = {}): Promise<{ applied: string[]; current: number; newerCompatible: string[] }> {
   const files = loadMigrations(dir);
   for (const f of files) {
     const bad = NON_TRANSACTIONAL.find((re) => re.test(f.sql));
@@ -90,12 +93,39 @@ export async function migrate(db: Db, dir = MIGRATIONS_DIR, opts: MigrateOptions
       await tx.query(q(`SET LOCAL lock_timeout = ${lockTimeoutMs}`));
       await tx.query(q(`CREATE TABLE IF NOT EXISTS schema_migrations (
         version integer PRIMARY KEY, name text NOT NULL, checksum text NOT NULL, applied_at timestamptz NOT NULL DEFAULT now())`));
-      const { rows } = await tx.query<{ version: number; name: string; checksum: string }>(q('SELECT version, name, checksum FROM schema_migrations ORDER BY version'));
+      // F5: whether the PREVIOUS release may run against a migration, recorded by the build that applied it
+      await tx.query(q('ALTER TABLE schema_migrations ADD COLUMN IF NOT EXISTS backward_compatible boolean NOT NULL DEFAULT false'));
+      const { rows } = await tx.query<{ version: number; name: string; checksum: string; backward_compatible: boolean }>(
+        q('SELECT version, name, checksum, backward_compatible FROM schema_migrations ORDER BY version'),
+      );
       const done = new Map(rows.map((r) => [r.version, r]));
+      const newestKnown = files.length ? files[files.length - 1].version : 0;
+      const newerCompatible: string[] = [];
       for (const r of rows) {
         const f = files.find((x) => x.version === r.version);
-        if (!f) throw new Error(`database has migration ${r.name} that is not in this build (newer schema?); refusing to run`);
-        if (f.checksum !== r.checksum) throw new Error(`migration ${r.name} was modified after it was applied; add a new migration instead`);
+        if (f) {
+          if (f.checksum !== r.checksum) throw new Error(`migration ${r.name} was modified after it was applied; add a new migration instead`);
+          continue;
+        }
+        // F5: an applied migration this build does not have. Safe only when it is NEWER than everything this build
+        // knows (we are the previous image: rolling deploy or rollback) AND its release declared it
+        // backward-compatible (expand-only). Anything else is a diverged or incompatible schema.
+        if (r.version < newestKnown) {
+          throw new Error(`database has migration ${r.name} that is not in this build and is older than this build's newest migration (diverged history); refusing to run`);
+        }
+        if (!r.backward_compatible) {
+          throw new Error(`database has newer migration ${r.name} that is not in this build and was not declared backward-compatible; refusing to run (deploy the newer release, or restore)`);
+        }
+        newerCompatible.push(r.name);
+      }
+      if (newerCompatible.length) {
+        // The schema is ahead of this build: apply nothing (our own pending files would run out of order).
+        const pending = files.filter((f) => !done.has(f.version));
+        if (pending.length) {
+          throw new Error(`database is at a newer schema (${newerCompatible.join(', ')}) but lacks ${pending.map((f) => f.name).join(', ')} from this build; refusing to run`);
+        }
+        console.warn(JSON.stringify({ level: 'warn', event: 'schema_newer_than_build', newerCompatible }));
+        return { applied: [], current: newestKnown, newerCompatible };
       }
       const applied: string[] = [];
       for (const f of files) {
@@ -106,10 +136,10 @@ export async function migrate(db: Db, dir = MIGRATIONS_DIR, opts: MigrateOptions
           const why = err?.code === '57014' ? 'statement timeout' : err?.code === '55P03' ? 'lock timeout (a table is busy)' : err?.message || String(err);
           throw new Error(`migration ${f.name} failed (${why}); nothing was applied — the schema is unchanged and a fixed re-run will recover`);
         }
-        await tx.query(q('INSERT INTO schema_migrations (version, name, checksum) VALUES ($1, $2, $3)', [f.version, f.name, f.checksum]));
+        await tx.query(q('INSERT INTO schema_migrations (version, name, checksum, backward_compatible) VALUES ($1, $2, $3, $4)', [f.version, f.name, f.checksum, f.backwardCompatible]));
         applied.push(f.name);
       }
-      return { applied, current: files.length ? files[files.length - 1].version : 0 };
+      return { applied, current: newestKnown, newerCompatible: [] };
     },
     { attempts: 1 }, // never auto-retry DDL; a deadlock here is reported and the operator re-runs
   );
