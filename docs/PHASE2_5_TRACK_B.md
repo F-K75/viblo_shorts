@@ -96,8 +96,38 @@ Results (local, PostgreSQL 16, real ffmpeg): see §6, filled from the gate run.
 
 No test was weakened: every changed assertion encodes the new, stricter rule.
 
-## 6. Gate results
-_Filled in below after the runs complete._
+## 6. Gate results (local: PostgreSQL 16, real ffmpeg)
+**Code under test: `5ea2030`.** The docs-only commit `ba1f91f` (parent `5ea2030`) changes 3 files under `docs/` and
+nothing else. The SHA-256 of `git ls-tree -r` excluding `docs/` is identical for both commits
+(`b633b3e6…97d`), so runs labelled `ba1f91f` exercised exactly the code at `5ea2030`.
+
+New tests, three consecutive runs per backend (`render_queue` + `repo_contract`), one uninterrupted sequence, no retries:
+
+| Run | Backend | Label | Tests | Pass | Fail | Skipped | Duration |
+|---|---|---|---|---|---|---|---|
+| 1 | JSON | `5ea2030` | 43 | 43 | 0 | 0 | 65.2 s |
+| 2 | JSON | `ba1f91f` | 43 | 43 | 0 | 0 | 64.4 s |
+| 3 | JSON | `ba1f91f` | 43 | 43 | 0 | 0 | 64.3 s |
+| 1 | PostgreSQL | `ba1f91f` | 43 | 43 | 0 | 0 | 68.0 s |
+| 2 | PostgreSQL | `ba1f91f` | 43 | 43 | 0 | 0 | 67.9 s |
+| 3 | PostgreSQL | `ba1f91f` | 43 | 43 | 0 | 0 | 67.9 s |
+
+Full suites (regression safety), same sequence:
+
+| Backend | Tests | Pass | Fail | Cancelled | Skipped | Duration |
+|---|---|---|---|---|---|---|
+| JSON | 216 | 214 | 0 | 0 | 2 | 121.6 s |
+| PostgreSQL | 216 | 207 | 0 | 0 | 9 | 130.1 s |
+
+Skips: 2 live Gemini tests on both backends (`GEMINI_API_KEY` not set, logged "NOT passed"; R-01, Track E), plus 7
+JSON-backend-specific tests on the PostgreSQL run (file corruption / volume snapshots). There were no other skips.
+
+Earlier failures, recorded and not hidden:
+* **B9 sync-route test (first gate attempt, `86f27f1`):** expected 202 after a 1 s wait, but a 6 s render can finish
+  within it. Reproduced 2 of 3 in isolation. Fixed in the **test** (a blocker job holds the only slot), commit
+  `5ea2030`, 5 of 5 after the fix. The sequence above started after this fix.
+* **EPIPE in the Track C exit-criterion test** (one pre-fix full run): the known Track D test-helper item, not
+  Track B. It did not recur in the full suites above.
 
 ## 7. Residual risks (Track B, recorded, not solved)
 1. **JSON backend: under-count window after a crash.** A crash between the completion and the charge is charged at
