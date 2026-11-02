@@ -191,18 +191,106 @@ Observation, not a gate:
 Side effect of the B7 crash test: the SIGKILLed instance leaves its stub `sleep 300` orphaned, exactly as a real hard
 crash orphans ffmpeg (residual risk 2). The orphan exits on its own after 5 minutes.
 
-## 7. Residual risks (Track B, recorded, not solved)
-1. **JSON backend: under-count window after a crash.** A crash between the completion and the charge is charged at
-   the next start, not immediately. The single-instance JSON mode cannot do better without a transaction. PostgreSQL
-   (the production target) has no such window.
-2. **Orphaned ffmpeg after a hard crash (SIGKILL/OOM of Node only).** The child encoder keeps running until it ends
-   (≤ 60 s video at `ultrafast`); its timeout timer died with the process. In a container a crash of PID 1 kills the
-   whole container, so this mainly affects bare-metal/dev runs. Its file is swept by `RENDER_TTL_HOURS`.
-3. **Charge basis is the requested duration** (normalised, ≤ 60 s), not the measured output duration (unchanged).
-4. **A graceful shutdown longer than the 10 s hard-exit timer** falls back to the reaper, which counts an attempt.
-5. **Sync route behind a proxy:** if `RENDER_SYNC_WAIT_S` is set above the load balancer idle timeout, the proxy
-   cuts the connection and the job is cancelled as abandoned. The default is 50 s; the setting is documented.
-6. **Scale of the fair-claim query** (`max(claimed_at)` per candidate user) is only proven up to the tested load
-   (300 admissions, 200-job queue cap). Not load-tested at production queue sizes.
-7. **No per-plan scheduling classes** (by design: no paid priority until billing exists).
-8. **Not covered by Track B:** Docker-level tests (Track D), live Gemini (R-01, Track E), browser export (unverified).
+## 7. Risk register (Track B; owner assessment of 2026-11-02 recorded)
+| # | Risk | Status after review verification | Owner assessment |
+|---|---|---|---|
+| 1 | **JSON backend: a crash between completion and charge is charged at the next start, not immediately** | Durability and idempotency now evidenced (§8.2): the charge intent (`billedSeconds`) is written with the completion (temp file + `fsync` + rename + directory `fsync`); reconciliation is idempotent across repeated restarts, survives its own crash, and survives a monthly reset. Remaining: usage is under-counted **until the restart**; JSON is single-instance and not the production target. | Needed explicit evidence (provided) |
+| 2 | **Orphaned ffmpeg after a hard kill of Node only** | Conditions and mitigation documented (§8.5). In the shipped container Node is not PID 1 (`tini` is); Node's death ends the container and every process in it. **Not tested at Docker level** (Track D). Bare-metal/dev: orphan runs until its render ends (bounded by the 60 s maximum video length). | Operational risk; documented |
+| 3 | **Charge basis is the requested duration** (normalised to 2–60 s), not the measured output | Made explicit in the API contract (`docs/API_INVENTORY.md`, "Server rendering contract") | Accepted |
+| 4 | A graceful shutdown longer than the 10 s hard-exit timer falls back to the reaper, which counts an attempt | unchanged | (not raised) |
+| 5 | Sync route: `RENDER_SYNC_WAIT_S` above the load balancer idle timeout makes the proxy's cut look like an abandoned client → job cancelled | Contract documented; default 50 s | (not raised) |
+| 6 | Fair-claim query scale (`max(claimed_at)` per candidate user) proven only to the tested load (300 admissions, 200-job cap) | unchanged | Accepted as a known scalability limitation |
+| 7 | **`MAX_CONCURRENT_RENDERS` is per instance**: aggregate = instances × limit (3 × 2 = 6) | Documented in `.env.example`, API contract and §8.4 | Accepted with explicit awareness |
+| 8 | No per-plan scheduling classes | by design (no paid priority until billing exists) | — |
+| 9 | Live Gemini still skipped | **R-01 release blocker** (Track E) | Release blocker |
+| 10 | Docker-level coverage of Track C (and the container claim in #2) | Track D | Track D follow-up |
+| 11 | Browser export unverified | Track E | — |
+
+## 8. Owner review verification (2026-11-02)
+The owner approved the five decisions in §3.1, subject to the verification below. **This is not merge approval.**
+
+### 8.1 Migration `0003`
+| Check | Evidence |
+|---|---|
+| next unused version | `main` @ `53fc724` has only `0001_initial.sql`, `0002_ai_reservations.sql` |
+| registry order | `loadMigrations`: `1:0001_initial`, `2:0002_ai_reservations`, `3:0003_render_queue` (only 0003 marked backward-compatible; the expand-only validator accepts it) |
+| upgrade path (real PostgreSQL) | a database migrated as `main` (`current: 2`) → branch applies **only** `0003_render_queue.sql` (`current: 3`); re-run applies nothing |
+| rollback compatibility | the previous release (migrations 1–2) against the v3 schema: `applied: []`, logs `schema_newer_than_build` with `newerCompatible: ["0003_render_queue.sql"]`, and runs |
+| production container (CI run 30, `docker` job) | `{"event":"schema_migrated","applied":["0001_initial.sql","0002_ai_reservations.sql","0003_render_queue.sql"],"version":3}` |
+
+### 8.2 Billing correctness (condition A)
+| Requirement | Evidence (test) |
+|---|---|
+| PostgreSQL completion + charge atomic | B5 "PostgreSQL: if the charge cannot be written, the job is NOT marked completed" (charge failure injected by trigger); **P1** (new): the instance is SIGKILLed while blocked *inside* the completion+charge transaction, after the job row was already updated; the transaction rolls back as a unit (job not `completed`, no subscription row), the other instance's reaper requeues it, it is rendered again and charged **exactly once** (`attempts = 2`, 0.1 min for 6 s). On the pre-Track-B code this test cannot pass: the completion was committed before the charge. |
+| No double charge on duplicate completion / retry / recovery | contract (both backends, new): a stale worker that finishes after its job was reassigned is refused; a retried completion is refused; a completed job cannot be retried; PostgreSQL (new): 10 concurrent completions of one job commit exactly one charge; J4: repeated restarts never re-charge |
+| Failed and cancelled never charged | contract "failed jobs are never charged"; J6: failed, cancelled (render finishing after the cancel) and expired, across restarts; B5 (cancel), B6 (timeout, expiry), B9 (client disconnect) at HTTP level |
+| Crash recovery cannot lose a successful charge | P1 (PostgreSQL); JSON: B5 crash between completion and charge → charged once on restart; **J1** crash while writing the completion → not completed, not charged, requeued, then charged once; **J3** crash while the restart reconciles → next restart charges once; **J5** a monthly reset after the charge is not undone or repeated by reconciliation |
+| JSON durability | every write is `writeJsonFileAtomic`: temp file, `fsync`, `rename`, directory `fsync` (`server/lib/storage.ts`) |
+
+### 8.3 Queue and API contract (conditions B, C)
+* **Fairness, multiple users and repeated scheduling:**
+  * 3 users × 3 jobs → `a1 b1 c1 a2 b2 c2 a3 b3 c3` (three full rounds, both backends);
+  * a late joiner is served second, not last (B4, HTTP);
+  * per-user running cap under 20 concurrent claimers (PostgreSQL).
+* **Synchronous endpoint:** the contract is written in `docs/API_INVENTORY.md` ("Server rendering contract"):
+  * `RENDER_SYNC_WAIT_S` (50 s) is how long the **request waits**, not an execution timeout;
+  * `202` + `jobId` + `pollUrl` when the wait ends, and the job continues;
+  * a client disconnect before any response cancels the job, uncharged;
+  * after a 202 the client may disconnect freely;
+  * the job's status is read with `GET /api/jobs/:id`;
+  * tested by B9 (202 and continue; disconnect cancels and stops the encoder).
+* **No bypass:**
+  * S1 (new) asserts that `renderVideoWithFfmpeg` has exactly one caller, `executeRenderJob` (the queue worker);
+  * ffmpeg is spawned only there and by the `-version` readiness probe;
+  * no other server module spawns ffmpeg;
+  * the HTTP render routes all enqueue.
+
+### 8.4 Concurrency (condition B)
+`MAX_CONCURRENT_RENDERS` limits renders **per instance**. Deployment-wide concurrency is instances ×
+`MAX_CONCURRENT_RENDERS` (3 × 2 = 6). The global **queue** cap (`RENDER_QUEUE_MAX`) and the per-user caps are
+deployment-wide (enforced in PostgreSQL). Documented in `.env.example` and the API contract.
+
+### 8.5 Orphaned ffmpeg (operational)
+**When it happens:** only when the Node process dies *without running its shutdown code* (SIGKILL, kernel OOM kill
+of Node, a native crash) while an encoder runs. A normal stop (SIGTERM/SIGINT) kills encoders and hands their jobs
+back to the queue. The orphan keeps encoding until its render ends (≤ 60 s of video). Its timeout timer died with Node.
+Its output is never registered and is removed by the `RENDER_TTL_HOURS` sweep. The job itself is recovered by another
+instance (B7, P1), so the only cost is wasted CPU and memory for the orphan's lifetime.
+
+**Mitigation as shipped:**
+* the image runs `tini` as PID 1 with Node as its child;
+* when Node dies, `tini` exits, the container stops, and the kernel kills every remaining process in the container's
+  PID namespace, including orphaned encoders;
+* this is the documented semantics of a PID namespace whose init exits. **It has not been tested at Docker level**
+  (recorded for Track D).
+
+**Mitigation outside containers:** run under a supervisor that kills the whole process group or cgroup on exit
+(e.g. systemd `KillMode=control-group`, the default). Do not run Node bare with a restart loop that leaves the
+group alive.
+
+### 8.6 Requested-duration billing
+Explicit in the API contract: the charge is the requested (normalised) video duration, not the measured output.
+The UI shows minutes used / limit from `/api/user/subscription`.
+
+### 8.7 CI on documentation commit `7946e8b` (run 30)
+`head_sha` = `7946e8b` = the branch head at that time. That commit changed only `docs/`, so the code tested was `8ac7235`.
+Every job's log was read:
+
+| Job / step | Result |
+|---|---|
+| `test`: typecheck | pass |
+| `test`: JSON suite | 216 tests, 214 pass, 0 fail, 0 cancelled, 2 skipped (live Gemini) |
+| `test`: every server on PostgreSQL | 216 tests, 207 pass, 0 fail, 0 cancelled, 9 skipped (2 live Gemini + 7 JSON-only) |
+| `test`: build | pass |
+| `test`: E2E | JSON 1/1, PostgreSQL 1/1 |
+| `test`: `bun audit` | "No vulnerabilities found" |
+| `docker` | both images built; 2-instance PostgreSQL smoke (migrations 1–3 applied, readiness incl. `memory`); JSON smoke + backup CLI; unsafe production config refused (exit 1 ×2); backup tools present |
+| `live-llm` | skipped on PRs (R-01) |
+
+The run 28 failure and its test-only correction remain recorded in §6.1. Results for the final head (after the
+verification commits) are in §8.8.
+
+### 8.8 Final head
+Results for this commit (the local gate: 3 consecutive runs of the new tests per backend plus both full suites, and
+its CI run) are recorded in the PR #5 description, not in a later commit. That way the CI run reported is the run of
+the exact final head.
