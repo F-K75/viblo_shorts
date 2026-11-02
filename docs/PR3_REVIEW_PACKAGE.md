@@ -4,9 +4,9 @@
 > authorization, F1, F2, F3, F5 and F6 are fixed in this PR (§11). Each fix has a regression test that was run red
 > against the unfixed code and green afterwards. F4 and F7–F11 are tracked, not fixed here (§9).
 
-**PR:** [F-K75/viblo_shorts#3](https://github.com/F-K75/viblo_shorts/pull/3) · **Base:** Phase 1 branch
-`claude/keen-feynman-xtbvz2` @ `194f5c5` (PR #2, not yet merged) · **CI:** see §7 for the run on the final head ·
-**Status:** awaiting your review and explicit merge authorization.
+**PR:** [F-K75/viblo_shorts#3](https://github.com/F-K75/viblo_shorts/pull/3) · **Base:** `main` @ `5f19c99` (PR #2 merged
+with a merge commit; PR #3 retargeted 2026-11-02) · **Code head:** `94e80d5` · **CI:** runs 21 and 22 green on
+`94e80d5` (§13) · **Status:** awaiting your final merge authorization.
 **Not merged, not deployed. No infrastructure created.**
 
 **Merge prerequisite:** PR #2 (Phase 1) merges first. Then this PR is retargeted to `main`; its diff stays the same
@@ -444,3 +444,82 @@ Earlier runs on this round's commits were also fully green: `7a3add5` ([run 4144
 | R-10: no AWS infrastructure, CD, staging, monitoring, alerting; PITR / Multi-AZ untested | P1 | Phase 4 (cost and architecture approval first) |
 | FS-037: rendered files local to one instance | P2 | Phase 4 (S3) |
 | npm-resolved tree reports the ignored grpc-js advisory | Info | Remove the unused Firestore dependency path, or keep the documented ignore |
+
+## 13. Integration with `main` after PR #2 merged (2026-11-02)
+
+### 13.1 Merge integrity
+| Item | Value | Verified |
+|---|---|---|
+| PR #2 merge | `5f19c99`, a **merge commit** (parents `98cdc30` = previous `main`, `5cb211b` = PR #2's approved head) | `main`'s tree is byte-identical to `5cb211b` (`7c4f339…`) |
+| CI on `main` after the merge | run 20 on `5f19c99`: success | — |
+| PR #3 integration merge | `118b309` (parents `507ddf1` = PR #3's approved head, `5f19c99` = `main`) | fast-forward push; no history rewritten |
+| J1 invariant test | `94e80d5` | — |
+| PR #3 now | base `main` @ `5f19c99`, head `94e80d5`, mergeable (clean), **51 files, +6,834 / −428, 33 commits** | GitHub's counts equal the local `git diff main...HEAD` |
+
+### 13.2 What changed relative to the approved PR #3 head (`507ddf1`)
+* **45 of the 50 previously reviewed files are byte-identical**. This includes every F1–F6 file:
+  * code: `offsiteBackup.ts`, `migrate.ts`, `db-backup.ts`, `pgRepo.ts`, `pool.ts`;
+  * migrations 0001/0002;
+  * tests: `backup_restore.test.ts`, `migrations.test.ts`;
+  * docs: this package, `PR3_CODE_REVIEW.md`, ADRs, `BACKUP_AND_RECOVERY.md`, `RELEASE_REAUDIT.md`;
+  * the CI workflow.
+* `docs/DATABASE_ARCHITECTURE.md`, `docs/RELEASE_ASSESSMENT.md` and `tests/storage_backup.test.ts` differ from
+  `507ddf1` by **exactly** PR #2's J1 change lines (identical hashes of the added and removed lines).
+* `README.md`: the PostgreSQL backup section is combined with J1's JSON snapshot/restore/`recover` instructions.
+* `server.ts`: only the J1 guard placement:
+  * the import of `restoreInProgressReason`;
+  * the guard as the **first statements of `initStorage()`'s JSON branch**: write the lock, then refuse if a
+    restore journal exists, all before `JsonRepo` is constructed or opened;
+  * the removal of the late `writeServerLock` after `app.listen()`. Before, the lock was written after the JSON
+    store had already been opened.
+* `tests/restore_atomic.test.ts` (from `main`, extended here):
+  * the J1 server tests pin `STORAGE_BACKEND=json`, so CI's PostgreSQL run cannot silently test the wrong backend;
+  * a new **invariant test**: with a restore journal present, the server refuses to start **and the data
+    directory is byte-for-byte unchanged**. It uses a legacy `projects.json` that opening the store would migrate
+    immediately.
+
+  **Shown non-vacuous:** with the guard moved after `JsonRepo.init()` (the cosmetic-merge mistake), the server
+  still refused, but the test failed. The legacy file had already been migrated into shards, and a migration
+  marker and a pre-migration snapshot had been created.
+
+### 13.3 Validation on `94e80d5`
+**Local:**
+* typecheck ✅;
+* JSON-backend suite 172/170/0/2;
+* PostgreSQL-backend suite 172/163/0/9;
+* build ✅;
+* E2E 1/1 on both backends;
+* J1 tests 13/13 under both `TEST_STORAGE_BACKEND` settings.
+
+(A first local run failed only with `ECONNREFUSED 127.0.0.1:55432`: the local test database had stopped when the
+container was recycled. It passed after a restart with no change to the code.)
+
+**CI, both runs on exactly `94e80d5`, every job's log inspected:**
+
+| Job | Run 21 ([41483834106](https://github.com/F-K75/viblo_shorts/actions/runs/41483834106)) | Run 22 ([41483836795](https://github.com/F-K75/viblo_shorts/actions/runs/41483836795)) |
+|---|---|---|
+| `test`: typecheck | ✅ | ✅ |
+| `test`: JSON-backend suite | `# tests 172 # pass 170 # fail 0 # skipped 2` | same |
+| `test`: PostgreSQL-backend suite | `# tests 172 # pass 163 # fail 0 # skipped 9` | same |
+| `test`: J1 groups in **both** suites | `ok 62`–`ok 65`, including `J1 invariant: the restore guard runs before JSON storage initialization opens anything` | same |
+| `test`: build, E2E (JSON, PG), audit | `✓ built`; `# pass 1` ×2; `No vulnerabilities found` | same |
+| `docker` | ✅ all steps (below) | ✅ all steps |
+| `live-llm` | **skipped** (no `GEMINI_API_KEY`) | **skipped** |
+
+**`docker` job, both runs:**
+* app and backup images built;
+* two app instances on one PostgreSQL 16: `{"ready":true,…}` ×4, `schema_migrated ["0001_initial.sql","0002_ai_reservations.sql"]`,
+  and a project saved on instance 1 was listed by instance 2;
+* JSON single-instance container ready, with a guest session and a backup CLI snapshot;
+* unsafe production configuration exits 1 (`no TRUST_PROXY -> 1 ; no DATABASE_URL/STORAGE_BACKEND -> 1`);
+* backup image: `pg_dump/pg_restore/psql 17.11`, `age 1.1.1`, `node v22.23.4`, and it refuses to back up without
+  keys.
+
+### 13.4 Coverage gaps stated plainly
+* **The Docker job does not exercise the J1 restore guard.** Its JSON smoke test only takes a snapshot. The guard is
+  exercised in CI by the `test` job (`restore_atomic.test.ts`, twice per run, pinned to the JSON backend), with the
+  server run from source rather than from the built image. A Docker step closing this gap is a small CI change:
+  write a journal into a volume, the container exits 1 with the refusal, the volume is unchanged, `recover`, then
+  the container starts. It was proposed and is **not** added (no code changes were authorized without a CI defect).
+* **Live Gemini** remains skipped in every run (`LIVE … # SKIP … (NOT passed)`, `live-llm` skipped). It remains
+  release blocker **R-01**.

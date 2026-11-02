@@ -1,5 +1,30 @@
 # Forge Studio — Independent Re-audit + Corrective Round
 
+## Integration (2026-11-02): PR #2 merged; PR #3 retargeted to `main`; awaiting final PR #3 decision
+* **PR #2:**
+  * J1 fixed red-first (the JSON restore is all-or-nothing, and the server and a restore can never overlap);
+  * merged with your approval as merge commit **`5f19c99`**;
+  * `main` is byte-identical to the approved `5cb211b`, and CI on `main` passed.
+* **PR #3:**
+  * integrated with merge commit `118b309`;
+  * the J1 guard was moved to the start of `initStorage()`'s JSON branch, before any JSON data is opened;
+  * an invariant test was added in `94e80d5` and shown non-vacuous;
+  * F1–F6 files are byte-identical to the approved head;
+  * CI runs 21 and 22 on `94e80d5` are green in every job.
+
+  Details: PR3_REVIEW_PACKAGE §13.
+* **Open findings and blockers, unchanged:**
+  * **R-01**: live Gemini → MP4 not demonstrated; `live-llm` skipped in every run;
+  * **R-03 / R-04 / R-13**: Phase 2.5;
+  * **J2**: the cross-file consistency of a CLI snapshot taken while the server runs is open;
+  * **F4**: backup authenticity;
+  * **F7**: render billing;
+  * **R-05/06/07/08/09/18**: product and legal issues;
+  * **R-10**: no AWS environment, CD, monitoring or PITR test.
+* **CI coverage gap:** the Docker job does not exercise the J1 guard on the built image (the `test` job does, from
+  source).
+* **Score: 58/100 (provisional). NOT READY FOR RELEASE.**
+
 ## Corrective round 2 (2026-11-02): F1, F2, F3, F5, F6 fixed in PR #3; CI green; awaiting your review
 * **Fixed, red-first, with follow-ups from your evidence review:**
   * F1: snapshot-consistent manifest, plus a proof that the counts and `pg_dump` read the same exported snapshot;
