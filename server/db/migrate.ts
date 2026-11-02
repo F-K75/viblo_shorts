@@ -41,15 +41,27 @@ const NON_TRANSACTIONAL = [
   /^\s*(BEGIN|COMMIT|ROLLBACK)\s*;/im,
 ];
 
+const MIGRATION_NAME = /^\d{4}_[a-z0-9_]+\.sql$/;
+
+/**
+ * Reads the migration files. F6: every *.sql file must be named NNNN_lower_snake_case.sql and versions must be
+ * unique; anything else is an error before anything runs. A misnamed file is never skipped silently (it would be a
+ * schema change that never ships). Non-SQL files (README.md, ...) are ignored.
+ */
 export function loadMigrations(dir = MIGRATIONS_DIR): MigrationFile[] {
-  return fs
-    .readdirSync(dir)
-    .filter((f) => /^\d{4}_[a-z0-9_]+\.sql$/.test(f))
-    .sort()
-    .map((f) => {
-      const sql = fs.readFileSync(path.join(dir, f), 'utf8');
-      return { version: Number(f.slice(0, 4)), name: f, sql, checksum: crypto.createHash('sha256').update(sql).digest('hex') };
-    });
+  const sqlFiles = fs.readdirSync(dir).filter((f) => f.toLowerCase().endsWith('.sql'));
+  const bad = sqlFiles.filter((f) => !MIGRATION_NAME.test(f));
+  if (bad.length) throw new Error(`${bad.join(', ')}: not a valid migration file name (expected NNNN_lower_snake_case.sql); nothing was applied`);
+  const files = sqlFiles.sort().map((f) => {
+    const sql = fs.readFileSync(path.join(dir, f), 'utf8');
+    return { version: Number(f.slice(0, 4)), name: f, sql, checksum: crypto.createHash('sha256').update(sql).digest('hex') };
+  });
+  for (let i = 1; i < files.length; i++) {
+    if (files[i].version === files[i - 1].version) {
+      throw new Error(`duplicate migration version ${String(files[i].version).padStart(4, '0')} (${files[i - 1].name}, ${files[i].name}); nothing was applied`);
+    }
+  }
+  return files;
 }
 
 const envMs = (name: string, def: number) => {
