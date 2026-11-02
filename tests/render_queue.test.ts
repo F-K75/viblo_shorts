@@ -293,17 +293,23 @@ describe('B9: the synchronous render route goes through the queue', () => {
   test('after RENDER_SYNC_WAIT_S it answers 202 + job id and the job still completes (charged once)', async () => {
     const s = await boot({ MAX_CONCURRENT_RENDERS: '1', RENDER_SYNC_WAIT_S: '1' });
     const u = s.signFirebaseToken({ sub: 'b9-sync' });
+    // deterministic: another user's long job holds the only slot, so the sync job is still queued at the deadline
+    const other = s.signFirebaseToken({ sub: 'b9-other' });
+    const blocker = (await (await post(s, '/api/jobs/create', other, job(60, 'blocker'))).json()).job.id;
+    await waitFor(async () => (await get(s, `/api/jobs/${blocker}`, other)).job.status === 'processing');
     const r = await post(s, '/api/render/video', u, job(6, 'sync').payload);
-    assert.equal(r.status, 202);
+    assert.equal(r.status, 202, await r.clone().text());
     const { jobId } = await r.json();
     assert.match(jobId, /^job_/);
+    assert.equal((await get(s, `/api/jobs/${jobId}`, u)).job.status, 'queued', 'answering 202 did not cancel the job');
+    assert.equal((await post(s, `/api/jobs/${blocker}/cancel`, other)).status, 200);
     const done = await waitFor(async () => {
       const x = (await get(s, `/api/jobs/${jobId}`, u)).job;
       return x.status === 'queued' || x.status === 'processing' ? null : x;
     });
     assert.equal(done.status, 'completed', JSON.stringify(done));
     await new Promise((res) => setTimeout(res, 300));
-    assert.equal(await minutesUsed(s, u), 0.1);
+    assert.equal(Math.round((await minutesUsed(s, u)) * 100) / 100, 0.1);
   });
 
   test('a client that disconnects while waiting cancels its job; it is not charged', async () => {
