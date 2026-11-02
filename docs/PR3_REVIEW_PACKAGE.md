@@ -161,16 +161,18 @@ request ──reserve(id)──▶ ai_reservations[id]=reserved ; counters +1 (u
 ## 7. Test results and CI evidence
 | Layer | Local, final code (2026-11-02) | CI on the final head |
 |---|---|---|
-| Typecheck (`npm run lint`) / production build | ✅ / ✅ | see below |
-| JSON backend suite (PG tests required) | **141 tests: 139 pass, 0 fail, 2 skipped** (live Gemini, no key) | see below |
-| PostgreSQL suite (every server on PG) | **141: 132 pass, 0 fail, 9 skipped** (2 live Gemini + 7 JSON-file-specific, with reasons) | see below |
-| Backup/restore + migration rules (19 tests) | 3 consecutive runs: 19/19 each | see below |
-| Failure injection (pg_dump / pg_restore dying, corrupt chunk, wrong key, connection killed during backup and restore, orchestrator SIGKILL) | ✅ | see below |
-| Multi-instance concurrency (R-02 storms, two-instance gates) | ✅ (inside both suite runs) | see below |
-| Browser E2E (JSON, PostgreSQL) | 1/1, 1/1 | see below |
-| Docker (two instances on one DB, unsafe configs refused, backup image tools) | n/a (no Docker daemon in this container) | see below |
+| Typecheck (`npm run lint`) / production build | ✅ / ✅ | ✅ |
+| JSON backend suite (PG tests required) | **159 tests: 157 pass, 0 fail, 2 skipped** (live Gemini, no key) | 159/157/0/2 |
+| PostgreSQL suite (every server on PG) | **159: 150 pass, 0 fail, 9 skipped** (2 live Gemini + 7 JSON-file-specific, with reasons) | 159/150/0/9 |
+| Backup/restore + migration rules (37 tests) | 3 consecutive runs: 37/37 each (§12.7) | inside both suites ✅ |
+| Failure injection (pg_dump / pg_restore dying, corrupt chunk, wrong key, connection killed during backup and restore, orchestrator SIGKILL) | ✅ | ✅ |
+| Multi-instance concurrency (R-02 storms, two-instance gates) | ✅ (inside both suite runs) | ✅ |
+| Browser E2E (JSON, PostgreSQL) | 1/1, 1/1 | ✅ |
+| Docker (two instances on one DB, unsafe configs refused, backup image tools) | n/a (no Docker daemon in this container) | ✅ |
 
-CI result for the final head: recorded in §11.4 after the run (actual logs inspected, not just the status).
+CI on the final code commit `9f4d4d8`, run [41445535285](https://github.com/F-K75/viblo_shorts/actions/runs/41445535285): every
+job green; details from the actual logs are in §12.8. Local runs of the final code: JSON 159/157/0/2, PostgreSQL
+159/150/0/9.
 
 **Not exercised anywhere yet:** real Gemini, a real AWS RDS / S3 / KMS environment, production-sized restore times.
 
@@ -263,7 +265,7 @@ diverged migration history refused.
   Existing `0001`/`0002` are unchanged (their checksums must not change).
 
 ### 11.4 CI on the final head
-*(filled in after the run; see the RELEASE_REAUDIT entry)*
+See §12.8 (actual job logs inspected, not just the status).
 
 ## 12. Final evidence package (answers to the review questions of 2026-11-02)
 
@@ -362,3 +364,83 @@ compatibility (e.g. a backfill `UPDATE` that changes meaning); that remains a co
 | `-- forge:backwards-compatible`, `-- forge:backward_compatible`, `--forge:compat`, `-- FORGE:backward-compatible` | `<file>: unknown migration directive …` |
 | Marked file with a non-expand statement | `<file> is marked backward-compatible but contains a statement that is not expand-only: "…"` |
 | `README.md` and other non-SQL files | Ignored |
+
+### 12.7 Three consecutive runs of the new regression tests (final code)
+`tests/backup_restore.test.ts` + `tests/migrations.test.ts` (37 tests), run three times back to back:
+
+| Run | Result | Duration |
+|---|---|---|
+| 1 | 37 pass / 0 fail | 33.9 s |
+| 2 | 37 pass / 0 fail | 32.3 s |
+| 3 | 37 pass / 0 fail | 32.4 s |
+
+Each of the 37 tests passed in each of the three runs:
+* **F1:** write storm; snapshot proof.
+* **F2:**
+  * pg_restore dying;
+  * late decryption failure;
+  * orchestrator SIGKILL;
+  * transaction-control guard;
+  * COMMIT never reaching the server;
+  * COMMIT applied with the acknowledgement lost;
+  * operator check (empty / complete / mismatch).
+* **F3:** argv refused; process/output scan.
+* **Matrix:**
+  * interrupted backup;
+  * connection loss during backup and during restore;
+  * corrupt backup and wrong key;
+  * non-empty target;
+  * ownership round trip ×2.
+* **F5:** N−1 against N; a real server process on N; undeclared newer migration refused; diverged history refused.
+* **F6 and marker validation:**
+  * misnamed files; duplicate versions; shipped migrations pass the rules;
+  * expand-only accepted;
+  * 10 non-expand statement kinds rejected;
+  * the same statements unmarked are allowed;
+  * unknown or misspelt directives rejected.
+
+### 12.8 CI on the final code commit (`9f4d4d8`, [run 41445535285](https://github.com/F-K75/viblo_shorts/actions/runs/41445535285))
+**Job `test` ([log](https://github.com/F-K75/viblo_shorts/actions/runs/41445535285/job/125277566520)) succeeded:**
+* PostgreSQL 16.15 service; typecheck ✅.
+* JSON-backend suite: `# tests 159 # pass 157 # fail 0 # skipped 2`. The log lists `ok 23` … `ok 30` (F1, F2, F3,
+  failure matrix, transaction-control guard, F1 proof, COMMIT boundary, F3 scan) and `ok 37` … `ok 39` (F5, F6,
+  marker validation). The skips are `LIVE: … # SKIP GEMINI_API_KEY not set — live LLM tests skipped (NOT passed)`.
+* PostgreSQL-backend suite: `# tests 159 # pass 150 # fail 0 # skipped 9`.
+* Production build: `✓ built`.
+* Browser E2E: `# tests 1 # pass 1` on JSON and on PostgreSQL.
+* Dependency gate (`bun audit --audit-level=high --ignore GHSA-m9gg-hp2v-232j`): `No vulnerabilities found
+  (checked 389 packages, 2 below --audit-level=high, 1 ignored)`.
+
+  The Playwright install step also prints npm's own notice, `5 vulnerabilities (1 moderate, 4 high)`. Investigated:
+  npm resolves its own tree (the project locks with `bun.lock`). The 4 high findings are all the already-ignored
+  GHSA-m9gg-hp2v-232j (`@grpc/grpc-js` via `firebase` → Firestore, which the app never imports). npm's suggested
+  fix is a major downgrade to `firebase@9.14.0`. The moderate one appears only in that transient tooling install.
+  No new advisory, but it is listed in §9 so it is not forgotten.
+
+**Job `docker` ([log](https://github.com/F-K75/viblo_shorts/actions/runs/41445535285/job/125281081880)) succeeded:**
+* Both images built.
+* Two app instances on one PostgreSQL 16: both `/api/ready` → `{"ready":true,…}`. Migrations were applied once
+  (`schema_migrated … ["0001_initial.sql","0002_ai_reservations.sql"]`), and a project saved through instance 1
+  was served by instance 2.
+* `/api/health/details` without the token → 404, and `/api/health` → `{"status":"ok"}`.
+* JSON single-instance container plus its backup CLI: ok.
+* Unsafe production configuration exits 1 (`no TRUST_PROXY -> 1 ; no DATABASE_URL/STORAGE_BACKEND -> 1`).
+* Backup image: `pg_dump/pg_restore/psql 17.11`, `age 1.1.1`, `node v22.23.4`; `create` without keys is refused.
+* The `curl: (56)/(52)` lines are readiness polls before the server listened; the retry loop then succeeded.
+
+**Job `live-llm`:** skipped (no `GEMINI_API_KEY`). **This is not a pass.** Real Gemini remains release blocker R-01.
+
+Earlier runs on this round's commits were also fully green: `7a3add5` ([run 41442815875](https://github.com/F-K75/viblo_shorts/actions/runs/41442815875)).
+
+### 12.9 Remaining open items after this round
+| Item | Severity | Where it is handled |
+|---|---|---|
+| R-01: real Gemini → render → preview → playable MP4 export never demonstrated; browser export unverified | **P0, release blocker** | Separate live-AI validation (Phase 3, first item) |
+| R-03 / R-04 / R-13: guest onboarding DoS, render-queue abuse, memory pressure | P1/P2 | Phase 2.5 (design approved, not started) |
+| F4: backup authenticity | P2 | AWS design (Object Lock, write-only role, separate account, signed manifests) |
+| F7: render minutes billed outside the finish transaction | P3 | Phase 2.5 exactly-once render settlement |
+| F8–F11 | P3 | Follow-up hardening |
+| R-05/06/07/08/09/18: auth, Drive, guest-work, paid-plan, legal and account-deletion issues | P1 | Phase 3/4 |
+| R-10: no AWS infrastructure, CD, staging, monitoring, alerting; PITR / Multi-AZ untested | P1 | Phase 4 (cost and architecture approval first) |
+| FS-037: rendered files local to one instance | P2 | Phase 4 (S3) |
+| npm-resolved tree reports the ignored grpc-js advisory | Info | Remove the unused Firestore dependency path, or keep the documented ignore |

@@ -1,36 +1,31 @@
 # Forge Studio — Independent Re-audit + Corrective Round
 
-## Corrective round 2 (2026-11-02): F1, F2, F3, F5, F6 fixed in PR #3; awaiting your review
-* **Fixed, red-first:**
-  * F1: backup manifest taken from the dump's snapshot;
-  * F2: restore is all-or-nothing, plus two further restore defects found by the new failure tests (F2a
-    unhandled rejection, F2b back-pressure stall);
-  * F3: restore target never in argv;
-  * F5: previous release runs against a newer backward-compatible schema;
-  * F6: misnamed/duplicate migrations are errors.
-  Before/after evidence: PR3_REVIEW_PACKAGE §11.
-* **Backup/restore failure matrix now tested:**
-  * interrupted backup;
-  * corrupted backup (checksum mismatch, and a corrupt chunk with a rewritten checksum);
-  * wrong key;
-  * partial restore;
-  * connection loss during backup and during restore;
-  * non-empty target;
-  * repeated restore;
-  * orchestrator killed mid-restore;
-  * ownership and project-record preservation across two restores.
-* **Local gate:**
-  * typecheck ✅;
-  * JSON suite 141/139/0/2;
-  * PostgreSQL suite 141/132/0/9;
-  * backup/migration tests 3× 19/19;
-  * E2E 1/1 on both backends;
-  * build ✅.
-  * Docker runs in CI only (no daemon here).
-* **Still open:** F4 (backup authenticity, AWS design), F7 (render billing, Phase 2.5), F8–F11 (P3 hardening).
-* **Score: 55 → 58 (provisional).** The two P1 backup defects that made the 55 overstated are closed, and restore
-  is now verifiable under traffic. It stays far from release: R-01 (real Gemini → MP4) and R-03/R-04 remain
-  open, and nothing has run on real AWS.
+## Corrective round 2 (2026-11-02): F1, F2, F3, F5, F6 fixed in PR #3; CI green; awaiting your review
+* **Fixed, red-first, with follow-ups from your evidence review:**
+  * F1: snapshot-consistent manifest, plus a proof that the counts and `pg_dump` read the same exported snapshot;
+  * F2: all-or-nothing restore; also F2a and F2b, plus the exact state at the COMMIT boundary and the read-only
+    `verify-restore` operator check;
+  * F3: restore target never in argv; the scan of every process and of all CLI output is clean;
+  * F5: the previous release runs against a newer, validated backward-compatible schema;
+  * F6: misnamed or duplicate migrations and unknown directives are errors.
+
+  Evidence: PR3_REVIEW_PACKAGE §11–§12.
+* **Local gate:** typecheck ✅; JSON 159/157/0/2; PostgreSQL 159/150/0/9; new regression tests 3× 37/37; E2E 1/1 on
+  both backends; build ✅.
+* **CI on `9f4d4d8`** ([run 41445535285](https://github.com/F-K75/viblo_shorts/actions/runs/41445535285)), with logs
+  inspected:
+  * `test` green (same counts as local);
+  * `docker` green (two-instance smoke test, gated diagnostics, unsafe configs refused, backup image);
+  * `live-llm` skipped (no key, not a pass).
+* **Open release blockers:**
+  * **R-01**: real Gemini → render → preview → playable MP4 export, P0;
+  * **R-03/R-04/R-13**: Phase 2.5;
+  * **R-05/06/07/08/09/18**: Phase 3/4;
+  * **R-10**: no AWS environment, CD, monitoring or PITR test;
+  * **F4**: backup authenticity;
+  * **F7**: render billing.
+* **Score: 55 → 58 (provisional).** The data layer's backup and restore path is now verifiable and atomic. The
+  product is still **NOT READY FOR RELEASE**.
 
 ## PR #3 code review (2026-11-01)
 The diff review (docs/PR3_CODE_REVIEW.md) found 2 P1 defects in backup/restore, both reproduced:
