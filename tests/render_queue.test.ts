@@ -4,6 +4,7 @@ import { test, describe, after } from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { startTestServer, guestToken, healthDetails, type TestServer } from './helpers/server.ts';
 import { createTestDatabase, pgSkip } from './helpers/pg.ts';
@@ -26,6 +27,18 @@ async function boot(env: Record<string, string> = {}) {
   };
   cleanups.push(stop);
   return Object.assign(s, { stopNow: stop });
+}
+/**
+ * Env for a server whose encoder never finishes: a stub `ffmpeg` first on PATH answers `-version` (startup probe) and
+ * otherwise sleeps until killed. The server's real spawn/kill/timeout code runs unchanged; only the render cannot
+ * complete. Tests that need "this slot stays busy" or "this instance cannot be the one that finished the job" use it,
+ * because real short renders finish in a few seconds on a fast CI runner (CI run 28: two 60 s blockers finished
+ * mid-burst and freed 2 queue slots, so 27 were admitted against a cap of 25, correctly).
+ */
+function hangingFfmpeg(): Record<string, string> {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ffmpeg-stub-'));
+  fs.writeFileSync(path.join(dir, 'ffmpeg'), '#!/bin/sh\nif [ "$1" = "-version" ]; then echo "ffmpeg stub"; exit 0; fi\nexec sleep 300\n', { mode: 0o755 });
+  return { PATH: `${dir}:${process.env.PATH}` };
 }
 const post = (s: TestServer, p: string, token: string, body: unknown = {}) =>
   fetch(`${s.baseUrl}${p}`, { method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' }, body: JSON.stringify(body) });
@@ -74,7 +87,7 @@ describe('B2: guests cannot start server renders', () => {
 
 describe('B3: per-user and global admission limits (configurable)', () => {
   test('one user: at most 1 running + 3 queued; the 5th and 6th requests get 429 with a clear code', async () => {
-    const s = await boot({ MAX_CONCURRENT_RENDERS: '2' });
+    const s = await boot({ MAX_CONCURRENT_RENDERS: '2', ...hangingFfmpeg() });
     const u = s.signFirebaseToken({ sub: 'b3-user' });
     const statuses: number[] = [];
     const codes: string[] = [];
@@ -93,7 +106,7 @@ describe('B3: per-user and global admission limits (configurable)', () => {
   });
 
   test('limits are configurable (RENDER_MAX_QUEUED_PER_USER=1)', async () => {
-    const s = await boot({ RENDER_MAX_QUEUED_PER_USER: '1', MAX_CONCURRENT_RENDERS: '1' });
+    const s = await boot({ RENDER_MAX_QUEUED_PER_USER: '1', MAX_CONCURRENT_RENDERS: '1', ...hangingFfmpeg() });
     const u = s.signFirebaseToken({ sub: 'b3-cfg' });
     const st = [];
     for (let i = 0; i < 3; i++) st.push((await post(s, '/api/jobs/create', u, job(4))).status);
@@ -104,7 +117,8 @@ describe('B3: per-user and global admission limits (configurable)', () => {
     const db = await createTestDatabase({ migrate: false });
     cleanups.push(() => db.drop());
     // all requests come from one test IP: lift the per-IP rate limit so only the queue cap decides
-    const env = { DATABASE_URL: db.url, RENDER_QUEUE_MAX: '25', MAX_CONCURRENT_RENDERS: '1', IP_RATE_MULTIPLIER: '100' };
+    // the two blockers never finish, so nothing leaves the queue during the burst and the count must be exact
+    const env = { DATABASE_URL: db.url, RENDER_QUEUE_MAX: '25', MAX_CONCURRENT_RENDERS: '1', IP_RATE_MULTIPLIER: '100', ...hangingFfmpeg() };
     const A = await boot(env);
     const B = await boot(env);
     // occupy both workers with long renders so nothing leaves the queue during the burst
@@ -126,6 +140,8 @@ describe('B3: per-user and global admission limits (configurable)', () => {
     assert.ok(full.every((r) => r.code === 'queue_full' && Number(r.retryAfter) > 0));
     const queued = (await db.pool.query("SELECT count(*)::int AS n FROM jobs WHERE status = 'queued'")).rows[0].n;
     assert.equal(queued, 25, 'the database holds exactly the cap');
+    const processing = (await db.pool.query("SELECT user_id FROM jobs WHERE status = 'processing' ORDER BY user_id")).rows.map((r: any) => r.user_id);
+    assert.deepEqual(processing, ['b3-long-a', 'b3-long-b'], 'premise: only the blockers ran; no burst job left the queue');
   });
 });
 
@@ -210,7 +226,8 @@ describe('B5: exactly-once render-minute settlement', () => {
 
 describe('B6: timeouts', () => {
   test('a render exceeding its wall-clock limit is killed, failed as timed out, and not charged', async () => {
-    const s = await boot({ MAX_CONCURRENT_RENDERS: '1', RENDER_TIMEOUT_MAX_S: '1', RENDER_TIMEOUT_MIN_S: '1' });
+    // a hanging encoder (plan B6): only the wall-clock limit can end this render
+    const s = await boot({ MAX_CONCURRENT_RENDERS: '1', RENDER_TIMEOUT_MAX_S: '1', RENDER_TIMEOUT_MIN_S: '1', ...hangingFfmpeg() });
     const u = s.signFirebaseToken({ sub: 'b6-timeout' });
     const id = (await (await post(s, '/api/jobs/create', u, { type: 'render_video', payload: { title: 'slow', duration: 60, resolution: '1080p', beats: [{ text: 'slow', start_s: 0, end_s: 50 }] } })).json()).job.id;
     const j = await waitFor(async () => {
@@ -227,7 +244,7 @@ describe('B6: timeouts', () => {
   });
 
   test('a job waiting in the queue longer than RENDER_QUEUE_TTL_S expires and is not charged', async () => {
-    const s = await boot({ MAX_CONCURRENT_RENDERS: '1', RENDER_QUEUE_TTL_S: '2' });
+    const s = await boot({ MAX_CONCURRENT_RENDERS: '1', RENDER_QUEUE_TTL_S: '2', ...hangingFfmpeg() }); // the slot never frees
     const a = s.signFirebaseToken({ sub: 'b6-busy' });
     const b = s.signFirebaseToken({ sub: 'b6-waiting' });
     await post(s, '/api/jobs/create', a, job(60, 'occupies the only slot'));
@@ -249,7 +266,8 @@ describe('B7: crash recovery', () => {
       const db = await createTestDatabase({ migrate: false });
       cleanups.push(() => db.drop());
       const env = { DATABASE_URL: db.url, MAX_CONCURRENT_RENDERS: '1', JOB_STALE_MS: '2000' };
-      const A = await boot(env);
+      // A's encoder never finishes, so a completed job can only have been rendered by B (the recovery is real)
+      const A = await boot({ ...env, ...hangingFfmpeg() });
       const u = A.signFirebaseToken({ sub: `b7-${how.slice(0, 7).toLowerCase()}` });
       // B starts only after A has claimed the job
       const id = (await (await post(A, '/api/jobs/create', u, job(30, 'survives'))).json()).job.id;
@@ -313,7 +331,7 @@ describe('B9: the synchronous render route goes through the queue', () => {
   });
 
   test('a client that disconnects while waiting cancels its job; it is not charged', async () => {
-    const s = await boot({ MAX_CONCURRENT_RENDERS: '1', RENDER_SYNC_WAIT_S: '120' });
+    const s = await boot({ MAX_CONCURRENT_RENDERS: '1', RENDER_SYNC_WAIT_S: '120', ...hangingFfmpeg() }); // still running when the client leaves
     const u = s.signFirebaseToken({ sub: 'b9-leaves' });
     const ac = new AbortController();
     const pending = fetch(`${s.baseUrl}/api/render/video`, {
