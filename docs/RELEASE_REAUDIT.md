@@ -24,6 +24,11 @@
   * runs 29 and 30 green, all job logs read;
   * the final head's run is recorded in the PR description.
 * **R-04: fixed on the branch.** F7: fixed on the branch.
+* **Pre-existing flaky test found during the final gate (not Track B):**
+  * the guest-token tamper test fails about 1 in 1,024 runs, because its "tamper" can be a no-op (base64url padding
+    bits);
+  * not a forgery;
+  * Track D will fix the test and consider rejecting non-canonical token encodings (`docs/PHASE2_5_TRACK_B.md` §8.8).
 * **Remaining for release:** R-01 live Gemini (Track E, blocker); Track A guest-registration protection; Track D
   Docker-level coverage (incl. the orphan-ffmpeg container claim) and test-helper stability; deployment and recovery
   evidence.

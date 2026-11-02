@@ -291,6 +291,34 @@ The run 28 failure and its test-only correction remain recorded in §6.1. Result
 verification commits) are in §8.8.
 
 ### 8.8 Final head
-Results for this commit (the local gate: 3 consecutive runs of the new tests per backend plus both full suites, and
-its CI run) are recorded in the PR #5 description, not in a later commit. That way the CI run reported is the run of
-the exact final head.
+**Code under test: `5e3a7b4`.** Every later commit changes only `docs/` and comments in `.env.example`. The local
+gate below was started at `6d75ed5` (code `5e3a7b4`).
+
+New and verification tests, 3 consecutive runs per backend (`billing_recovery` + `render_queue` + `repo_contract`),
+no retries:
+
+| Backend | Run 1 | Run 2 | Run 3 |
+|---|---|---|---|
+| JSON | 55/55 (60.6 s) | 55/55 (57.2 s) | 55/55 (57.2 s) |
+| PostgreSQL | 55/55 (59.7 s) | 55/55 (60.0 s) | 55/55 (59.5 s) |
+
+Full suites:
+
+| Backend | Tests | Pass | Fail | Skipped |
+|---|---|---|---|---|
+| JSON | 228 | 226 | 0 | 2 (live Gemini) |
+| PostgreSQL | 228 | 218 | **1** | 9 (2 live Gemini + 7 JSON-only) |
+
+**The one failure is reported, not retried.** It is `tests/auth_llm_storage.test.ts` "Guest tokens: … tamper … rejected"
+(line 41). It is a **pre-existing test flaw, unrelated to Track B**, from commits `813343c`/`176b745`, before Phase 1:
+* The test "tampers" with a token by replacing the signature's last two base64url characters with `AA`.
+* A 32-byte HMAC is 43 base64url characters, and the last character carries 2 unused bits. In about **1 in 1,024**
+  random tokens (measured: 197 of 200,000) the "tampered" string decodes to the **same signature bytes**.
+* The server compares decoded bytes (`timingSafeEqual`), so it correctly accepts a byte-identical genuine
+  signature. **Not a forgery.**
+* Recorded for Track D:
+  * make the tamper change a decoded signature byte;
+  * hardening option: reject non-canonical base64url so a valid token has exactly one spelling (token
+    malleability, low severity).
+
+CI for the final head is recorded in the PR #5 description: a later commit cannot carry the run of itself.
