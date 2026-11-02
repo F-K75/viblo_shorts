@@ -1,26 +1,32 @@
 # Forge Studio — Independent Re-audit + Corrective Round
 
-## Phase 2.5 Track B (R-04, F7): IMPLEMENTED, awaiting separate review (branch `claude/keen-feynman-xtbvz2-track-b`)
-* **Not merged, not release-ready.** Evidence: `docs/PHASE2_5_TRACK_B.md`.
+## Phase 2.5 Track B (R-04, F7): decisions approved, verification complete, awaiting merge decision (PR #5)
+* **Status: not merged, not release-ready.** The owner approved the five architectural decisions (2026-11-02): no
+  reservation ledger, migration `0003`, least-recently-served fairness, per-instance `MAX_CONCURRENT_RENDERS`, and
+  the sync route through the queue. **Merge is not approved.** Evidence: `docs/PHASE2_5_TRACK_B.md` (§6 gate, §7 risk
+  register, §8 review verification).
 * **Red first:** on `main` @ `53fc724`, 12 of 14 new tests failed. They reproduced:
-  * guest renders were accepted;
-  * there was no global cap;
-  * one user's backlog starved another user;
-  * **F7 completed-but-unbilled** on PostgreSQL;
+  * guest renders accepted;
+  * no global cap;
+  * starvation;
+  * **F7 completed-but-unbilled**;
   * no timeout or expiry;
-  * crash and deploy failed the job instead of recovering it.
-* **Implemented:**
-  * guests get `403 sign_in_required`;
-  * 1 running + 3 queued per user, and a global queue cap (`429` + `Retry-After`) that is exact across instances;
-  * fair claim (least recently served user first);
-  * completion and charge in one transaction (JSON: idempotent reconciliation);
-  * wall-clock timeout and queue-wait expiry (neither charged);
-  * crash requeue bounded by `RENDER_MAX_ATTEMPTS`; graceful shutdown releases jobs to the queue;
-  * the sync render route goes through the queue.
-* **Deviation for the reviewer:** there is no reservation ledger. Nothing is charged before success, so there are no
-  refunds to lose or duplicate. See `docs/PHASE2_5_TRACK_B.md` §3.1.
-* **R-04: fixed on the branch, pending review and CI.** F7 is fixed on the branch.
-* **Residual risks:** Track B doc §7 (JSON under-count window until restart, orphaned ffmpeg after a hard crash, and others).
+  * crash and deploy failing the job.
+* **Billing verification (review):**
+  * PostgreSQL completion + charge are one transaction, proven by charge-failure injection and by SIGKILL of the
+    instance *inside* that transaction (rolled back, recovered by the other instance, charged exactly once);
+  * no double charge on stale-worker completion, retried completion or 10 concurrent completions;
+  * failed, cancelled, expired and timed-out jobs are never charged;
+  * JSON reconciliation is durable (`fsync`ed atomic writes) and idempotent across repeated restarts, its own crash
+    and a monthly reset.
+* **CI history (preserved):**
+  * run 28 failed: a test-premise error, a blocker render finishing early on a fast runner; reproduced; test-only fix;
+  * runs 29 and 30 green, all job logs read;
+  * the final head's run is recorded in the PR description.
+* **R-04: fixed on the branch.** F7: fixed on the branch.
+* **Remaining for release:** R-01 live Gemini (Track E, blocker); Track A guest-registration protection; Track D
+  Docker-level coverage (incl. the orphan-ffmpeg container claim) and test-helper stability; deployment and recovery
+  evidence.
 
 ## Phase 2.5 Track C (R-13): MERGED (PR #4 → `main` @ `53fc724`, 2026-11-02)
 * **Merged with owner approval** as merge commit `53fc724`, whose parents are the previous `main` (`be4c48e`) and the
