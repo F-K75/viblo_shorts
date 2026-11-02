@@ -13,6 +13,8 @@ import { createSnapshot, restoreSnapshot, writeServerLock } from '../server/lib/
 import { startTestServer } from './helpers/server.ts';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
+// These tests are about the JSON store: every test server is pinned to it, also in the CI run that puts test
+// servers on PostgreSQL (TEST_STORAGE_BACKEND=postgres).
 const cleanups: Array<() => Promise<unknown> | unknown> = [];
 after(async () => {
   for (const c of cleanups.reverse()) await c();
@@ -141,12 +143,12 @@ describe('J1: a failed restore never leaves a partially restored data directory'
     );
     assert.match(String(restoreBlocked(dir)), /interrupted restore/);
     // the server must not start on this directory
-    await assert.rejects(startTestServer({ DATA_DIR: dir, BACKUP_INTERVAL_HOURS: '0' }), /interrupted restore/);
+    await assert.rejects(startTestServer({ DATA_DIR: dir, BACKUP_INTERVAL_HOURS: '0', STORAGE_BACKEND: 'json' }), /interrupted restore/);
     const r = recover(dir);
     assert.equal(r.state, 'rolled-back');
     assert.deepEqual(storeState(dir), currentState, 'original data back, byte for byte');
     assert.equal(restoreBlocked(dir), null);
-    const s = await startTestServer({ DATA_DIR: dir, BACKUP_INTERVAL_HOURS: '0' });
+    const s = await startTestServer({ DATA_DIR: dir, BACKUP_INTERVAL_HOURS: '0', STORAGE_BACKEND: 'json' });
     cleanups.push(() => s.stop());
     assert.equal((await fetch(`${s.baseUrl}/api/ready`)).status, 200);
   });
@@ -237,12 +239,46 @@ describe('J1: successful, repeated and refused restores', () => {
 describe('J1: the server and the restore can never overlap', () => {
   test('a running server blocks a restore; a restore journal blocks the server from starting', async () => {
     const { dir, backups, snapDir } = setup();
-    const s = await startTestServer({ DATA_DIR: dir, BACKUP_INTERVAL_HOURS: '0' });
+    const s = await startTestServer({ DATA_DIR: dir, BACKUP_INTERVAL_HOURS: '0', STORAGE_BACKEND: 'json' });
     cleanups.push(() => s.stop());
     assert.throws(() => restoreSnapshot(dir, backups, snapDir), /server may be running/);
     await s.stop();
     fs.writeFileSync(path.join(dir, '.restore-in-progress.json'), JSON.stringify({ format: 1, stamp: 1, phase: 'staging', original: [], snapshot: 'x' }));
-    await assert.rejects(startTestServer({ DATA_DIR: dir, BACKUP_INTERVAL_HOURS: '0' }), /interrupted restore/);
+    await assert.rejects(startTestServer({ DATA_DIR: dir, BACKUP_INTERVAL_HOURS: '0', STORAGE_BACKEND: 'json' }), /interrupted restore/);
     void spawn;
+  });
+});
+
+describe('J1 invariant: the restore guard runs before JSON storage initialization opens anything', () => {
+  /** Every file under dir (including hidden ones and snapshots), path -> sha256. */
+  const everything = (dir: string): Record<string, string> => {
+    const out: Record<string, string> = {};
+    const walk = (d: string) => {
+      for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+        const p = path.join(d, e.name);
+        if (e.isDirectory()) walk(p);
+        else out[path.relative(dir, p)] = crypto.createHash('sha256').update(fs.readFileSync(p)).digest('hex');
+      }
+    };
+    walk(dir);
+    return out;
+  };
+
+  test('with a restore journal present the server refuses to start and leaves the data directory byte-for-byte untouched', async () => {
+    const dir = tmp();
+    // A legacy single-file store: opening the JSON store migrates it immediately (creates projects/ shards, a
+    // migration marker and a pre-migration snapshot). If initialization ran before the guard, those would appear.
+    fs.writeFileSync(path.join(dir, 'projects.json'), JSON.stringify([{ id: 'proj_legacy1', userId: 'firebase-u1', title: 'legacy' }]));
+    fs.writeFileSync(path.join(dir, 'usage.json'), JSON.stringify({ version: 1, day: 20000, counts: { 'user:firebase-u1': 2 } }));
+    fs.writeFileSync(path.join(dir, '.restore-in-progress.json'), JSON.stringify({ format: 1, stamp: 1, phase: 'swapping', original: [], snapshot: 'snap-x' }));
+    const before = everything(dir);
+    await assert.rejects(startTestServer({ DATA_DIR: dir, BACKUP_INTERVAL_HOURS: '0', STORAGE_BACKEND: 'json' }), /Refusing to start: an interrupted restore/);
+    assert.deepEqual(everything(dir), before, 'no file created, changed or removed: JSON storage was never opened (and the lock was released)');
+    // after recovery the same directory starts normally and the legacy data is migrated then
+    fs.rmSync(path.join(dir, '.restore-in-progress.json'));
+    const s = await startTestServer({ DATA_DIR: dir, BACKUP_INTERVAL_HOURS: '0', STORAGE_BACKEND: 'json' });
+    cleanups.push(() => s.stop());
+    assert.equal((await fetch(`${s.baseUrl}/api/ready`)).status, 200);
+    assert.ok(fs.existsSync(path.join(dir, 'projects.migrated.json')), 'storage initialized once the journal was gone');
   });
 });
