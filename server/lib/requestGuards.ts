@@ -55,10 +55,62 @@ export function containerMemoryLimitBytes(): number | null {
   return null;
 }
 
-/** Default soft limit: 80 % of the container limit, else 80 % of host memory. */
-export function defaultSoftLimitMb(): number {
-  const limit = containerMemoryLimitBytes() ?? os.totalmem();
-  return Math.round((limit * 0.8) / MB);
+export interface MemoryBudgetInput {
+  /** MEMORY_SOFT_LIMIT_MB when set: the Node threshold itself (0 disables the guard). */
+  explicitSoftLimitMb?: number;
+  /** Container memory limit in MB (MEMORY_CONTAINER_LIMIT_MB, else cgroup), or null when unknown/unlimited. */
+  containerLimitMb: number | null;
+  /** Fallback when there is no container limit (defaults to this host's memory). */
+  hostMemoryMb?: number;
+  /** MAX_CONCURRENT_RENDERS: ffmpeg processes this instance may run at once. */
+  maxConcurrentRenders: number;
+  /** RENDER_MEMORY_RESERVE_MB: memory set aside per concurrent render (worst case measured: 169 MB). */
+  renderReserveMb: number;
+  /** The smallest Node threshold that is still useful (MEMORY_MIN_NODE_MB, default 192). */
+  minNodeMb?: number;
+}
+export interface MemoryBudget {
+  softLimitMb: number;
+  source: 'computed' | 'explicit' | 'disabled';
+  memoryMb: number | null;
+  reservedForRendersMb: number;
+  maxConcurrentRenders: number;
+  renderReserveMb: number;
+}
+
+/**
+ * The memory guard's Node threshold (Track C correction 1). ffmpeg renders run as separate processes: their memory is
+ * never part of Node's RSS, but it counts against the same container limit. So, by default:
+ *
+ *     L = floor(0.8 x M - R x S)      M = container (else host) memory, R = concurrent renders, S = reserve per render
+ *
+ * An explicit MEMORY_SOFT_LIMIT_MB is the Node threshold itself; the reserve is NOT subtracted from it again. A budget
+ * that leaves Node less than `minNodeMb` (or nothing) is refused: a useless threshold must never be accepted silently.
+ */
+export function computeMemoryBudget(i: MemoryBudgetInput): MemoryBudget {
+  const R = i.maxConcurrentRenders;
+  const S = i.renderReserveMb;
+  if (!Number.isInteger(R) || R < 1) throw new Error(`MAX_CONCURRENT_RENDERS must be a whole number >= 1 (got ${R})`);
+  if (!Number.isFinite(S) || S < 0) throw new Error(`RENDER_MEMORY_RESERVE_MB must be a number >= 0 (got ${S})`);
+  if (i.explicitSoftLimitMb !== undefined) {
+    const e = i.explicitSoftLimitMb;
+    if (!Number.isFinite(e) || e < 0) throw new Error(`MEMORY_SOFT_LIMIT_MB must be a number >= 0 (got ${e})`);
+    return { softLimitMb: e, source: e === 0 ? 'disabled' : 'explicit', memoryMb: i.containerLimitMb, reservedForRendersMb: 0, maxConcurrentRenders: R, renderReserveMb: S };
+  }
+  if (i.containerLimitMb !== null && (!Number.isFinite(i.containerLimitMb) || i.containerLimitMb <= 0)) {
+    throw new Error(`MEMORY_CONTAINER_LIMIT_MB must be a number > 0 (got ${i.containerLimitMb})`);
+  }
+  const M = i.containerLimitMb ?? i.hostMemoryMb ?? Math.round(os.totalmem() / MB);
+  const reserved = R * S;
+  const L = Math.floor(0.8 * M - reserved);
+  const min = i.minNodeMb ?? 192;
+  if (L < min) {
+    throw new Error(
+      `insufficient memory budget: 80 % of ${M} MB minus ${R} renders x ${S} MB leaves ${L} MB for the Node process (minimum ${min} MB). ` +
+        'Give the container more memory, lower MAX_CONCURRENT_RENDERS or RENDER_MEMORY_RESERVE_MB, or set MEMORY_SOFT_LIMIT_MB explicitly.',
+    );
+  }
+  return { softLimitMb: L, source: 'computed', memoryMb: M, reservedForRendersMb: reserved, maxConcurrentRenders: R, renderReserveMb: S };
 }
 
 export class MemoryGuard {

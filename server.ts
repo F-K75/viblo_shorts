@@ -38,7 +38,7 @@ import { createPool, isUnavailable, isRetryableTxError, txRetryCount } from './s
 import { migrate } from './server/db/migrate.ts';
 import { createSnapshot, listSnapshots, pruneSnapshots, writeServerLock, removeServerLock, restoreInProgressReason } from './server/lib/backup.ts';
 import { cleanAndParseJSON, validateScript, normalizeHashtags, quoteUserInput } from './server/lib/llm.ts';
-import { MemoryGuard, createBodyGuard, createRouteJsonParser, defaultSoftLimitMb, type BodyLimits } from './server/lib/requestGuards.ts';
+import { MemoryGuard, computeMemoryBudget, containerMemoryLimitBytes, createBodyGuard, createRouteJsonParser, type BodyLimits, type MemoryBudget } from './server/lib/requestGuards.ts';
 
 dotenv.config();
 
@@ -54,7 +54,10 @@ const IS_TEST = NODE_ENV === 'test';
 const port = Number(process.env.PORT ?? 3000);
 const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(__dirname, 'data'));
 const BILLING_MODE = process.env.BILLING_MODE === 'demo' ? 'demo' : 'disabled';
-const MAX_CONCURRENT_RENDERS = Math.max(1, Number(process.env.MAX_CONCURRENT_RENDERS || 2));
+/** Raw numeric setting: the default when unset, otherwise Number(value) (NaN is NOT replaced; callers validate). */
+const rawNum = (name: string, def: number) => (process.env[name] === undefined || process.env[name] === '' ? def : Number(process.env[name]));
+// Validated at startup by computeMemoryBudget (an invalid value stops the server instead of becoming NaN).
+const MAX_CONCURRENT_RENDERS = rawNum('MAX_CONCURRENT_RENDERS', 2);
 const RENDER_TTL_HOURS = Math.max(1, Number(process.env.RENDER_TTL_HOURS || 24));
 const LLM_TIMEOUT_MS = Math.max(2000, Number(process.env.LLM_TIMEOUT_MS || 25000));
 const LLM_MODELS = (process.env.GEMINI_MODELS || 'gemini-3.1-flash-lite,gemini-3.8-flash')
@@ -93,8 +96,24 @@ const BODY_CONCURRENCY = Math.floor(envNum('BODY_CONCURRENCY', 16, 1));
 const LARGE_BODY_BYTES = envNum('LARGE_BODY_KB', 64, 1) * 1024;
 const HEADERS_TIMEOUT_MS = envNum('HEADERS_TIMEOUT_MS', 20000, 500);
 const REQUEST_TIMEOUT_MS = Math.max(HEADERS_TIMEOUT_MS, envNum('REQUEST_TIMEOUT_MS', 60000, 500));
+// Correction 1: the default threshold leaves room for the ffmpeg render processes (L = 0.8 x M - R x S).
+const MEMORY_BUDGET: MemoryBudget = (() => {
+  try {
+    const detected = containerMemoryLimitBytes();
+    return computeMemoryBudget({
+      explicitSoftLimitMb: process.env.MEMORY_SOFT_LIMIT_MB === undefined || process.env.MEMORY_SOFT_LIMIT_MB === '' ? undefined : Number(process.env.MEMORY_SOFT_LIMIT_MB),
+      containerLimitMb: process.env.MEMORY_CONTAINER_LIMIT_MB ? Number(process.env.MEMORY_CONTAINER_LIMIT_MB) : detected === null ? null : Math.round(detected / (1024 * 1024)),
+      maxConcurrentRenders: MAX_CONCURRENT_RENDERS,
+      renderReserveMb: rawNum('RENDER_MEMORY_RESERVE_MB', 256),
+      minNodeMb: rawNum('MEMORY_MIN_NODE_MB', 192),
+    });
+  } catch (err: any) {
+    console.error(`[Config] ${err?.message || err}`);
+    process.exit(1);
+  }
+})();
 const memoryGuard = new MemoryGuard(
-  process.env.MEMORY_SOFT_LIMIT_MB !== undefined ? envNum('MEMORY_SOFT_LIMIT_MB', 0, 0) : defaultSoftLimitMb(),
+  MEMORY_BUDGET.softLimitMb,
   envNum('MEMORY_SAMPLE_MS', 1000, 50),
   // Tests inject the RSS value through a file; never in production.
   IS_TEST && process.env.MEMORY_RSS_TEST_FILE
@@ -908,7 +927,7 @@ app.get('/api/health/details', probeLimit(60), async (req, res) => {
       heapUsedMb: Math.round((mem.heapUsed / 1024 / 1024) * 10) / 10,
       heapTotalMb: Math.round((mem.heapTotal / 1024 / 1024) * 10) / 10,
       rssMb: Math.round((mem.rss / 1024 / 1024) * 10) / 10,
-      memoryGuard: { softLimitMb: memoryGuard.softLimitMb, pressured: memoryGuard.pressured, lastRssMb: Math.round(memoryGuard.lastRssMb * 10) / 10, trips: memoryGuard.trips },
+      memoryGuard: { ...MEMORY_BUDGET, pressured: memoryGuard.pressured, lastRssMb: Math.round(memoryGuard.lastRssMb * 10) / 10, trips: memoryGuard.trips },
     },
     requests: { ...bodyGuard.stats, headersTimeoutMs: HEADERS_TIMEOUT_MS, requestTimeoutMs: REQUEST_TIMEOUT_MS },
     ai: {
@@ -974,6 +993,23 @@ async function computeReadiness() {
   const memory = !memoryGuard.pressured; // Track C: drain this instance under memory pressure
   const ready = storage && ffmpeg && stores && memory;
   return { ready, checks: { storage, ffmpeg, stores, memory } };
+}
+
+// Test-only (Track C correction 2): retains / releases GENUINE memory inside this process so the memory guard can be
+// exercised against real RSS. Registered only when NODE_ENV=test AND MEMORY_TEST_HOOKS=1; never in production.
+if (IS_TEST && process.env.MEMORY_TEST_HOOKS === '1') {
+  let retained: Buffer[] = [];
+  app.post('/__test/memory', express.json({ limit: '1kb' }), (req, res) => {
+    const retainMb = Number(req.body?.retainMb) || 0;
+    for (let i = 0; i < Math.ceil(retainMb / 8); i++) retained.push(Buffer.alloc(8 * 1024 * 1024, 1)); // non-zero: pages are touched
+    if (req.body?.release) {
+      retained = [];
+      const gc = (globalThis as any).gc as undefined | (() => void);
+      gc?.();
+      gc?.();
+    }
+    res.json({ retainedMb: retained.length * 8, rssMb: Math.round((process.memoryUsage.rss() / (1024 * 1024)) * 10) / 10, gcAvailable: typeof (globalThis as any).gc === 'function' });
+  });
 }
 
 // Public feature flags only (no model names, provider fingerprints or key details).
