@@ -42,7 +42,7 @@ describe('health, readiness, config', () => {
     const r = await api('/api/ready');
     const d = await r.json();
     assert.equal(r.status, 200, JSON.stringify(d));
-    assert.deepEqual(d.checks, { storage: true, ffmpeg: true, stores: true });
+    assert.deepEqual(d.checks, { storage: true, ffmpeg: true, stores: true, memory: true }); // memory: Track C guard
   });
   test('config exposes feature flags only (no keys, model names or provider details)', async () => {
     const d = await (await api('/api/config')).json();

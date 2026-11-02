@@ -4,7 +4,7 @@ import dotenv from 'dotenv';
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
-import type { Server } from 'http';
+import { createServer as createHttpServer, type Server } from 'http';
 import { fileURLToPath } from 'url';
 import { spawn, type ChildProcess } from 'child_process';
 import { GoogleGenAI, Type } from '@google/genai';
@@ -38,6 +38,7 @@ import { createPool, isUnavailable, isRetryableTxError, txRetryCount } from './s
 import { migrate } from './server/db/migrate.ts';
 import { createSnapshot, listSnapshots, pruneSnapshots, writeServerLock, removeServerLock, restoreInProgressReason } from './server/lib/backup.ts';
 import { cleanAndParseJSON, validateScript, normalizeHashtags, quoteUserInput } from './server/lib/llm.ts';
+import { MemoryGuard, computeMemoryBudget, containerMemoryLimitBytes, createBodyGuard, createRouteJsonParser, type BodyLimits, type MemoryBudget } from './server/lib/requestGuards.ts';
 
 dotenv.config();
 
@@ -53,7 +54,10 @@ const IS_TEST = NODE_ENV === 'test';
 const port = Number(process.env.PORT ?? 3000);
 const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(__dirname, 'data'));
 const BILLING_MODE = process.env.BILLING_MODE === 'demo' ? 'demo' : 'disabled';
-const MAX_CONCURRENT_RENDERS = Math.max(1, Number(process.env.MAX_CONCURRENT_RENDERS || 2));
+/** Raw numeric setting: the default when unset, otherwise Number(value) (NaN is NOT replaced; callers validate). */
+const rawNum = (name: string, def: number) => (process.env[name] === undefined || process.env[name] === '' ? def : Number(process.env[name]));
+// Validated at startup by computeMemoryBudget (an invalid value stops the server instead of becoming NaN).
+const MAX_CONCURRENT_RENDERS = rawNum('MAX_CONCURRENT_RENDERS', 2);
 const RENDER_TTL_HOURS = Math.max(1, Number(process.env.RENDER_TTL_HOURS || 24));
 const LLM_TIMEOUT_MS = Math.max(2000, Number(process.env.LLM_TIMEOUT_MS || 25000));
 const LLM_MODELS = (process.env.GEMINI_MODELS || 'gemini-3.1-flash-lite,gemini-3.8-flash')
@@ -81,6 +85,42 @@ const STORE_LIMITS = {
   minFreeDiskBytes: envNum('MIN_FREE_DISK_MB', 256, 0) * MB,
 };
 const GUEST_MINT_PER_HOUR = envNum('GUEST_MINT_PER_HOUR', 1000, 1);
+// Track C (R-13): request bodies, memory and slow clients (server/lib/requestGuards.ts). All configurable.
+const BODY_LIMITS: BodyLimits = {
+  projectBytes: STORE_LIMITS.maxProjectBytes + 64 * 1024, // a whole project plus JSON envelope
+  transcriptBytes: envNum('BODY_LIMIT_TRANSCRIPT_KB', 1024, 16) * 1024,
+  mediumBytes: envNum('BODY_LIMIT_MEDIUM_KB', 64, 4) * 1024,
+  defaultBytes: envNum('BODY_LIMIT_DEFAULT_KB', 16, 1) * 1024,
+};
+const BODY_CONCURRENCY = Math.floor(envNum('BODY_CONCURRENCY', 16, 1));
+const LARGE_BODY_BYTES = envNum('LARGE_BODY_KB', 64, 1) * 1024;
+const HEADERS_TIMEOUT_MS = envNum('HEADERS_TIMEOUT_MS', 20000, 500);
+const REQUEST_TIMEOUT_MS = Math.max(HEADERS_TIMEOUT_MS, envNum('REQUEST_TIMEOUT_MS', 60000, 500));
+// Correction 1: the default threshold leaves room for the ffmpeg render processes (L = 0.8 x M - R x S).
+const MEMORY_BUDGET: MemoryBudget = (() => {
+  try {
+    const detected = containerMemoryLimitBytes();
+    return computeMemoryBudget({
+      explicitSoftLimitMb: process.env.MEMORY_SOFT_LIMIT_MB === undefined || process.env.MEMORY_SOFT_LIMIT_MB === '' ? undefined : Number(process.env.MEMORY_SOFT_LIMIT_MB),
+      containerLimitMb: process.env.MEMORY_CONTAINER_LIMIT_MB ? Number(process.env.MEMORY_CONTAINER_LIMIT_MB) : detected === null ? null : Math.round(detected / (1024 * 1024)),
+      maxConcurrentRenders: MAX_CONCURRENT_RENDERS,
+      renderReserveMb: rawNum('RENDER_MEMORY_RESERVE_MB', 256),
+      minNodeMb: rawNum('MEMORY_MIN_NODE_MB', 192),
+    });
+  } catch (err: any) {
+    console.error(`[Config] ${err?.message || err}`);
+    process.exit(1);
+  }
+})();
+const memoryGuard = new MemoryGuard(
+  MEMORY_BUDGET.softLimitMb,
+  envNum('MEMORY_SAMPLE_MS', 1000, 50),
+  // Tests inject the RSS value through a file; never in production.
+  IS_TEST && process.env.MEMORY_RSS_TEST_FILE
+    ? () => Number(fs.readFileSync(process.env.MEMORY_RSS_TEST_FILE!, 'utf8'))
+    : () => process.memoryUsage.rss() / (1024 * 1024),
+);
+const bodyGuard = createBodyGuard({ limits: BODY_LIMITS, concurrency: BODY_CONCURRENCY, largeBodyBytes: LARGE_BODY_BYTES, memory: memoryGuard });
 // Per-IP buckets are this multiple of the per-user limit (several users may share an IP, e.g. offices/NAT).
 const IP_RATE_MULTIPLIER = envNum('IP_RATE_MULTIPLIER', 4, 1);
 const BACKUP_DIR = path.resolve(process.env.BACKUP_DIR || path.join(DATA_DIR, 'backups'));
@@ -284,7 +324,7 @@ app.use(
     origin: allowedOrigins.length > 0 ? allowedOrigins : IS_PROD ? false : true,
   }),
 );
-app.use(express.json({ limit: '1mb' }));
+// JSON bodies are parsed only after authentication (below), with route-specific limits (Track C).
 
 const fetchWithTimeout = (url: string, init: RequestInit = {}, timeoutMs = 8000) =>
   fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
@@ -302,10 +342,15 @@ app.use('/api', async (req, res, next) => {
   }
   if (PUBLIC_API.has(req.baseUrl + req.path) || req.path.startsWith('/render/download/')) return next();
   if (!req.identity) {
+    // The body is never parsed or buffered for an anonymous request (Node discards what the client still sends).
     return res.status(401).json({ error: 'Authentication required. Please sign in or continue as guest.', code: 'unauthenticated' });
   }
   next();
 });
+// Track C: body admission (route limit from Content-Length, memory guard, bounded large bodies in flight), then the
+// JSON parser with the same route limit (which also cuts off chunked bodies while streaming).
+app.use('/api', bodyGuard.middleware);
+app.use('/api', createRouteJsonParser(BODY_LIMITS, (limit) => express.json({ limit })));
 
 const uid = (req: express.Request) => req.identity!.userId;
 const isAdmin = (req: express.Request) => Boolean(req.identity?.isAdmin);
@@ -882,7 +927,9 @@ app.get('/api/health/details', probeLimit(60), async (req, res) => {
       heapUsedMb: Math.round((mem.heapUsed / 1024 / 1024) * 10) / 10,
       heapTotalMb: Math.round((mem.heapTotal / 1024 / 1024) * 10) / 10,
       rssMb: Math.round((mem.rss / 1024 / 1024) * 10) / 10,
+      memoryGuard: { ...MEMORY_BUDGET, pressured: memoryGuard.pressured, lastRssMb: Math.round(memoryGuard.lastRssMb * 10) / 10, trips: memoryGuard.trips },
     },
+    requests: { ...bodyGuard.stats, headersTimeoutMs: HEADERS_TIMEOUT_MS, requestTimeoutMs: REQUEST_TIMEOUT_MS },
     ai: {
       calls: llmMetrics.calls,
       successes: llmMetrics.successes,
@@ -943,8 +990,26 @@ async function computeReadiness() {
   // Stores every request depends on must be usable (JSON: shared files readable; PostgreSQL: reachable).
   // A single corrupt JSON user shard does not fail readiness.
   const stores = (await repo.health()).ok;
-  const ready = storage && ffmpeg && stores;
-  return { ready, checks: { storage, ffmpeg, stores } };
+  const memory = !memoryGuard.pressured; // Track C: drain this instance under memory pressure
+  const ready = storage && ffmpeg && stores && memory;
+  return { ready, checks: { storage, ffmpeg, stores, memory } };
+}
+
+// Test-only (Track C correction 2): retains / releases GENUINE memory inside this process so the memory guard can be
+// exercised against real RSS. Registered only when NODE_ENV=test AND MEMORY_TEST_HOOKS=1; never in production.
+if (IS_TEST && process.env.MEMORY_TEST_HOOKS === '1') {
+  let retained: Buffer[] = [];
+  app.post('/__test/memory', express.json({ limit: '1kb' }), (req, res) => {
+    const retainMb = Number(req.body?.retainMb) || 0;
+    for (let i = 0; i < Math.ceil(retainMb / 8); i++) retained.push(Buffer.alloc(8 * 1024 * 1024, 1)); // non-zero: pages are touched
+    if (req.body?.release) {
+      retained = [];
+      const gc = (globalThis as any).gc as undefined | (() => void);
+      gc?.();
+      gc?.();
+    }
+    res.json({ retainedMb: retained.length * 8, rssMb: Math.round((process.memoryUsage.rss() / (1024 * 1024)) * 10) / 10, gcAvailable: typeof (globalThis as any).gc === 'function' });
+  });
 }
 
 // Public feature flags only (no model names, provider fingerprints or key details).
@@ -2590,7 +2655,9 @@ app.use('/api', (_req, res) => {
 // Central error handler: malformed JSON -> 400; everything else -> generic 500 (no stack traces leaked).
 app.use((err: any, req: express.Request, res: express.Response, _next: express.NextFunction) => {
   if (err?.type === 'entity.parse.failed') return res.status(400).json({ error: 'Malformed JSON body' });
-  if (err?.type === 'entity.too.large') return res.status(413).json({ error: 'Request body too large' });
+  if (err?.type === 'entity.too.large') {
+    return res.status(413).json({ error: `Request body too large (max ${Math.round((err.limit || 0) / 1024)} KB for this endpoint).`, code: 'payload_too_large', limitBytes: err.limit });
+  }
   if (err instanceof StoreLimitError) {
     if (res.headersSent) return;
     return res.status(err.status).json({ error: err.message, code: err.code });
@@ -2675,7 +2742,15 @@ export async function startServer(): Promise<Server> {
     app.use(vite.middlewares);
   }
 
-  const server = app.listen(port, '0.0.0.0', () => {
+  memoryGuard.start();
+  // Track C: slow clients are cut off. headersTimeout bounds the time to send the request headers, requestTimeout the
+  // time to send the whole request (headers + body; responses are not affected). Node checks them every
+  // connectionsCheckingInterval, so it is kept short for the timeouts to be enforced promptly.
+  const server = createHttpServer(
+    { headersTimeout: HEADERS_TIMEOUT_MS, requestTimeout: REQUEST_TIMEOUT_MS, connectionsCheckingInterval: Math.min(1000, Math.floor(HEADERS_TIMEOUT_MS / 2)) },
+    app,
+  );
+  server.listen(port, '0.0.0.0', () => {
     const addr = server.address();
     const actualPort = typeof addr === 'object' && addr ? addr.port : port;
     console.log(`[Forge Studio] listening on :${actualPort} (${NODE_ENV}) storage=${repo.kind}${jsonMigrationNote} instance=${INSTANCE_ID} llm=${resolveGeminiApiKey() ? LLM_MODELS.join('>') : 'template-fallback'} trustProxy=${trustProxy.ok ? trustProxy.description : '?'}`);
