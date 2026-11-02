@@ -55,6 +55,10 @@ secret stored in GitHub Actions or Secrets Manager. I never handle the value.
 | B7 | **Crash recovery:** a stale heartbeat requeues a job once (`attempts < 2`), otherwise fails it with one refund | Kill a worker mid-render on 2 instances → completes elsewhere or one refund |
 | B8 | No paid-priority wording anywhere (UI, API, docs) | Grep check in tests |
 
+**Track B status (2026-11-02):** B1–B8 implemented on `claude/keen-feynman-xtbvz2-track-b`, awaiting separate review.
+Evidence and the deviations from this checklist (no reservation ledger: nothing is charged until success; migration
+`0003_render_queue.sql`; least-recently-served fairness) are in `docs/PHASE2_5_TRACK_B.md` §3.1.
+
 ## Track C: Memory protection and backpressure (R-13). PR "phase2.5-c"
 | # | Step | Done when |
 |---|---|---|

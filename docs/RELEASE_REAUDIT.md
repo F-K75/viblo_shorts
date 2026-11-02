@@ -1,5 +1,27 @@
 # Forge Studio — Independent Re-audit + Corrective Round
 
+## Phase 2.5 Track B (R-04, F7): IMPLEMENTED, awaiting separate review (branch `claude/keen-feynman-xtbvz2-track-b`)
+* **Not merged, not release-ready.** Evidence: `docs/PHASE2_5_TRACK_B.md`.
+* **Red first:** on `main` @ `53fc724`, 12 of 14 new tests failed. They reproduced:
+  * guest renders were accepted;
+  * there was no global cap;
+  * one user's backlog starved another user;
+  * **F7 completed-but-unbilled** on PostgreSQL;
+  * no timeout or expiry;
+  * crash and deploy failed the job instead of recovering it.
+* **Implemented:**
+  * guests get `403 sign_in_required`;
+  * 1 running + 3 queued per user, and a global queue cap (`429` + `Retry-After`) that is exact across instances;
+  * fair claim (least recently served user first);
+  * completion and charge in one transaction (JSON: idempotent reconciliation);
+  * wall-clock timeout and queue-wait expiry (neither charged);
+  * crash requeue bounded by `RENDER_MAX_ATTEMPTS`; graceful shutdown releases jobs to the queue;
+  * the sync render route goes through the queue.
+* **Deviation for the reviewer:** there is no reservation ledger. Nothing is charged before success, so there are no
+  refunds to lose or duplicate. See `docs/PHASE2_5_TRACK_B.md` §3.1.
+* **R-04: fixed on the branch, pending review and CI.** F7 is fixed on the branch.
+* **Residual risks:** Track B doc §7 (JSON under-count window until restart, orphaned ffmpeg after a hard crash, and others).
+
 ## Phase 2.5 Track C (R-13): MERGED (PR #4 → `main` @ `53fc724`, 2026-11-02)
 * **Merged with owner approval** as merge commit `53fc724`, whose parents are the previous `main` (`be4c48e`) and the
   approved head (`b895cfc`). `main` is byte-identical to `b895cfc`.
