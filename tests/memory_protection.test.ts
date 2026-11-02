@@ -254,3 +254,107 @@ describe('C exit criterion: memory stays bounded under concurrent oversized and 
     assert.ok(rss1 - rss0 < 120, `RSS growth ${rss1 - rss0} MB stays bounded`);
   });
 });
+
+describe('Correction 1: FFmpeg-aware memory budget in the running server', () => {
+  test('1 GB container, 2 renders: Node threshold 307 MB (not 819); guard and readiness act at that threshold', async () => {
+    const rssFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'c6-')), 'rss');
+    fs.writeFileSync(rssFile, '200');
+    const s = await boot({ MEMORY_CONTAINER_LIMIT_MB: '1024', MAX_CONCURRENT_RENDERS: '2', MEMORY_SAMPLE_MS: '100', MEMORY_RSS_TEST_FILE: rssFile, READY_CACHE_MS: '0' });
+    const g = (await healthDetails(s.baseUrl)).system.memoryGuard;
+    assert.equal(g.softLimitMb, 307, JSON.stringify(g));
+    assert.equal(g.reservedForRendersMb, 512);
+    assert.equal(g.source, 'computed');
+    const token = s.signFirebaseToken({ sub: 'c6-user' });
+    const readyIs = async (want: number) => {
+      for (let i = 0; i < 40; i++) {
+        if ((await fetch(`${s.baseUrl}/api/ready`)).status === want) return;
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      assert.fail(`readiness never became ${want}`);
+    };
+    await readyIs(200);
+    fs.writeFileSync(rssFile, '320'); // Node at 320 MB: fine for the old 819 MB threshold, NOT with two renders running
+    await readyIs(503);
+    const render = await send(s, { path: '/api/render/video', token, body: json({ title: 'x', duration: 5, beats: [{ text: 'hi', start_s: 0, end_s: 2 }] }) });
+    assert.equal(render.status, 503);
+    assert.equal(render.body?.code, 'memory_pressure');
+    fs.writeFileSync(rssFile, '290'); // below 307 but above 90 % (276): still guarded
+    await new Promise((r) => setTimeout(r, 400));
+    assert.equal((await fetch(`${s.baseUrl}/api/ready`)).status, 503);
+    fs.writeFileSync(rssFile, '250');
+    await readyIs(200);
+  });
+
+  test('a configured reserve and an explicit override are used (no double counting)', async () => {
+    const a = await boot({ MEMORY_CONTAINER_LIMIT_MB: '1024', MAX_CONCURRENT_RENDERS: '2', RENDER_MEMORY_RESERVE_MB: '128' });
+    assert.equal((await healthDetails(a.baseUrl)).system.memoryGuard.softLimitMb, 563);
+    const b = await boot({ MEMORY_CONTAINER_LIMIT_MB: '1024', MAX_CONCURRENT_RENDERS: '2', MEMORY_SOFT_LIMIT_MB: '700' });
+    const gb = (await healthDetails(b.baseUrl)).system.memoryGuard;
+    assert.deepEqual([gb.softLimitMb, gb.source, gb.reservedForRendersMb], [700, 'explicit', 0]);
+  });
+
+  test('an insufficient memory budget makes the server refuse to start with a clear message', async () => {
+    await assert.rejects(boot({ MEMORY_CONTAINER_LIMIT_MB: '512', MAX_CONCURRENT_RENDERS: '2' }), /insufficient memory budget/);
+    await assert.rejects(boot({ MEMORY_CONTAINER_LIMIT_MB: '1024', MAX_CONCURRENT_RENDERS: 'abc' }), /MAX_CONCURRENT_RENDERS/);
+  });
+});
+
+describe('Correction 2: recovery from REAL memory pressure (no injected RSS)', () => {
+  /** Retains / releases genuine memory inside the server process (test-only hook, refused outside NODE_ENV=test). */
+  const hook = async (s: TestServer, body: Record<string, unknown>) =>
+    (await fetch(`${s.baseUrl}/__test/memory`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })).json();
+
+  test('retained buffers push real RSS over the limit: guard on, readiness 503; after release + GC readiness returns only once real RSS < 90 %', async () => {
+    const s = await boot({ NODE_OPTIONS: '--expose-gc', MEMORY_TEST_HOOKS: '1', MEMORY_SOFT_LIMIT_MB: '400', MEMORY_SAMPLE_MS: '200', READY_CACHE_MS: '0' });
+    const token = s.signFirebaseToken({ sub: 'c7-user' });
+    const base = (await healthDetails(s.baseUrl)).system;
+    assert.ok(base.rssMb < 360, `baseline RSS ${base.rssMb} MB leaves room under the 400 MB limit`);
+    assert.equal((await fetch(`${s.baseUrl}/api/ready`)).status, 200);
+
+    const held = await hook(s, { retainMb: 450 });
+    assert.ok(held.rssMb > 400, `real RSS after retaining 450 MB: ${held.rssMb} MB`);
+    // guard on (from the sampler's real reading) and readiness drained
+    let pressured: any = null;
+    for (let i = 0; i < 30 && !pressured; i++) {
+      const d = await healthDetails(s.baseUrl);
+      if (d.system.memoryGuard.pressured) pressured = d.system;
+      else await new Promise((r) => setTimeout(r, 100));
+    }
+    assert.ok(pressured, 'the guard tripped on real RSS');
+    assert.ok(pressured.memoryGuard.lastRssMb > 400);
+    const ready = await fetch(`${s.baseUrl}/api/ready`);
+    assert.equal(ready.status, 503);
+    assert.equal((await ready.json()).checks.memory, false);
+    const big = await send(s, { path: '/api/projects', token, body: sized(200_000, 'notes', { title: 'under real pressure' }) });
+    assert.equal(big.status, 503);
+    assert.equal(big.body?.code, 'memory_pressure');
+
+    // release and collect; then readiness may only come back when the REAL reading is below 90 % of the limit
+    const released = await hook(s, { release: true });
+    const observations: Array<{ t: number; ready: number; lastRssMb: number; pressured: boolean }> = [];
+    const t0 = Date.now();
+    let recovered = false;
+    while (Date.now() - t0 < 20_000) {
+      const d = await healthDetails(s.baseUrl);
+      const r = (await fetch(`${s.baseUrl}/api/ready`)).status;
+      observations.push({ t: Date.now() - t0, ready: r, lastRssMb: d.system.memoryGuard.lastRssMb, pressured: d.system.memoryGuard.pressured });
+      if (r === 200) {
+        recovered = true;
+        break;
+      }
+      await new Promise((res) => setTimeout(res, 250));
+    }
+    console.log(JSON.stringify({ event: 'c7_real_recovery', baselineRssMb: base.rssMb, heldRssMb: held.rssMb, afterReleaseRssMb: released.rssMb, recovered, observations: observations.slice(-5), polls: observations.length }));
+    assert.ok(recovered, `readiness did not recover within 20 s; last real RSS ${observations.at(-1)?.lastRssMb} MB vs recovery threshold 360 MB`);
+    const last = observations.at(-1)!;
+    assert.ok(last.lastRssMb < 360, `recovered only below 90 % of the limit (real RSS ${last.lastRssMb} MB)`);
+    for (const o of observations.slice(0, -1)) assert.equal(o.ready, 503, 'never ready while the guard still saw RSS at or above the recovery threshold');
+    assert.equal((await send(s, { path: '/api/projects', token, body: sized(200_000, 'notes', { title: 'after real recovery' }) })).status, 200);
+  });
+
+  test('the memory test hook does not exist unless NODE_ENV=test and MEMORY_TEST_HOOKS=1', async () => {
+    const s = await boot();
+    const r = await fetch(`${s.baseUrl}/__test/memory`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{"retainMb":10}' });
+    assert.notEqual(r.status, 200);
+  });
+});
