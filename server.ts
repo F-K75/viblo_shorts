@@ -30,7 +30,7 @@ import { AuthService, resolveSessionSecret, type AuthIdentity } from './server/l
 import { readJsonFile, writeJsonFileAtomic, StoreUnavailableError, freeDiskBytes } from './server/lib/storage.ts';
 import { ProjectStore, StoreLimitError } from './server/lib/projectStore.ts';
 import { UsageLedger, utcDay } from './server/lib/usage.ts';
-import { createSnapshot, listSnapshots, pruneSnapshots, writeServerLock, removeServerLock } from './server/lib/backup.ts';
+import { createSnapshot, listSnapshots, pruneSnapshots, writeServerLock, removeServerLock, restoreInProgressReason } from './server/lib/backup.ts';
 import { cleanAndParseJSON, validateScript, normalizeHashtags, quoteUserInput } from './server/lib/llm.ts';
 
 dotenv.config();
@@ -108,6 +108,19 @@ const trustProxy = parseTrustProxy(process.env.TRUST_PROXY, IS_PROD);
 if (!trustProxy.ok) {
   console.error(`[Config] ${trustProxy.error}`);
   process.exit(1);
+}
+
+// J1: never open the stores while a snapshot restore is running or was interrupted. The lock is written
+// FIRST and the restore journal checked SECOND; a restore creates its journal first and checks the lock second,
+// so whichever starts later always sees the other and backs off.
+writeServerLock(DATA_DIR);
+{
+  const restoring = restoreInProgressReason(DATA_DIR);
+  if (restoring) {
+    removeServerLock(DATA_DIR);
+    console.error(`[Startup] Refusing to start: ${restoring}`);
+    process.exit(1);
+  }
 }
 
 const projectStore = new ProjectStore(DATA_DIR, BACKUP_DIR, STORE_LIMITS);
@@ -2565,7 +2578,6 @@ export async function startServer(): Promise<Server> {
     console.log(`[Forge Studio] listening on :${actualPort} (${NODE_ENV}) llm=${resolveGeminiApiKey() ? LLM_MODELS.join('>') : 'template-fallback'} trustProxy=${trustProxy.ok ? trustProxy.description : '?'} projects=${projectStore.status().projects}${migrationReport.migrated ? ` (migrated ${migrationReport.records} from legacy file; snapshot ${migrationReport.snapshot})` : ''}`);
   });
 
-  writeServerLock(DATA_DIR);
   let backupTimer: NodeJS.Timeout | null = null;
   if (BACKUP_INTERVAL_HOURS > 0) {
     const first = setTimeout(runScheduledBackup, IS_TEST ? 0 : 30000); // soon after boot, then on the interval

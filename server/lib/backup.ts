@@ -4,8 +4,19 @@
 // size + SHA-256 of every file. A snapshot is written to a temp directory, re-hashed from disk, and only
 // then renamed into place, so a listed snapshot is always complete and verified.
 //
-// Restore never deletes anything: the current files are first captured in a "pre-restore" snapshot and
-// then moved aside (renamed *.pre-restore-<ts>) before the snapshot's files are copied in.
+// Restore never deletes anything and is all-or-nothing (J1):
+//   1. the snapshot is verified; the server must be stopped;
+//   2. a restore journal is created exclusively (DATA_DIR/.restore-in-progress.json); the server refuses to
+//      start while it exists, and a second restore refuses to run;
+//   3. the current state is captured in a "pre-restore" snapshot;
+//   4. the snapshot is copied into a staging directory on the same filesystem and the staged copy is verified
+//      (size + SHA-256 of every file against the manifest, every store file parses as JSON);
+//   5. only then is the live data swapped: each store entry is renamed aside (*.pre-restore-<ts>) and the
+//      staged entry renamed into place (atomic renames on one filesystem);
+//   6. any failure during the swap is rolled back automatically (aside entries renamed back; restored entries
+//      kept in .restore-failed-<ts>/, never deleted). If even the rollback fails, the journal stays: the
+//      server refuses to start and `npm run backup -- recover` finishes the rollback (idempotent).
+// Failures before step 5 change nothing in the live data.
 //
 // LIMITATION (documented): BACKUP_DIR defaults to DATA_DIR/backups, i.e. the same volume. Off-site
 // copies / PITR come with PostgreSQL in Phase 2.
@@ -230,38 +241,229 @@ export interface RestoreResult {
   movedAside: string[];
 }
 
-/**
- * Restores `snapDir` into `dataDir`. Refuses unless the snapshot verifies and the server is stopped
- * (override with force when the lock cannot be checked, e.g. a different container).
- */
-export function restoreSnapshot(dataDir: string, backupDir: string, snapDir: string, opts: { force?: boolean } = {}): RestoreResult {
-  const problems = verifySnapshotDir(snapDir);
-  if (problems.length) throw new Error(`refusing to restore: snapshot does not verify (${problems.join('; ')})`);
-  const running = serverRunningReason(dataDir);
-  if (running && !opts.force) throw new Error(`refusing to restore while the server may be running: ${running}. Stop it first (or pass --force if you are sure).`);
+/** Journal of a restore in progress. Its presence blocks the server from starting (J1). */
+export const RESTORE_JOURNAL = '.restore-in-progress.json';
+interface RestoreJournal {
+  format: 1;
+  stamp: number;
+  snapshot: string;
+  startedAt: string;
+  pid: number;
+  hostname: string;
+  /** staging: live data untouched; swapping: live entries are being replaced. */
+  phase: 'staging' | 'swapping';
+  /** store entries that existed in the live directory before the swap */
+  original: string[];
+}
+const journalPath = (dataDir: string) => path.join(dataDir, RESTORE_JOURNAL);
+const stagingDir = (dataDir: string, stamp: number) => path.join(dataDir, `.restore-staging-${stamp}`);
+const failedDir = (dataDir: string, stamp: number) => path.join(dataDir, `.restore-failed-${stamp}`);
+const asideName = (entry: string, stamp: number) => `${entry}.pre-restore-${stamp}`;
 
-  const manifest: Manifest = JSON.parse(fs.readFileSync(path.join(snapDir, 'manifest.json'), 'utf8'));
-  const pre = createSnapshot(dataDir, backupDir, 'pre-restore');
-  const stamp = Date.now();
-  const movedAside: string[] = [];
+function fsyncDir(dir: string) {
+  try {
+    const fd = fs.openSync(dir, 'r');
+    try {
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    // not supported on every filesystem; renames are still atomic
+  }
+}
+function writeJournal(dataDir: string, j: RestoreJournal, exclusive: boolean) {
+  const fd = fs.openSync(journalPath(dataDir), exclusive ? 'wx' : 'w', 0o600);
+  try {
+    fs.writeSync(fd, JSON.stringify(j));
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
+  fsyncDir(dataDir);
+}
+function readJournal(dataDir: string): RestoreJournal | null {
+  try {
+    return JSON.parse(fs.readFileSync(journalPath(dataDir), 'utf8'));
+  } catch (err: any) {
+    if (err?.code === 'ENOENT') return null;
+    // an unreadable journal still means "a restore was interrupted": never ignore it
+    return { format: 1, stamp: 0, snapshot: '?', startedAt: '?', pid: 0, hostname: '?', phase: 'swapping', original: [] };
+  }
+}
 
-  // Move every current store entry aside (never delete), then copy the snapshot in.
+/** Non-null when a restore is running or was interrupted: the server must not start on this directory. */
+export function restoreInProgressReason(dataDir: string): string | null {
+  const j = readJournal(dataDir);
+  if (!j) return null;
+  return `an interrupted restore (or one still running) was found (${RESTORE_JOURNAL}, snapshot ${j.snapshot}, phase ${j.phase}); run "npm run backup -- recover" before starting the server`;
+}
+
+/** Local lock state: a provably running local server can never be overridden, even with force. */
+function lockState(dataDir: string): { blocked: string | null; overridable: boolean } {
+  const reason = serverRunningReason(dataDir);
+  if (!reason) return { blocked: null, overridable: false };
+  return { blocked: reason, overridable: reason.startsWith('lock held by host') };
+}
+
+/** Puts the original live entries back after a failed or interrupted swap. Idempotent; throws if a step fails. */
+function rollbackSwap(dataDir: string, j: RestoreJournal): string[] {
+  const kept: string[] = [];
+  const failed = failedDir(dataDir, j.stamp);
+  const keep = (entry: string) => {
+    fs.mkdirSync(failed, { recursive: true, mode: 0o700 });
+    fs.renameSync(path.join(dataDir, entry), path.join(failed, entry));
+    kept.push(entry);
+  };
   for (const entry of STORE_ENTRIES) {
-    const abs = path.join(dataDir, entry);
-    if (fs.existsSync(abs)) {
-      const aside = `${abs}.pre-restore-${stamp}`;
-      fs.renameSync(abs, aside);
-      movedAside.push(path.basename(aside));
+    const live = path.join(dataDir, entry);
+    const aside = path.join(dataDir, asideName(entry, j.stamp));
+    if (fs.existsSync(aside)) {
+      if (fs.existsSync(live)) keep(entry); // restored copy: kept, never deleted
+      fs.renameSync(aside, live);
+    } else if (!j.original.includes(entry) && fs.existsSync(live)) {
+      keep(entry); // entry that did not exist before the swap
     }
   }
-  const restored: string[] = [];
-  for (const f of manifest.files) {
-    const dest = path.join(dataDir, f.path);
-    fs.mkdirSync(path.dirname(dest), { recursive: true });
-    const tmp = `${dest}.restore-tmp`;
-    fs.copyFileSync(path.join(snapDir, f.path), tmp);
-    fs.renameSync(tmp, dest);
-    restored.push(f.path);
+  fsyncDir(dataDir);
+  return kept;
+}
+
+/**
+ * Restores `snapDir` into `dataDir`, all-or-nothing (see the header). `force` only overrides a lock written on
+ * another host (which cannot be checked from here); a provably running local server always blocks a restore.
+ */
+export function restoreSnapshot(
+  dataDir: string,
+  backupDir: string,
+  snapDir: string,
+  opts: { force?: boolean; allowUnparseable?: boolean } = {},
+): RestoreResult {
+  const problems = verifySnapshotDir(snapDir);
+  if (problems.length) throw new Error(`refusing to restore: snapshot does not verify (${problems.join('; ')})`);
+  const manifest: Manifest = JSON.parse(fs.readFileSync(path.join(snapDir, 'manifest.json'), 'utf8'));
+  const unparseable = manifest.files.filter((f) => !f.parseOk).map((f) => f.path);
+  if (unparseable.length && !opts.allowUnparseable) {
+    throw new Error(`refusing to restore: the snapshot contains unparseable store files (${unparseable.join(', ')}); the server would refuse to use them. Pass --allow-unparseable only to restore them as evidence.`);
   }
-  return { restored, preRestoreSnapshot: pre.name, movedAside };
+  const checkLock = () => {
+    const lock = lockState(dataDir);
+    if (lock.blocked && !(opts.force && lock.overridable)) {
+      throw new Error(`refusing to restore while the server may be running: ${lock.blocked}. Stop it first${lock.overridable ? ' (or pass --force if you are sure the other host is stopped)' : ''}.`);
+    }
+  };
+  checkLock();
+
+  const stamp = Date.now();
+  const journal: RestoreJournal = {
+    format: 1,
+    stamp,
+    snapshot: path.basename(snapDir),
+    startedAt: new Date().toISOString(),
+    pid: process.pid,
+    hostname: os.hostname(),
+    phase: 'staging',
+    original: [],
+  };
+  try {
+    writeJournal(dataDir, journal, true); // exclusive: one restore at a time
+  } catch (err: any) {
+    if (err?.code === 'EEXIST') {
+      throw new Error(`refusing to restore: a restore is in progress or was interrupted (${RESTORE_JOURNAL} exists); run "npm run backup -- recover" first`);
+    }
+    throw err;
+  }
+
+  // ---- stage + verify: the live data is not touched ----
+  const staging = stagingDir(dataDir, stamp);
+  let pre: Manifest;
+  try {
+    checkLock(); // again, after the journal exists: a server starting now refuses (it checks the journal after locking)
+    pre = createSnapshot(dataDir, backupDir, 'pre-restore');
+    fs.mkdirSync(staging, { recursive: true, mode: 0o700 });
+    for (const f of manifest.files) {
+      const dest = path.join(staging, f.path);
+      fs.mkdirSync(path.dirname(dest), { recursive: true, mode: 0o700 });
+      fs.copyFileSync(path.join(snapDir, f.path), dest);
+    }
+    fs.copyFileSync(path.join(snapDir, 'manifest.json'), path.join(staging, 'manifest.json'));
+    const staged = verifySnapshotDir(staging);
+    if (staged.length) throw new Error(`staged copy does not match the snapshot (${staged.join('; ')})`);
+    for (const f of manifest.files) {
+      if (!f.parseOk) continue;
+      try {
+        JSON.parse(fs.readFileSync(path.join(staging, f.path), 'utf8'));
+      } catch {
+        throw new Error(`staged ${f.path} does not parse`);
+      }
+    }
+    fs.rmSync(path.join(staging, 'manifest.json'));
+  } catch (err: any) {
+    fs.rmSync(staging, { recursive: true, force: true }); // copies of the snapshot only
+    fs.rmSync(journalPath(dataDir), { force: true });
+    throw new Error(`restore aborted, nothing was changed (live data untouched): ${err?.message || err}`);
+  }
+
+  // ---- swap: journaled, rolled back on any failure ----
+  journal.phase = 'swapping';
+  journal.original = STORE_ENTRIES.filter((e) => fs.existsSync(path.join(dataDir, e)));
+  const movedAside: string[] = [];
+  try {
+    writeJournal(dataDir, journal, false);
+    for (const entry of STORE_ENTRIES) {
+      const live = path.join(dataDir, entry);
+      if (fs.existsSync(live)) {
+        fs.renameSync(live, path.join(dataDir, asideName(entry, stamp)));
+        movedAside.push(asideName(entry, stamp));
+      }
+      const stagedEntry = path.join(staging, entry);
+      if (fs.existsSync(stagedEntry)) fs.renameSync(stagedEntry, live);
+    }
+    fsyncDir(dataDir);
+  } catch (err: any) {
+    let kept: string[];
+    try {
+      kept = rollbackSwap(dataDir, journal);
+    } catch (rbErr: any) {
+      throw new Error(
+        `restore failed while replacing the live data (${err?.message || err}) AND the automatic rollback failed (${rbErr?.message || rbErr}). ` +
+          `Nothing was deleted: the original entries are named *.pre-restore-${stamp} in ${dataDir}. The server will refuse to start until you run "npm run backup -- recover", which finishes the rollback.`,
+      );
+    }
+    fs.rmSync(journalPath(dataDir), { force: true });
+    fs.rmSync(staging, { recursive: true, force: true }); // only leftover copies of the snapshot
+    throw new Error(
+      `restore failed while replacing the live data and was rolled back automatically; the live data is exactly as before` +
+        `${kept.length ? ` (partially restored entries kept in ${path.basename(failedDir(dataDir, stamp))}/)` : ''}: ${err?.message || err}`,
+    );
+  }
+  fs.rmSync(journalPath(dataDir), { force: true });
+  fs.rmSync(staging, { recursive: true, force: true }); // empty after the swap
+  fsyncDir(dataDir);
+  return { restored: manifest.files.map((f) => f.path), preRestoreSnapshot: pre.name, movedAside };
+}
+
+/**
+ * Finishes an interrupted restore by rolling it back to the data that was live before it started (idempotent).
+ * Refuses while the restoring process is provably still running on this host.
+ */
+export function recoverInterruptedRestore(dataDir: string): { state: 'none' | 'rolled-back'; snapshot?: string; keptInFailedDir: string[] } {
+  const j = readJournal(dataDir);
+  if (!j) return { state: 'none', keptInFailedDir: [] };
+  if (j.hostname === os.hostname() && j.pid && j.pid !== process.pid) {
+    try {
+      process.kill(j.pid, 0);
+      throw new Error(`the restore process ${j.pid} is still running; wait for it to finish`);
+    } catch (err: any) {
+      if (err?.code !== 'ESRCH') throw err;
+    }
+  }
+  const kept = j.phase === 'swapping' && j.stamp ? rollbackSwap(dataDir, j) : [];
+  if (j.stamp) {
+    const staging = stagingDir(dataDir, j.stamp);
+    if (fs.existsSync(staging)) fs.rmSync(staging, { recursive: true, force: true }); // copies of the snapshot only
+  }
+  fs.rmSync(journalPath(dataDir), { force: true });
+  fsyncDir(dataDir);
+  return { state: 'rolled-back', snapshot: j.snapshot, keptInFailedDir: kept };
 }
