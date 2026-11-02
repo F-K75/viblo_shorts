@@ -14,7 +14,7 @@ import os from 'os';
 import path from 'path';
 import { spawn } from 'child_process';
 import { pipeline } from 'stream/promises';
-import { Transform } from 'stream';
+import { PassThrough, Transform } from 'stream';
 import { DeleteObjectCommand, GetObjectCommand, ListObjectsV2Command, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import pg from 'pg';
 
@@ -158,7 +158,11 @@ function run(cmd: string, args: string[], opts: { stdin?: NodeJS.ReadableStream;
     proc.on('error', (e) => reject(new Error(`${cmd}: ${e.message}`)));
     proc.on('close', (code) => (code === 0 ? resolve() : reject(new Error(`${cmd} exited with ${code}: ${stderr.trim().slice(-500)}`))));
   });
-  if (opts.stdin) opts.stdin.pipe(proc.stdin!);
+  done.catch(() => {}); // observed by the caller's await; never an unhandled rejection while it awaits something else
+  if (opts.stdin) {
+    proc.stdin!.on('error', () => {}); // EPIPE when the child exits first; its exit code carries the real error
+    opts.stdin.pipe(proc.stdin!);
+  }
   return { proc, done };
 }
 
@@ -244,6 +248,8 @@ async function serverMajor(url: string): Promise<number> {
   }
 }
 
+const TX_CONTROL = /^(BEGIN|COMMIT|ROLLBACK|END|ABORT|START\s+TRANSACTION|SAVEPOINT|RELEASE|PREPARE\s+TRANSACTION)\b[^;]*;\s*$/i;
+
 /**
  * Line filter for pg_restore SQL output: removes only top-level `SET <name> = ...;` lines for settings the target
  * server major does not know. Data (COPY blocks) and every other statement pass through unchanged.
@@ -259,18 +265,29 @@ export function dropUnsupportedSessionSettings(targetMajor: number): Transform {
       return line;
     }
     if (/^COPY .* FROM stdin;$/.test(line)) inCopy = true;
+    // F2: the restore owns the transaction (BEGIN ... COMMIT only after every stage succeeded). A transaction-control
+    // statement inside the dump would end it early and make a partial restore committable, so it is refused.
+    if (TX_CONTROL.test(line)) throw new Error(`restore stream contains a transaction-control statement (${line.slice(0, 40)}); refusing to apply it`);
     return re && re.test(line) ? null : line;
   };
   return new Transform({
     transform(chunk, _enc, cb) {
-      const parts = (carry + chunk.toString('utf8')).split('\n');
-      carry = parts.pop() ?? '';
-      const out = parts.map(handle).filter((l) => l !== null);
-      cb(null, out.length ? out.join('\n') + '\n' : '');
+      try {
+        const parts = (carry + chunk.toString('utf8')).split('\n');
+        carry = parts.pop() ?? '';
+        const out = parts.map(handle).filter((l) => l !== null);
+        cb(null, out.length ? out.join('\n') + '\n' : '');
+      } catch (err) {
+        cb(err as Error);
+      }
     },
     flush(cb) {
-      const last = carry ? handle(carry) : null;
-      cb(null, last ?? '');
+      try {
+        const last = carry ? handle(carry) : null;
+        cb(null, last ?? '');
+      } catch (err) {
+        cb(err as Error);
+      }
     },
   });
 }
@@ -379,14 +396,65 @@ export async function restoreBackup(cfg: OffsiteConfig, name: string, targetUrl:
     const { manifest, file } = await download(cfg, name, tmpDir);
     const t1 = Date.now();
     const env = libpqEnv(targetUrl);
-    // age -d | pg_restore -f - (SQL) | drop unknown session SETs | psql --single-transaction ON_ERROR_STOP.
-    // A newer pg_dump (the backup image ships 17; CI runners ship 18) emits session settings an older target
-    // server rejects (e.g. `SET transaction_timeout = 0;`, PostgreSQL 17+), which made a direct pg_restore abort.
+    const major = await serverMajor(targetUrl); // before any child starts: nothing can fail unobserved meanwhile
+    // age -d | pg_restore -f - (SQL) | drop unknown session SETs | psql, inside ONE transaction that WE control.
+    //  * Why SQL and not pg_restore directly: a newer pg_dump (17+) emits session settings an older server rejects
+    //    (e.g. `SET transaction_timeout = 0;`).
+    //  * F2: psql --single-transaction commits at end of input, and a dying upstream stage looks exactly like end of
+    //    input, so a partial restore got committed. Now BEGIN is sent first and COMMIT is appended only after age,
+    //    pg_restore and the filter have all finished successfully. On any failure psql is killed before COMMIT, so
+    //    the server rolls the transaction back and the target stays empty. If this process itself dies, psql sees
+    //    end of input without COMMIT, disconnects, and the server rolls back as well.
     const dec = run(bin('age'), ['-d', '-i', identityFile, file]);
     const toSql = run(bin('pg_restore'), ['--no-owner', '--no-acl', '--file=-'], { stdin: dec.proc.stdout! });
-    const filtered = toSql.proc.stdout!.pipe(dropUnsupportedSessionSettings(await serverMajor(targetUrl)));
-    const apply = run(bin('psql'), ['-X', '-q', '--set=ON_ERROR_STOP=1', '--single-transaction'], { stdin: filtered, env });
-    await Promise.all([dec.done, toSql.done, apply.done]);
+    const filter = dropUnsupportedSessionSettings(major);
+    const feed = new PassThrough();
+    const apply = run(bin('psql'), ['-X', '-q', '--set=ON_ERROR_STOP=1'], { stdin: feed, env });
+    feed.write('BEGIN;\n');
+    let filterError: Error | null = null;
+    const filtered = new Promise<void>((resolve, reject) => {
+      toSql.proc.stdout!.on('error', reject);
+      filter.on('error', (err) => reject((filterError = err)));
+      filter.on('end', resolve);
+    });
+    filtered.catch(() => {});
+    toSql.proc.stdout!.pipe(filter);
+    filter.pipe(feed, { end: false }); // psql's input is ended below, with or without COMMIT
+    const upstream = Promise.all([dec.done, toSql.done, filtered]);
+    // psql never exits on its own before its input is ended, so an early exit is a failure (SQL error, lost
+    // connection). It must also stop the upstream stages: nothing reads their output any more, and back-pressure
+    // would otherwise stall them forever.
+    const psqlEarlyExit = apply.done.then(
+      () => Promise.reject(new Error('psql exited before the restore stream was complete')),
+      (err) => Promise.reject(err),
+    );
+    let upstreamError: unknown = null;
+    await Promise.race([upstream, psqlEarlyExit]).catch((err) => (upstreamError = err));
+    if (upstreamError) {
+      for (const p of [apply.proc, toSql.proc, dec.proc]) p.kill('SIGKILL'); // COMMIT was never sent: rollback
+      filter.unpipe(feed);
+      filter.destroy(); // nothing will read it any more; `filtered` may stay pending, so it is not awaited here
+      const settled = await Promise.allSettled([dec.done, toSql.done, apply.done]);
+      if (filterError) settled.push({ status: 'rejected', reason: filterError });
+      // report every stage that failed on its own (not the ones we just killed), root cause first
+      const causes = [...new Set(settled.flatMap((r) => (r.status === 'rejected' ? [String((r.reason as any)?.message || r.reason)] : [])).filter((m) => !/exited with null/.test(m)))];
+      if (!causes.length) causes.push(String((upstreamError as any)?.message || upstreamError));
+      throw new Error(`restore aborted, nothing was committed (target database is unchanged): ${causes.join(' | ')}`);
+    }
+    feed.end('COMMIT;\n');
+    try {
+      await apply.done;
+    } catch (err: any) {
+      // psql failed. Before COMMIT (SQL error, lost connection) nothing is committed; a failure DURING COMMIT has an
+      // unknown outcome. Never guess: look at the target and say which case this is.
+      const now = await rowCounts(targetUrl).catch(() => null);
+      const state = !now
+        ? 'the target could not be inspected: check it before retrying (it must be empty to restore into)'
+        : Object.keys(now.counts).length === 0
+          ? 'nothing was committed (target database is unchanged)'
+          : 'the target is NOT empty (the failure happened during COMMIT): verify it or drop and recreate it before retrying';
+      throw new Error(`restore failed; ${state}: ${err?.message || err}`);
+    }
     const t2 = Date.now();
     const after = await rowCounts(targetUrl);
     const verified = Object.entries(manifest.rowCounts).every(([t, n]) => after.counts[t] === n);

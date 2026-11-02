@@ -129,7 +129,7 @@ describe('F2: a restore is applied completely or not at all', { skip: pgSkip }, 
     const dst = await db(false);
     // real pg_restore, cut after the schema and part of the data, then a non-zero exit
     await withTool('PG_RESTORE_PATH', 'pg_restore "$@" | head -c 6000; exit 7', async () => {
-      await assert.rejects(restoreBackup(cfg, m.name, dst.url, key.file), /pg_restore|tool\.sh/);
+      await assert.rejects(restoreBackup(cfg, m.name, dst.url, key.file), /nothing was committed.*tool\.sh exited with 7/s);
     });
     assert.equal(await publicTables(dst), 0, 'nothing from the failed restore was committed');
     const ok = await restoreBackup(cfg, m.name, dst.url, key.file);
@@ -154,7 +154,7 @@ describe('F2: a restore is applied completely or not at all', { skip: pgSkip }, 
     manifest.sha256 = crypto.createHash('sha256').update(blob).digest('hex'); // attacker/bit-rot also fixed the checksum
     fs.writeFileSync(path.join(dir, `${m.name}.manifest.json`), JSON.stringify(manifest));
     const dst = await db(false);
-    await assert.rejects(restoreBackup(cfg, m.name, dst.url, key.file), /age/);
+    await assert.rejects(restoreBackup(cfg, m.name, dst.url, key.file), /nothing was committed.*age exited with 1: age: error: failed to decrypt and authenticate payload chunk/s);
     assert.equal(await publicTables(dst), 0);
   });
 
@@ -268,7 +268,7 @@ describe('Backup/restore failure matrix', { skip: pgSkip }, () => {
     const cfg = fileTarget();
     const m = await createBackup(src.url, cfg, [key.pub]);
     const dst = await db(false);
-    await assert.rejects(restoreBackup(cfg, m.name, dst.url, other.file), /age/);
+    await assert.rejects(restoreBackup(cfg, m.name, dst.url, other.file), /nothing was committed.*no identity matched any of the recipients/s);
     assert.equal(await publicTables(dst), 0, 'wrong key: nothing applied');
     const file = path.join(new URL(cfg.target).pathname, m.objectKey);
     const blob = fs.readFileSync(file);
@@ -328,5 +328,22 @@ describe('Backup/restore failure matrix', { skip: pgSkip }, () => {
       assert.deepEqual(await projectRows(dst), expected);
       assert.deepEqual(await q(dst, 'SELECT id, kind, storage_bytes, project_count FROM users ORDER BY id'), users);
     }
+  });
+});
+
+describe('F2: the restore stream may not end the restore transaction itself', () => {
+  test('top-level BEGIN/COMMIT/ROLLBACK in the SQL stream is refused; the same words inside COPY data pass through', async () => {
+    const { dropUnsupportedSessionSettings } = await import('../server/db/offsiteBackup.ts');
+    const { Readable } = await import('node:stream');
+    const pipeAll = async (sql: string) => {
+      let out = '';
+      for await (const c of Readable.from([sql]).pipe(dropUnsupportedSessionSettings(16))) out += c;
+      return out;
+    };
+    for (const stmt of ['COMMIT;', 'BEGIN;', 'ROLLBACK;', 'START TRANSACTION;', 'end;']) {
+      await assert.rejects(pipeAll(`CREATE TABLE t (a text);\n${stmt}\nCREATE TABLE u (a text);\n`), /transaction-control statement/);
+    }
+    const data = 'COPY public.t (a) FROM stdin;\nCOMMIT;\nBEGIN;\n\\.\n';
+    assert.equal(await pipeAll(data), data);
   });
 });
