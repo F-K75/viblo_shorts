@@ -24,6 +24,9 @@
   * **R-10**: no AWS environment, CD, monitoring or PITR test;
   * **F4**: backup authenticity;
   * **F7**: render billing.
+* **Disclosed limitation (keep visible):** the backward-compatible migration allow-list checks statement types, not
+  semantic effects. Manual review of every marked migration's data effect, backfills in particular, is mandatory
+  (ADR-002).
 * **Score: 55 → 58 (provisional).** The data layer's backup and restore path is now verifiable and atomic. The
   product is still **NOT READY FOR RELEASE**.
 

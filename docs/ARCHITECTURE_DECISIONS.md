@@ -53,6 +53,11 @@ this allow-list, and any other or misspelt `-- forge:` directive is an error:
 * `ALTER TABLE <existing> ADD COLUMN …` that is nullable or has a `DEFAULT`, without constraints;
 * `COMMENT ON …`, and `UPDATE` (backfilling new columns).
 
+**Limitation, required process:** the allow-list checks statement *types*, not their semantic effect. A backfill
+`UPDATE` (or a default) that changes what existing data means passes the check. **Every migration that carries the
+marker, and every backfill in particular, requires manual code review of its data effect before merge.** That is
+a release-process rule, not something the tooling guarantees.
+
 Everything else (drop/rename, type change, `SET NOT NULL`, constraints or unique indexes on existing tables,
 `DELETE`/`TRUNCATE`, triggers, functions) cannot carry the marker. Such a change is split into expand (marked) →
 code change → contract (unmarked, next release). A build older than this rule (before F5) refuses any unknown
