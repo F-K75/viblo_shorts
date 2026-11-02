@@ -296,9 +296,9 @@ describe('Gate 8: encrypted off-site backup restored into a real database', { sk
     // restore into a NEW database (never the live one)
     const target = await freshDb();
     const restoreEnv = { ...env, BACKUP_AGE_IDENTITY_FILE: path.join(keyDir, 'key.txt') };
-    assert.equal((await cli('scripts/db-backup.ts', ['restore', name, db.url], restoreEnv)).status, 1, 'refuses a non-empty target');
-    assert.equal((await cli('scripts/db-backup.ts', ['restore', name, target.url], { ...env })).status, 1, 'needs the private key');
-    const restored = await cli('scripts/db-backup.ts', ['restore', name, target.url], restoreEnv);
+    assert.equal((await cli('scripts/db-backup.ts', ['restore', name], { ...restoreEnv, RESTORE_DATABASE_URL: db.url })).status, 1, 'refuses a non-empty target');
+    assert.equal((await cli('scripts/db-backup.ts', ['restore', name], { ...env, RESTORE_DATABASE_URL: target.url })).status, 1, 'needs the private key');
+    const restored = await cli('scripts/db-backup.ts', ['restore', name], { ...restoreEnv, RESTORE_DATABASE_URL: target.url });
     assert.equal(restored.status, 0, restored.stderr);
     const rr = JSON.parse(restored.stdout);
     assert.equal(rr.verified, true);

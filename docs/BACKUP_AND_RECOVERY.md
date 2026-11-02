@@ -50,12 +50,24 @@ on), keep hourly for 48 h, daily for 35 days, monthly for 12 months (bucket life
 ## 4. Restore procedure (tested: tests/phase2.test.ts "Gate 8")
 1. `npm run db-backup -- list` → pick the backup; `npm run db-backup -- verify <name>` (checksum only).
 2. Create a **new empty** database (never restore over the live one).
-3. `BACKUP_AGE_IDENTITY_FILE=/secure/forge-backup-key.txt npm run db-backup -- restore <name> <new-db-url>`.
+3. `BACKUP_AGE_IDENTITY_FILE=/secure/forge-backup-key.txt RESTORE_DATABASE_URL=<new empty db url> npm run db-backup -- restore <name>`
+   (the URL is read from the environment only; the CLI refuses it as an argument, because arguments are visible
+   to every user on the host).
    It refuses a non-empty target or a checksum mismatch, applies everything in ONE transaction (all or
    nothing), works when the backup tool is newer than the target server (unknown session settings are dropped),
    and prints row counts versus the manifest plus timings.
 4. Smoke-test the app against the new database (staging instance), then switch `DATABASE_URL` and roll the
    instances. Keep the old database until the incident is closed.
+
+## 4a. When a backup or restore fails (recovery procedures; tested: tests/backup_restore.test.ts)
+| Situation | What the tool guarantees | What you do |
+|---|---|---|
+| `create` fails (pg_dump error, lost connection, age error, upload error) | Exit code 1 and an error. **No manifest is written**, so a failed backup is never listed or restorable. The local temp dir holds only ciphertext and is always deleted. | Fix the cause and re-run. If the upload of the ciphertext succeeded but the manifest did not, an unlisted `*.dump.age` remains: harmless, removed by the bucket lifecycle rule. |
+| Backup manifest row counts | Taken inside the **same snapshot** pg_dump uses (`pg_export_snapshot` + `--snapshot`), so a restore verifies exactly even under live traffic. | Connect the backup job **directly** to PostgreSQL (or a session-mode pooler), not through a transaction-mode pooler (it cannot share a snapshot). The snapshot holds back vacuum for the duration of the dump: schedule outside peak write hours. |
+| `restore` fails before COMMIT (corrupt or wrong-key backup, pg_restore error, psql error, lost connection, the restore process killed) | Exit 1, `restore aborted, nothing was committed (target database is unchanged)`. The restore runs in one transaction that is only committed after every stage succeeded; the target stays **empty**. | Fix the cause and run the same command again against the same empty database. |
+| `restore` fails **during** COMMIT (connection lost at that instant) | The tool inspects the target and says whether it is empty or not; it never guesses. | If it reports *NOT empty*: drop and recreate the target database, then retry. |
+| `restore` completed but `verified:false` | Exit 1 with both row-count sets. | Do not switch. Investigate (wrong backup? manual changes to the target?); restore again into a new empty database. |
+| Target is not empty | Refused before anything is read or applied; the target is untouched. | Create a new empty database. Never restore over the live database. |
 
 ## 5. Database outage behaviour (tested: "Gate 9")
 * Requests fail fast with `503 database_unavailable` (connect timeout 5 s, statement timeout 10 s). Nothing is
