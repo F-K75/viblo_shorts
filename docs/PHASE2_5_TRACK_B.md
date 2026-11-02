@@ -129,6 +129,68 @@ Earlier failures, recorded and not hidden:
 * **EPIPE in the Track C exit-criterion test** (one pre-fix full run): the known Track D test-helper item, not
   Track B. It did not recur in the full suites above.
 
+### 6.1 CI (PR #5)
+**Run 28 on `36a10fd` (code `5ea2030`): FAILED in the `test` job.** The JSON-suite step failed: 216 tests, 213 pass,
+**1 fail**, 2 skipped.
+* Failure: `B3 global queue cap … 300 users`, `27 !== 25`.
+* Every later step and the `docker` job were skipped, so this run is no evidence for them.
+
+Root cause (a test-premise error, not a server defect):
+* The two 60 s "blocker" renders, meant to keep both workers busy for the whole burst, finish in seconds on a fast
+  runner (7 s locally on 4 cores).
+* Each freed worker then claimed a burst job. That **correctly** freed a queue slot (the cap limits *queued* jobs).
+* Hence 25 + 2 = 27.
+* **Reproduced locally**, `27 !== 25`, by running the old test with 2 s blockers.
+
+The same hidden assumption ("a real render outlasts the test") made other tests timing-dependent:
+* B3 per-user and configurable caps;
+* B6 queue expiry;
+* B9 disconnect;
+* B7 crash and deploy, which could even pass **without any recovery happening**, if instance A finished the job
+  before it was stopped.
+
+**Fix (`8ac7235`, test-only):**
+* A stub `ffmpeg` on `PATH` answers `-version` and otherwise sleeps until killed. The server's spawn, kill and timeout
+  code is unchanged.
+* It is used wherever the premise is "this slot stays busy" or "this instance cannot finish the job".
+* The global-cap test keeps its **exact** assertion and now also asserts that only the two blockers are running.
+* B7 gives the stub only to instance A, so `completed` proves instance B rendered the job.
+* No assertion was weakened, and no test was skipped or retried to get green.
+
+**Local, code `8ac7235`, 3 consecutive runs per backend** (`render_queue` + `repo_contract`), no retries:
+
+| Backend | Run 1 | Run 2 | Run 3 |
+|---|---|---|---|
+| JSON | 43/43 (62.0 s) | 43/43 (61.5 s) | 43/43 (60.7 s) |
+| PostgreSQL | 43/43 (64.4 s) | 43/43 (62.9 s) | 43/43 (63.5 s) |
+
+**Run 29 on `8ac7235`: GREEN. Every job's log was read:**
+
+| Job / step | Result (from the log) |
+|---|---|
+| `test`: typecheck | pass |
+| `test`: JSON suite | 216 tests, 214 pass, 0 fail, 0 cancelled, 2 skipped (live Gemini) |
+| `test`: every server on PostgreSQL | 216 tests, 207 pass, 0 fail, 0 cancelled, 9 skipped (2 live Gemini + 7 JSON-only) |
+| `test`: all Track B tests (B2–B9 and the repo contracts) | `ok` in both suites |
+| `test`: production build | pass |
+| `test`: Playwright E2E, JSON and PostgreSQL | 1/1 and 1/1 |
+| `test`: `bun audit --audit-level=high` | "No vulnerabilities found (checked 389 packages, 2 below --audit-level=high, 1 ignored)" |
+| `docker`: app and backup images build | pass |
+| `docker`: 2-instance PostgreSQL smoke | pass (readiness incl. `memory`, cross-instance project, health token) |
+| `docker`: JSON smoke, unsafe-config refusal, backup tools | pass |
+| `live-llm` | skipped on PRs by design (R-01 still open, Track E) |
+
+Observation, not a gate:
+* The E2E step's transient `npm install --no-save playwright@1` prints "5 vulnerabilities (1 moderate, 4 high)" from
+  npm's own audit of that throwaway install tree.
+* This PR changes no dependency, lockfile or workflow file (`git diff origin/main...HEAD` over `package.json`, lockfiles
+  and `.github` is empty).
+* The gating audit (`bun audit`) passes.
+* Recorded for Track D, not fixed here.
+
+Side effect of the B7 crash test: the SIGKILLed instance leaves its stub `sleep 300` orphaned, exactly as a real hard
+crash orphans ffmpeg (residual risk 2). The orphan exits on its own after 5 minutes.
+
 ## 7. Residual risks (Track B, recorded, not solved)
 1. **JSON backend: under-count window after a crash.** A crash between the completion and the charge is charged at
    the next start, not immediately. The single-instance JSON mode cannot do better without a transaction. PostgreSQL
