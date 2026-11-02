@@ -48,10 +48,12 @@ docker run -p 3000:3000 -e SESSION_SECRET=$(openssl rand -hex 32) -e TRUST_PROXY
   ```bash
   npm run backup -- list
   npm run backup -- verify <snapshot>
-  npm run backup -- restore <snapshot>   # server must be stopped; current data is snapshotted and moved aside first
+  npm run backup -- restore <snapshot>   # server must be stopped; all-or-nothing; current data is snapshotted and moved aside first
+  npm run backup -- recover              # only if a restore was interrupted: rolls back to the data before it (the server refuses to start until then)
   ```
 
-  In Docker, run the restore in a one-off container against the stopped service's volume:
+  In Docker, **stop the service first**, then run the restore in a one-off container against its volume (`--force`
+  is needed because the lock was written by the other container, and it cannot verify that container is stopped):
   `docker run --rm -v forge-data:/data forge-studio node --import tsx scripts/backup.ts restore <snapshot> --force`
   (`--force` is needed because the lock was written by a different container; make sure the service is stopped).
 * All settings: [.env.example](.env.example).

@@ -83,6 +83,25 @@ Other runs: `npm run test:load` completed, with no regression on reads (list p50
 * **FS-035 (P3):** `/api/health` is public and now exposes more operational detail (storage totals, guest-mint count, proxy diagnostics). Restrict detailed health to an internal port or token in Phase 4.
 * **FS-036 (P3):** restoring inside Docker needs `--force`, because the server lock was written by another container. This is documented, but an operator must make sure the service is stopped.
 
+## A4a. Final-review corrective change (2026-11-02): J1 fixed, J2 documented
+* **J1 (P2, fixed, red-first):** a JSON snapshot restore could leave a half-restored data directory, and the
+  server would start on it. Reproduced: an I/O failure on the 3rd file left 2 of 3 user shards and no
+  `usage.json`/`jobs.json`/`subscriptions.json`.
+  * **Fix:** stage + verify, then a journaled swap with automatic rollback; the server refuses to start while a
+    restore journal exists; `npm run backup -- recover` finishes an interrupted restore; `--force` no longer
+    overrides a running local server.
+  * **Evidence:** `tests/restore_atomic.test.ts`, 11 of 12 red before, 12 of 12 green after. It covers:
+    * staging copy failure, disk full, and a corrupted staged copy;
+    * a swap failure, and a swap failure with the rollback failing too;
+    * a SIGKILL mid-swap;
+    * success, repeated restores, and missing/corrupt/unparseable snapshots;
+    * concurrent restores, `--force`, and server/restore exclusion.
+
+  Details and remaining limitations: `docs/DATABASE_ARCHITECTURE.md` (Backups).
+* **J2 (P3, open, documented):** a CLI snapshot taken while the server runs is consistent per file, not across
+  files. The supported workflow is a stopped server, or the server's own scheduled snapshots (which are
+  point-in-time). It stays open until the required guarantee is defined.
+
 ## A5. Updated score
 | Dimension | Weight | Phase 0 | Phase 1 | Why it moved |
 |---|---:|---:|---:|---|
