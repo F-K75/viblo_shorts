@@ -204,19 +204,29 @@ export function libpqEnv(url: string): NodeJS.ProcessEnv {
   return env;
 }
 
-export async function rowCounts(url: string): Promise<{ counts: Record<string, number>; schemaVersion: number | null; serverVersion: string }> {
-  const c = new pg.Client({ connectionString: url.replace(/[?&]sslmode=disable/, '') });
-  c.on('error', () => {}); // a dropped connection surfaces as a rejected query below, never as an uncaught exception
+async function connect(url: string, applicationName: string) {
+  const c = new pg.Client({ connectionString: url.replace(/[?&]sslmode=disable/, ''), application_name: applicationName });
+  c.on('error', () => {}); // a dropped connection surfaces as a rejected query, never as an uncaught exception
   await c.connect();
+  return c;
+}
+
+/** Row counts, schema version and server version, all read by `c` (inside whatever snapshot `c` holds). */
+async function countRows(c: pg.Client): Promise<{ counts: Record<string, number>; schemaVersion: number | null; serverVersion: string }> {
+  const counts: Record<string, number> = {};
+  for (const t of BACKUP_TABLES) {
+    const exists = (await c.query('SELECT to_regclass($1) AS r', [`public.${t}`])).rows[0].r;
+    if (exists) counts[t] = Number((await c.query(`SELECT count(*) AS n FROM ${t}`)).rows[0].n);
+  }
+  const sv = counts.schema_migrations !== undefined ? (await c.query('SELECT max(version) AS v FROM schema_migrations')).rows[0].v : null;
+  const ver = (await c.query('SHOW server_version')).rows[0].server_version;
+  return { counts, schemaVersion: sv === null ? null : Number(sv), serverVersion: ver };
+}
+
+export async function rowCounts(url: string) {
+  const c = await connect(url, 'forge-backup-verify');
   try {
-    const counts: Record<string, number> = {};
-    for (const t of BACKUP_TABLES) {
-      const exists = (await c.query('SELECT to_regclass($1) AS r', [`public.${t}`])).rows[0].r;
-      if (exists) counts[t] = Number((await c.query(`SELECT count(*) AS n FROM ${t}`)).rows[0].n);
-    }
-    const sv = counts.schema_migrations !== undefined ? (await c.query('SELECT max(version) AS v FROM schema_migrations')).rows[0].v : null;
-    const ver = (await c.query('SHOW server_version')).rows[0].server_version;
-    return { counts, schemaVersion: sv === null ? null : Number(sv), serverVersion: ver };
+    return await countRows(c);
   } finally {
     await c.end();
   }
@@ -226,9 +236,7 @@ export async function rowCounts(url: string): Promise<{ counts: Record<string, n
 const SESSION_SETTINGS_SINCE: Record<string, number> = { transaction_timeout: 17 };
 
 async function serverMajor(url: string): Promise<number> {
-  const c = new pg.Client({ connectionString: url.replace(/[?&]sslmode=disable/, '') });
-  c.on('error', () => {});
-  await c.connect();
+  const c = await connect(url, 'forge-backup-verify');
   try {
     return Math.floor(Number((await c.query('SHOW server_version_num')).rows[0].server_version_num) / 10000);
   } finally {
@@ -276,13 +284,22 @@ export async function createBackup(databaseUrl: string, cfg: OffsiteConfig, reci
   }
   const target = openTarget(cfg);
   const started = Date.now();
-  const before = await rowCounts(databaseUrl);
+  // F1: the manifest must describe exactly the data in the dump. One REPEATABLE READ transaction is held open for
+  // the whole backup: its snapshot is exported, the row counts are read inside it, and pg_dump runs on that same
+  // snapshot (--snapshot). Writes made during the backup are in neither, so restore verification is exact.
+  // (Needs a direct/session connection; a transaction-mode pooler cannot share an exported snapshot.)
+  const snap = await connect(databaseUrl, 'forge-backup-snapshot');
   const name = `forge-${new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d+Z$/, 'Z')}-${crypto.randomBytes(3).toString('hex')}`;
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-backup-'));
   const cipherFile = path.join(tmpDir, `${name}.dump.age`);
   try {
+    await snap.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
+    // this session sits idle in its transaction while pg_dump runs; a server-wide idle timeout must not end it early
+    await snap.query('SET LOCAL idle_in_transaction_session_timeout = 0');
+    const snapshotId: string = (await snap.query('SELECT pg_export_snapshot() AS id')).rows[0].id;
+    const before = await countRows(snap);
     const env = libpqEnv(databaseUrl);
-    const dump = run(bin('pg_dump'), ['--format=custom', '--no-owner', '--no-acl'], { env });
+    const dump = run(bin('pg_dump'), ['--format=custom', '--no-owner', '--no-acl', `--snapshot=${snapshotId}`], { env });
     const age = run(bin('age'), [...recipients.flatMap((r) => ['-r', r]), '-o', cipherFile], { stdin: dump.proc.stdout! });
     await Promise.all([dump.done, age.done]);
     const bytes = fs.statSync(cipherFile).size;
@@ -308,6 +325,8 @@ export async function createBackup(databaseUrl: string, cfg: OffsiteConfig, reci
     return manifest;
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true }); // our own temp dir (ciphertext only)
+    await snap.query('ROLLBACK').catch(() => {}); // read-only snapshot transaction: nothing to commit
+    await snap.end().catch(() => {});
   }
 }
 
