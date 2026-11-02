@@ -38,12 +38,19 @@ docker run -p 3000:3000 -e SESSION_SECRET=$(openssl rand -hex 32) -e TRUST_PROXY
 ```
 
 * Health: `GET /api/health` (liveness + metrics), `GET /api/ready` (storage + ffmpeg).
-* Runs as a **single instance** (per-user JSON shards in `/data/projects`). PostgreSQL replaces this in Phase 2.
+* **Storage:** set `DATABASE_URL` (managed PostgreSQL ≥ 14, TLS). Schema migrations run automatically at
+  startup (advisory-locked, safe with several instances). Without `DATABASE_URL`, production refuses to start
+  unless `STORAGE_BACKEND=json` explicitly selects the single-instance JSON store.
 * `TRUST_PROXY` is **required** in production: `none` when clients connect directly, `1` behind one load
   balancer (or proxy CIDRs). `true` is rejected because it lets clients spoof their IP.
-* Storage is bounded per guest, per user, for all guests together, globally, and by free disk (see `.env.example`).
-* Backups: verified snapshots every `BACKUP_INTERVAL_HOURS` into `BACKUP_DIR` (default `/data/backups`, same
-  volume — copy them off-host). Operator CLI:
+* Rate limits, AI quotas, storage quotas and the render queue are shared through the database, so any number
+  of instances can run (rendered MP4 files are still per-instance: FS-037).
+* **Backups:** encrypted off-site `pg_dump` backups with `Dockerfile.backup` / `npm run db-backup`, plus
+  provider PITR — see [docs/BACKUP_AND_RECOVERY.md](docs/BACKUP_AND_RECOVERY.md) (RPO/RTO, restore, cut-over
+  from JSON with `npm run data-migration -- plan|migrate|export`).
+* **JSON backend snapshots** (`STORAGE_BACKEND=json`, single instance): verified snapshots every
+  `BACKUP_INTERVAL_HOURS` into `BACKUP_DIR` (default `/data/backups`, same volume, so copy them off-host).
+  Operator CLI:
 
   ```bash
   npm run backup -- list
@@ -52,11 +59,21 @@ docker run -p 3000:3000 -e SESSION_SECRET=$(openssl rand -hex 32) -e TRUST_PROXY
   npm run backup -- recover              # only if a restore was interrupted: rolls back to the data before it (the server refuses to start until then)
   ```
 
-  In Docker, **stop the service first**, then run the restore in a one-off container against its volume (`--force`
-  is needed because the lock was written by the other container, and it cannot verify that container is stopped):
+  In Docker, **stop the service first**, then run the restore in a one-off container against its volume. `--force`
+  is needed because the lock was written by the other container, and the tool cannot verify that container is
+  stopped:
   `docker run --rm -v forge-data:/data forge-studio node --import tsx scripts/backup.ts restore <snapshot> --force`
-  (`--force` is needed because the lock was written by a different container; make sure the service is stopped).
 * All settings: [.env.example](.env.example).
+
+### Tests against PostgreSQL
+
+```bash
+TEST_DATABASE_URL='postgres://postgres@127.0.0.1:5432/postgres?sslmode=disable' npm test   # + PostgreSQL contract & Phase 2 gate tests
+TEST_DATABASE_URL=... TEST_STORAGE_BACKEND=postgres npm test                               # every test server on PostgreSQL
+```
+
+Without `TEST_DATABASE_URL` the PostgreSQL tests are reported as **skipped** (not passed); CI sets
+`REQUIRE_PG_TESTS=1`, which turns a missing database into a failure. Backup tests need `age` and `pg_dump`.
 
 ## Documentation
 

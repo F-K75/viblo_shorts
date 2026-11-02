@@ -6,14 +6,23 @@ import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { startTestServer, guestToken, type TestServer } from './helpers/server.ts';
+import pg from 'pg';
+import { startTestServer, guestToken, TEST_BACKEND, healthDetails, type TestServer } from './helpers/server.ts';
+import { createTestDatabase } from './helpers/pg.ts';
+
+// These tests exercise the JSON file backend directly (corrupting files, on-volume snapshots). On PostgreSQL the
+// same guarantees are proven by tests/phase2.test.ts; here they are reported as SKIPPED, never as passed.
+const jsonOnly = TEST_BACKEND === 'postgres' ? 'JSON-backend specific (file corruption / volume snapshots) — PostgreSQL equivalents in tests/phase2.test.ts' : false;
 import { startGeminiStub } from './helpers/geminiStub.ts';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
 const KB = 1024;
 const servers: TestServer[] = [];
+const cleanups: Array<() => Promise<unknown>> = [];
 after(async () => {
   for (const s of servers) await s.stop().catch(() => {});
+  // also runs when a test fails midway (an open stub server would otherwise keep the test process alive)
+  for (const c of cleanups) await c().catch(() => {});
 });
 async function boot(env: Record<string, string> = {}) {
   const s = await startTestServer(env);
@@ -113,7 +122,13 @@ describe('FS-001 storage abuse', () => {
     // Layout-agnostic size (works for the legacy single file too, so this test also measures the old code).
     const dirBytes = (d: string): number => (fs.existsSync(d) ? fs.readdirSync(d).reduce((acc, f) => acc + fs.statSync(path.join(d, f)).size, 0) : 0);
     const legacyFile = path.join(s.dataDir, 'projects.json');
-    const totalMb = (dirBytes(path.join(s.dataDir, 'projects')) + (fs.existsSync(legacyFile) ? fs.statSync(legacyFile).size : 0)) / 1e6;
+    let totalMb = (dirBytes(path.join(s.dataDir, 'projects')) + (fs.existsSync(legacyFile) ? fs.statSync(legacyFile).size : 0)) / 1e6;
+    if (s.databaseUrl) {
+      const c = new pg.Client({ connectionString: s.databaseUrl.replace(/[?&]sslmode=disable/, '') });
+      await c.connect();
+      totalMb = Number((await c.query('SELECT coalesce(sum(size_bytes), 0) AS b FROM projects')).rows[0].b) / 1e6;
+      await c.end();
+    }
     const afterL = await latencies(s, victim);
     const vList = (await (await call(s, '/api/projects', victim)).json()).projects;
     t.diagnostic(`store size ${totalMb.toFixed(1)} MB; victim p95 before ${p95(before).toFixed(1)} ms, after ${p95(afterL).toFixed(1)} ms`);
@@ -125,7 +140,7 @@ describe('FS-001 storage abuse', () => {
 });
 
 describe('FS-002 corruption cannot cause global data loss', () => {
-  test('a corrupt shard affects only its owner, is never overwritten; other users keep saving', async () => {
+  test('a corrupt shard affects only its owner, is never overwritten; other users keep saving', { skip: jsonOnly }, async () => {
     const s = await boot();
     const a = await guestToken(s.baseUrl);
     const b = await guestToken(s.baseUrl);
@@ -152,7 +167,7 @@ describe('FS-002 corruption cannot cause global data loss', () => {
     assert.equal(fs.readdirSync(path.dirname(aFile)).filter((f) => f.includes('.corrupt-')).length, 1);
   });
 
-  test('a corrupt shared store (jobs.json) fails closed: 503, readiness down, file untouched', async () => {
+  test('a corrupt shared store (jobs.json) fails closed: 503, readiness down, file untouched', { skip: jsonOnly }, async () => {
     const s = await boot();
     const a = await guestToken(s.baseUrl);
     const jobsFile = path.join(s.dataDir, 'jobs.json');
@@ -166,7 +181,7 @@ describe('FS-002 corruption cannot cause global data loss', () => {
     assert.equal((await ready.json()).checks.stores, false);
   });
 
-  test('legacy single-file store: verified backup, migration to per-user shards, nothing lost', async () => {
+  test('legacy single-file store: verified backup, migration to per-user shards, nothing lost', { skip: jsonOnly }, async () => {
     const dataDir = tmpDataDir();
     const legacy = [
       { id: 'proj_legacy_1', userId: 'legacy-alice', title: 'Alice 1', updatedAt: '2026-10-01T00:00:00Z' },
@@ -191,7 +206,7 @@ describe('FS-002 corruption cannot cause global data loss', () => {
     fs.rmSync(dataDir, { recursive: true, force: true });
   });
 
-  test('corrupt legacy store: migration refused, file untouched, project routes 503', async () => {
+  test('corrupt legacy store: migration refused, file untouched, project routes 503', { skip: jsonOnly }, async () => {
     const dataDir = tmpDataDir();
     fs.writeFileSync(path.join(dataDir, 'projects.json'), '[{"id":"proj_1","userId":"u"');
     const s = await boot({ DATA_DIR: dataDir });
@@ -206,7 +221,7 @@ describe('FS-002 corruption cannot cause global data loss', () => {
 });
 
 describe('Backups', () => {
-  test('snapshot -> user loses data -> restore (server stopped) -> original projects are back', async () => {
+  test('snapshot -> user loses data -> restore (server stopped) -> original projects are back', { skip: jsonOnly }, async () => {
     const dataDir = tmpDataDir();
     const env = { DATA_DIR: dataDir, BACKUP_INTERVAL_HOURS: '0' };
     const cli = (...args: string[]) => spawnSync(process.execPath, ['--import', 'tsx', 'scripts/backup.ts', ...args], { cwd: ROOT, env: { ...process.env, DATA_DIR: dataDir }, encoding: 'utf8' });
@@ -243,11 +258,11 @@ describe('Backups', () => {
     fs.rmSync(dataDir, { recursive: true, force: true });
   });
 
-  test('server takes a verified scheduled snapshot at startup and reports it in /api/health', async () => {
+  test('server takes a verified scheduled snapshot at startup and reports it in /api/health', { skip: jsonOnly }, async () => {
     const s = await boot();
     let backups: any = null;
     for (let i = 0; i < 20 && !backups?.last; i++) {
-      backups = (await (await call(s, '/api/health')).json()).backups;
+      backups = (await healthDetails(s.baseUrl)).backups;
       if (!backups?.last) await new Promise((r) => setTimeout(r, 100));
     }
     assert.ok(backups.last, JSON.stringify(backups));
@@ -258,9 +273,16 @@ describe('Backups', () => {
 describe('FS-007 AI quota', () => {
   test('concurrent requests cannot exceed the daily quota; usage survives a restart', async () => {
     const stub = await startGeminiStub();
+    cleanups.push(() => stub.close());
     stub.delayMs = 400; // all requests are in flight at the same time
     const dataDir = tmpDataDir();
-    const env = { DATA_DIR: dataDir, GEMINI_API_KEY: 'stub-key-0123456789', GEMINI_BASE_URL: stub.baseUrl, GEMINI_MODELS: 'stub-model', FREE_DAILY_AI_QUOTA: '3' };
+    const env: Record<string, string> = { DATA_DIR: dataDir, GEMINI_API_KEY: 'stub-key-0123456789', GEMINI_BASE_URL: stub.baseUrl, GEMINI_MODELS: 'stub-model', FREE_DAILY_AI_QUOTA: '3' };
+    // "Restart" must keep the same store: on PostgreSQL that means the same database for both boots.
+    const sharedDb = TEST_BACKEND === 'postgres' ? await createTestDatabase({ migrate: false }) : null;
+    if (sharedDb) {
+      env.DATABASE_URL = sharedDb.url;
+      cleanups.push(() => sharedDb.drop());
+    }
     let s = await boot(env);
     let u = s.signFirebaseToken({ sub: 'quota-user' });
     const responses = await Promise.all(
@@ -279,12 +301,12 @@ describe('FS-007 AI quota', () => {
     assert.equal((await (await call(s, '/api/quota', u)).json()).dailyQuotaUsed, 3, 'usage persisted across restart');
     assert.equal((await call(s, '/api/gemini/suggest-hooks', u, { method: 'POST', body: JSON.stringify({ topic: 'x' }) })).status, 429);
     await stopServer(s);
-    await stub.close();
     fs.rmSync(dataDir, { recursive: true, force: true });
   });
 
   test('failed AI calls, template fallbacks and invalid requests do not consume quota', async () => {
     const stub = await startGeminiStub();
+    cleanups.push(() => stub.close());
     stub.mode = 'fail';
     const s = await boot({ GEMINI_API_KEY: 'stub-key-0123456789', GEMINI_BASE_URL: stub.baseUrl, GEMINI_MODELS: 'stub-model', FREE_DAILY_AI_QUOTA: '2' });
     const u = s.signFirebaseToken({ sub: 'refund-user' });
@@ -302,7 +324,6 @@ describe('FS-007 AI quota', () => {
     const ok = await call(s, '/api/gemini/suggest-hooks', u, { method: 'POST', body: JSON.stringify({ topic: 'sleep' }) });
     assert.equal((await ok.json()).isFallback, false);
     assert.equal((await (await call(s, '/api/quota', u)).json()).dailyQuotaUsed, 1);
-    await stub.close();
   });
 });
 
@@ -337,7 +358,7 @@ describe('FS-008 proxy configuration', () => {
     const s = await boot();
     const g = await guestToken(s.baseUrl);
     await call(s, '/api/projects', g, { headers: { 'x-forwarded-for': '1.2.3.4' } });
-    const h = await (await call(s, '/api/health')).json();
+    const h = await healthDetails(s.baseUrl);
     assert.ok(h.proxy.untrustedForwardedRequests >= 1);
   });
 });
@@ -376,7 +397,7 @@ describe('Crash scenarios and limit bypasses', () => {
     for (const id of active) await call(s2, `/api/jobs/${id}/cancel`, g2, { method: 'POST' });
   });
 
-  test('async route failures reach the error handler (no unhandled rejection, server keeps serving)', async () => {
+  test('async route failures reach the error handler (no unhandled rejection, server keeps serving)', { skip: jsonOnly }, async () => {
     const s = await boot();
     const g = await guestToken(s.baseUrl);
     fs.writeFileSync(path.join(s.dataDir, 'subscriptions.json'), '{bad');

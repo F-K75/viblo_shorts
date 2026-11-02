@@ -2,7 +2,7 @@
 // Usage: npm run test:load  (env: CONCURRENCY=20 REQUESTS=400)
 // Note: per-IP rate limits apply, so all traffic from one machine shares limits; the script reports 429s
 // separately so latency figures only include served requests.
-import { startTestServer, guestToken } from '../tests/helpers/server.ts';
+import { startTestServer, guestToken, healthDetails } from '../tests/helpers/server.ts';
 
 const CONCURRENCY = Number(process.env.CONCURRENCY || 20);
 const REQUESTS = Number(process.env.REQUESTS || 400);
@@ -41,7 +41,7 @@ const srv = await startTestServer();
 try {
   const tokens = await Promise.all(Array.from({ length: 5 }, () => guestToken(srv.baseUrl)));
   const auth = (i: number) => ({ authorization: `Bearer ${tokens[i % tokens.length]}`, 'content-type': 'application/json' });
-  const mem0 = (await (await fetch(`${srv.baseUrl}/api/health`)).json()).system;
+  const mem0 = (await healthDetails(srv.baseUrl)).system;
 
   await run('GET /api/health', REQUESTS, () => fetch(`${srv.baseUrl}/api/health`));
   await run('POST /api/projects (save)', 60, (i) =>
@@ -62,7 +62,7 @@ try {
     body: JSON.stringify({ title: 'Load', duration: 15, resolution: '1080p', beats: [{ text: 'hello', start_s: 0, end_s: 3 }] }),
   });
   console.log(`render 15s@1080p              status=${r.status} wall=${(performance.now() - t0).toFixed(0)}ms`);
-  const mem1 = (await (await fetch(`${srv.baseUrl}/api/health`)).json()).system;
+  const mem1 = (await healthDetails(srv.baseUrl)).system;
   console.log(`server rss: ${mem0.rssMb}MB -> ${mem1.rssMb}MB, heapUsed ${mem0.heapUsedMb}MB -> ${mem1.heapUsedMb}MB`);
 } finally {
   await srv.stop();

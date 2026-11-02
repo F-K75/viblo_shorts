@@ -8,7 +8,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import { execFileSync } from 'node:child_process';
-import { startTestServer, type TestServer } from '../helpers/server.ts';
+import { startTestServer, TEST_BACKEND, type TestServer } from '../helpers/server.ts';
 
 const require = createRequire(import.meta.url);
 let chromium: any = null;
@@ -23,7 +23,7 @@ const skip = !chromium ? 'playwright not installed' : !hasDist ? 'dist/ missing 
 let srv: TestServer;
 before(async () => {
   if (skip) return;
-  srv = await startTestServer({ NODE_ENV: 'production', TRUST_PROXY: 'none' });
+  srv = await startTestServer({ NODE_ENV: 'production', TRUST_PROXY: 'none', ...(TEST_BACKEND === 'json' ? { STORAGE_BACKEND: 'json' } : {}) });
 });
 after(async () => srv?.stop());
 

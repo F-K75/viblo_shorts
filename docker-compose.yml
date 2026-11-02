@@ -7,6 +7,7 @@ services:
     environment:
       NODE_ENV: production
       DATA_DIR: /data
+      # .env must set DATABASE_URL (managed PostgreSQL), or STORAGE_BACKEND=json for an explicit single instance.
     volumes:
       - forge-data:/data
     restart: unless-stopped

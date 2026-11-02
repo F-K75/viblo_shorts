@@ -6,6 +6,10 @@ import fs from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
+import { createTestDatabase, type TestDb } from './pg.ts';
+
+/** Backend under test: TEST_STORAGE_BACKEND=postgres runs every test server on its own fresh PostgreSQL database. */
+export const TEST_BACKEND: 'json' | 'postgres' = process.env.TEST_STORAGE_BACKEND === 'postgres' ? 'postgres' : 'json';
 
 export const FIREBASE_TEST_PROJECT = 'forge-test-project';
 
@@ -15,6 +19,8 @@ export interface TestServer {
   signFirebaseToken: (claims: Record<string, unknown>) => string;
   stop: () => Promise<void>;
   logs: () => string;
+  /** Present when the server runs on PostgreSQL (fresh database per server unless DATABASE_URL was passed in). */
+  databaseUrl?: string;
 }
 
 async function freePort(): Promise<number> {
@@ -28,14 +34,29 @@ async function freePort(): Promise<number> {
   });
 }
 
+const TEST_SIGNING_KEYS = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 });
+/** Diagnostics credential for /api/health/details in tests (R-12: details are not public). */
+export const HEALTH_TOKEN = crypto.randomBytes(24).toString('hex');
+export const healthDetails = async (baseUrl: string) =>
+  (await fetch(`${baseUrl}/api/health/details`, { headers: { authorization: `Bearer ${HEALTH_TOKEN}` } })).json() as Promise<any>;
+
 export async function startTestServer(extraEnv: Record<string, string> = {}): Promise<TestServer> {
   const port = await freePort();
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-test-data-'));
-  const { privateKey, publicKey } = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 });
+  // One signing key per test process: like production (all instances trust Google's certs), every test server
+  // accepts every test token, so multi-instance tests can send one user's token to any instance.
+  const { privateKey, publicKey } = TEST_SIGNING_KEYS;
   const kid = 'integration-kid';
   const certsFile = path.join(dataDir, 'test-certs.json');
   fs.writeFileSync(certsFile, JSON.stringify({ [kid]: publicKey.export({ type: 'spki', format: 'pem' }) }));
 
+  let testDb: TestDb | null = null;
+  const env: Record<string, string> = { ...extraEnv };
+  if (TEST_BACKEND === 'postgres' && env.DATABASE_URL === undefined && env.STORAGE_BACKEND !== 'json') {
+    testDb = await createTestDatabase({ migrate: false }); // the server applies migrations itself, as in production
+    await testDb.pool.end();
+    env.DATABASE_URL = testDb.url;
+  }
   let output = '';
   const child: ChildProcess = spawn(process.execPath, ['--import', 'tsx', 'server.ts'], {
     cwd: path.resolve(import.meta.dirname, '..', '..'),
@@ -49,7 +70,8 @@ export async function startTestServer(extraEnv: Record<string, string> = {}): Pr
       FIREBASE_CERTS_FILE: certsFile,
       GEMINI_API_KEY: '',
       PEXELS_API_KEY: '',
-      ...extraEnv,
+      HEALTH_DETAILS_TOKEN: HEALTH_TOKEN,
+      ...env,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -58,15 +80,23 @@ export async function startTestServer(extraEnv: Record<string, string> = {}): Pr
 
   const baseUrl = `http://127.0.0.1:${port}`;
   const deadline = Date.now() + 30000;
+  let healthy = false;
   while (Date.now() < deadline) {
     if (child.exitCode !== null) throw new Error(`Server exited early:\n${output}`);
     try {
       const r = await fetch(`${baseUrl}/api/health`);
-      if (r.ok) break;
+      if (r.ok) {
+        healthy = true;
+        break;
+      }
     } catch {
       // not up yet
     }
     await new Promise((r) => setTimeout(r, 200));
+  }
+  if (!healthy) {
+    child.kill('SIGKILL');
+    throw new Error(`Server did not become healthy within 30 s:\n${output}`);
   }
 
   const signFirebaseToken = (claims: Record<string, unknown>) => {
@@ -89,6 +119,7 @@ export async function startTestServer(extraEnv: Record<string, string> = {}): Pr
     dataDir,
     signFirebaseToken,
     logs: () => output,
+    databaseUrl: env.DATABASE_URL || undefined,
     stop: async () => {
       child.kill('SIGTERM');
       await new Promise((r) => {
@@ -100,6 +131,7 @@ export async function startTestServer(extraEnv: Record<string, string> = {}): Pr
         }, 5000);
       });
       fs.rmSync(dataDir, { recursive: true, force: true });
+      if (testDb) await testDb.drop().catch(() => {});
     },
   };
 }

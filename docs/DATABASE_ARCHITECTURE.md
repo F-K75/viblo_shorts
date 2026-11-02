@@ -1,6 +1,8 @@
 # Data / Storage Architecture
 
-> Phase 1 (interim) layout. PostgreSQL replaces it in Phase 2; until then the server is **single-instance only**.
+> **This document describes the JSON backend** (`STORAGE_BACKEND=json`: development default, rollback target,
+> single instance only). Production uses PostgreSQL: schema in `server/db/migrations/`, decisions in
+> [ARCHITECTURE_DECISIONS.md](ARCHITECTURE_DECISIONS.md), backups in [BACKUP_AND_RECOVERY.md](BACKUP_AND_RECOVERY.md).
 
 There is no database. Persistence is JSON files under `DATA_DIR` (default `./data`, `/data` in Docker).
 

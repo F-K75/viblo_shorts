@@ -1,0 +1,29 @@
+# syntax=docker/dockerfile:1
+# Off-site backup runner (ADR-006): pg_dump | age -> S3-compatible storage.
+# Run on a schedule from your platform (Kubernetes CronJob, Cloud Scheduler, cron), e.g.:
+#   docker run --rm --env-file backup.env forge-backup create
+# backup.env: DATABASE_URL, BACKUP_TARGET=s3://bucket/prefix, S3_ENDPOINT (non-AWS), AWS_ACCESS_KEY_ID,
+#             AWS_SECRET_ACCESS_KEY, BACKUP_AGE_RECIPIENTS=age1...  (public keys only; never the private key)
+FROM oven/bun:1.4 AS deps
+WORKDIR /app
+COPY package.json bun.lock ./
+RUN bun install --frozen-lockfile --production
+
+FROM node:22-bookworm-slim
+# pg_dump must be >= the server major version. Debian bookworm ships 15, so use the PGDG repository (client 17
+# dumps servers 9.2-17).
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates curl gnupg age tini \
+ && install -d /usr/share/postgresql-common/pgdg \
+ && curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+ && echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt bookworm-pgdg main" > /etc/apt/sources.list.d/pgdg.list \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends postgresql-client-17 \
+ && apt-get purge -y gnupg && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY --from=deps /app/node_modules ./node_modules
+COPY package.json ./
+COPY server ./server
+COPY scripts/db-backup.ts ./scripts/db-backup.ts
+USER node
+ENTRYPOINT ["/usr/bin/tini", "--", "node", "--import", "tsx", "scripts/db-backup.ts"]
