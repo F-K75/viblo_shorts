@@ -227,6 +227,31 @@ for (const kind of ['json', 'postgres'] as const) {
       assert.equal((await r.getSubscription('uc'))!.monthlyRenderMinutesUsed, 0.5);
     });
 
+    test('jobs (Track B, F7): recovery cannot double-charge: a stale worker that finishes after reassignment is refused', async () => {
+      const r = await makeRepo(kind);
+      const def = { plan: 'free' as const, status: 'active' as const, monthlyRenderMinutesUsed: 0, currentPeriodEnd: '2026-12-01T00:00:00.000Z' };
+      await r.insertJob({ id: 'job_re1', userId: 'ur', type: 'render_video', status: 'queued', progress: 5, createdAt: '2026-01-01T00:00:01.000Z', payload: { duration: 30 } });
+      const first = (await r.claimNextJob('w-old', 1))!;
+      await new Promise((res) => setTimeout(res, 50));
+      assert.deepEqual(await r.reapStaleJobs(10, 2), { requeued: 1, failed: 0 }, 'w-old looks dead: requeued');
+      const second = (await r.claimNextJob('w-new', 1))!;
+      assert.equal(second.attempts, 2);
+      const fin = (j: typeof first) => ({ ...j, status: 'completed' as const, progress: 100, completedAt: new Date().toISOString() });
+      assert.equal(await r.completeJob(fin(first), 'w-old', 30, def), false, 'the old worker finished late: refused, not charged');
+      assert.equal(await r.completeJob(fin(second), 'w-new', 30, def), true);
+      assert.equal(await r.completeJob(fin(second), 'w-new', 30, def), false, 'a retried completion is refused');
+      assert.equal((await r.requeueJob('job_re1')).job, null, 'a completed job cannot be retried (and so cannot be charged again)');
+      assert.equal((await r.getSubscription('ur'))!.monthlyRenderMinutesUsed, 0.5);
+    });
+
+    test('jobs (Track B): failed jobs are never charged', async () => {
+      const r = await makeRepo(kind);
+      await r.insertJob({ id: 'job_f1', userId: 'uf', type: 'render_video', status: 'queued', progress: 5, createdAt: '2026-01-01T00:00:01.000Z', payload: { duration: 30 } });
+      const c = (await r.claimNextJob('w', 1))!;
+      assert.equal(await r.finishJob({ ...c, status: 'failed', error: 'boom', completedAt: new Date().toISOString() }, 'w'), true);
+      assert.equal(await r.getSubscription('uf'), null);
+    });
+
     test('subscriptions: absent by default, put/get, render minutes accumulate', async () => {
       const r = await makeRepo(kind);
       assert.equal(await r.getSubscription('u'), null);
@@ -314,6 +339,19 @@ describe('PostgreSQL specifics', { skip: pgSkip }, () => {
     const { rows } = await db.pool.query("SELECT user_id, count(*)::int AS n FROM jobs WHERE status = 'processing' GROUP BY user_id");
     assert.ok(rows.every((x: any) => x.n === 1), JSON.stringify(rows));
     assert.equal(await r.claimNextJob('more', 1), null, 'every user is at the cap');
+  });
+
+  test('jobs (Track B, F7): concurrent duplicate completions of one job commit exactly one charge', async () => {
+    const db = await createTestDatabase();
+    dbs.push(db);
+    const r = new PostgresRepo(db.pool, limits);
+    const def = { plan: 'free' as const, status: 'active' as const, monthlyRenderMinutesUsed: 0, currentPeriodEnd: '2026-12-01T00:00:00.000Z' };
+    await r.insertJob({ id: 'job_dup', userId: 'dup-u', type: 'render_video', status: 'queued', progress: 5, createdAt: new Date().toISOString(), payload: { duration: 30 } });
+    const c = (await r.claimNextJob('w', 1))!;
+    const fin = { ...c, status: 'completed' as const, progress: 100, completedAt: new Date().toISOString() };
+    const out = await Promise.all(Array.from({ length: 10 }, () => r.completeJob(fin, 'w', 30, def)));
+    assert.equal(out.filter(Boolean).length, 1, JSON.stringify(out));
+    assert.equal((await r.getSubscription('dup-u'))!.monthlyRenderMinutesUsed, 0.5);
   });
 
   test('jobs (Track B): the global queue cap is exact under concurrent admissions', async () => {
