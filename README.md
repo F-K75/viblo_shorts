@@ -48,6 +48,22 @@ docker run -p 3000:3000 -e SESSION_SECRET=$(openssl rand -hex 32) -e TRUST_PROXY
 * **Backups:** encrypted off-site `pg_dump` backups with `Dockerfile.backup` / `npm run db-backup`, plus
   provider PITR — see [docs/BACKUP_AND_RECOVERY.md](docs/BACKUP_AND_RECOVERY.md) (RPO/RTO, restore, cut-over
   from JSON with `npm run data-migration -- plan|migrate|export`).
+* **JSON backend snapshots** (`STORAGE_BACKEND=json`, single instance): verified snapshots every
+  `BACKUP_INTERVAL_HOURS` into `BACKUP_DIR` (default `/data/backups`, same volume, so copy them off-host).
+  Operator CLI:
+
+  ```bash
+  npm run backup -- list
+  npm run backup -- verify <snapshot>
+  npm run backup -- restore <snapshot>   # server must be stopped; all-or-nothing; current data is snapshotted and moved aside first
+  npm run backup -- recover              # only if a restore was interrupted: rolls back to the data before it (the server refuses to start until then)
+  ```
+
+  In Docker, **stop the service first**, then run the restore in a one-off container against its volume. `--force`
+  is needed because the lock was written by the other container, and the tool cannot verify that container is
+  stopped:
+  `docker run --rm -v forge-data:/data forge-studio node --import tsx scripts/backup.ts restore <snapshot> --force`
+* All settings: [.env.example](.env.example).
 
 ### Tests against PostgreSQL
 

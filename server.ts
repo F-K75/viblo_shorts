@@ -36,7 +36,7 @@ import { ProjectOwnershipError, type Repo, type ServerJob, type StoredSubscripti
 import { PostgresRepo } from './server/db/pgRepo.ts';
 import { createPool, isUnavailable, isRetryableTxError, txRetryCount } from './server/db/pool.ts';
 import { migrate } from './server/db/migrate.ts';
-import { createSnapshot, listSnapshots, pruneSnapshots, writeServerLock, removeServerLock } from './server/lib/backup.ts';
+import { createSnapshot, listSnapshots, pruneSnapshots, writeServerLock, removeServerLock, restoreInProgressReason } from './server/lib/backup.ts';
 import { cleanAndParseJSON, validateScript, normalizeHashtags, quoteUserInput } from './server/lib/llm.ts';
 
 dotenv.config();
@@ -144,6 +144,17 @@ let jsonMigrationNote = '';
 
 async function initStorage(): Promise<void> {
   if (STORAGE_BACKEND === 'json') {
+    // J1 invariant: never open the JSON stores while a snapshot restore is running or was interrupted. These must
+    // stay the FIRST statements of this branch, before JsonRepo touches any file. The lock is written first and the
+    // restore journal checked second; a restore creates its journal first and re-checks the lock second, so
+    // whichever starts later always sees the other and backs off (tests/restore_atomic.test.ts).
+    writeServerLock(DATA_DIR);
+    const restoring = restoreInProgressReason(DATA_DIR);
+    if (restoring) {
+      removeServerLock(DATA_DIR);
+      console.error(`[Startup] Refusing to start: ${restoring}`);
+      process.exit(1);
+    }
     const r = new JsonRepo(DATA_DIR, BACKUP_DIR, STORE_LIMITS, IS_TEST ? 50 : 1000);
     const report = r.init();
     if (report.migrated) jsonMigrationNote = ` (migrated ${report.records} from legacy file; snapshot ${report.snapshot})`;
@@ -2677,8 +2688,8 @@ export async function startServer(): Promise<Server> {
     timers.push(t);
   };
   if (repo.kind === 'json') {
-    // JSON mode only: single-instance lock + on-volume snapshots (PostgreSQL uses database backups instead).
-    writeServerLock(DATA_DIR);
+    // JSON mode only: on-volume snapshots (PostgreSQL uses database backups instead). The single-instance lock was
+    // already written in initStorage(), before any store was opened (J1).
     if (BACKUP_INTERVAL_HOURS > 0) {
       const first = setTimeout(runScheduledBackup, IS_TEST ? 0 : 30000);
       first.unref();

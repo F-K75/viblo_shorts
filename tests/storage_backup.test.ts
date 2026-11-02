@@ -148,6 +148,11 @@ test('restore refuses a tampered snapshot and refuses while the server lock is h
   const lock = JSON.parse(fs.readFileSync(lockFile, 'utf8'));
   fs.writeFileSync(lockFile, JSON.stringify({ ...lock, pid: process.ppid }));
   assert.throws(() => restoreSnapshot(dir, backups, path.join(backups, good.name)), /server may be running/);
+  // J1: --force never overrides a provably running LOCAL server (it could observe the swap) ...
+  assert.throws(() => restoreSnapshot(dir, backups, path.join(backups, good.name), { force: true }), /server process \d+ is running/);
+  // ... it only overrides a lock written on another host, which cannot be checked from here
+  fs.writeFileSync(lockFile, JSON.stringify({ ...lock, hostname: 'other-container', pid: 1 }));
+  assert.throws(() => restoreSnapshot(dir, backups, path.join(backups, good.name)), /lock held by host "other-container"/);
   assert.doesNotThrow(() => restoreSnapshot(dir, backups, path.join(backups, good.name), { force: true }));
 });
 
