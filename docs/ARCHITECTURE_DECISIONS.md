@@ -125,15 +125,25 @@ observation window has passed (proposal: 30 days). Deleting them needs your expl
 * `pg_dump -Fc` is piped straight into `age` (X25519 public-key encryption), so **plaintext never touches disk**.
   The backup job holds only public keys; the private key is kept offline by operators. A compromised server or
   bucket cannot read backups.
+* **Consistent manifest (F1).** The backup holds one `REPEATABLE READ READ ONLY` transaction, exports its
+  snapshot, records the per-table row counts inside it, and runs `pg_dump --snapshot=<id>`. Manifest and dump
+  describe the same instant, so restore verification is exact even under live traffic (it was not before: every
+  backup taken under writes failed verification). The backup job must connect directly or via a session-mode
+  pooler.
 * The ciphertext goes to `BACKUP_TARGET=s3://bucket/prefix` (AWS S3, R2, B2, GCS interop, MinIO…) with a
   manifest: SHA-256, size, schema version, per-table row counts. The manifest is written last, so a listed
   backup is complete.
 * Restore verifies the checksum, decrypts, converts with `pg_restore -f -` to SQL, drops only header session
-  settings the target server does not know, and applies it with `psql --single-transaction -v ON_ERROR_STOP=1`
+  settings the target server does not know, and applies it with `psql -v ON_ERROR_STOP=1` inside one transaction
   into an **empty** database. It then verifies row counts, and you switch `DATABASE_URL` (restore-then-switch,
-  never in place). Why the SQL path: `pg_dump` must be ≥ the server version, but a newer `pg_dump` (17+) writes
+  never in place). **Atomicity (F2):** the tool, not psql, owns the transaction. It sends `BEGIN` first and
+  `COMMIT` only after decryption, `pg_restore` and the filter have all exited successfully; any failure, or
+  the tool itself being killed, ends without `COMMIT` and the server rolls back. (`psql --single-transaction`
+  was used before and committed a partial restore whenever an upstream stage died, because that looks like end
+  of input.) The target URL is read from `RESTORE_DATABASE_URL`, never from the command line (F3). Why the SQL path: `pg_dump` must be ≥ the server version, but a newer `pg_dump` (17+) writes
   `SET transaction_timeout`, which a 16 server rejects. CI caught this with `pg_dump` 18 against server 16; a
-  direct `pg_restore` aborted. Every other error still aborts the restore, and no partial restore is left behind.
+  direct `pg_restore` aborted. Every other error aborts the restore with nothing committed (tested failure
+  matrix: tests/backup_restore.test.ts).
 * `file://` targets are disabled unless `BACKUP_ALLOW_FILE_TARGET=1` (tests, or a mounted *remote* filesystem).
   Same-disk backups are never the only copy.
 * Recommended bucket settings: versioning plus object lock (immutability), a lifecycle rule for retention, and a

@@ -5,7 +5,11 @@
 > the quota and job paths in `server.ts`, and `scripts/db-backup.ts`.
 > Method: read the code, then reproduce each suspected defect against PostgreSQL 16 before listing it as
 > confirmed. **[R]** = reproduced in this session · **[A]** = by code analysis, not yet reproduced.
-> **Result: PR #3 is not ready to merge.** Two P1 defects in the backup/restore path were found and reproduced.
+> **Update 2026-11-02:** F1, F2, F3, F5 and F6 are **fixed** in PR #3, each red-first. Two further restore defects
+> found by the new tests (F2a unhandled rejection, F2b back-pressure stall) are fixed as well. Evidence:
+> PR3_REVIEW_PACKAGE §11. F4 and F7–F11 remain open, as tracked below.
+>
+> **Original result: PR #3 was not ready to merge.** Two P1 defects in the backup/restore path were found and reproduced.
 > They were not caught by the existing tests, because those tests take backups of an idle database and never
 > fail a restore stage midway.
 
@@ -43,6 +47,18 @@
 * **Migrations:** one transaction, advisory lock, `SET LOCAL` timeouts (integer-floored, so the interpolation is safe), checksums, rejection of statements that can't run inside a transaction, and `attempts: 1`.
 * **Backup:** plaintext never reaches disk; recipients are validated as `age1…`; temp directories are cleaned in `finally`; the restore is gated on an empty target and decrypts only after the checksum matches.
 * **Error mapping:** async errors reach the central handler via `forwardErrors`; conflicts give 503 `conflict_retry` and database outages give 503 `database_unavailable`.
+
+## 1a. Resolution (2026-11-02)
+| # | Status |
+|---|---|
+| F1 | ✅ Fixed `af7d58c`: snapshot-consistent manifest |
+| F2 | ✅ Fixed `168abe3`: tool-owned transaction; also F2a (unhandled rejection) and F2b (back-pressure stall) |
+| F3 | ✅ Fixed `d782ebd`: `RESTORE_DATABASE_URL` only |
+| F4 | Open: AWS design (Phase 4 prep) |
+| F5 | ✅ Fixed `288149f`: backward-compatible marker |
+| F6 | ✅ Fixed `cf5432b`: strict file names, unique versions |
+| F7 | Open: Phase 2.5 (exactly-once render settlement) |
+| F8–F11 | Open: P3 hardening, follow-up |
 
 ## 2. Recommended disposition
 **Fix F1, F2 and F3 inside PR #3 before merge.** Backup and restore are Phase 2 deliverables, and shipping them with

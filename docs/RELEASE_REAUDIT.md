@@ -1,11 +1,49 @@
 # Forge Studio — Independent Re-audit + Corrective Round
 
-## PR #3 code review (2026-11-01): NOT ready to merge
-I reviewed the actual diff (docs/PR3_CODE_REVIEW.md). There are **2 new P1 defects in backup/restore, both reproduced**: F1, manifest row counts are
-not taken from the dump's snapshot, so every restore under traffic reports `verified:false`; F2, a failed restore stage
-commits a partial restore. There are also P2 findings: F3 (target URL in argv), F4 (backup authenticity) and F5 (old
-builds refuse a newer schema, which blocks rollback). The score of 55 is **provisional** and will be rescored after the
-fixes. Phase 2.5 design is approved with conditions (PHASE2_5_PLAN §7); it is not implemented.
+## Corrective round 2 (2026-11-02): F1, F2, F3, F5, F6 fixed in PR #3; awaiting your review
+* **Fixed, red-first:**
+  * F1: backup manifest taken from the dump's snapshot;
+  * F2: restore is all-or-nothing, plus two further restore defects found by the new failure tests (F2a
+    unhandled rejection, F2b back-pressure stall);
+  * F3: restore target never in argv;
+  * F5: previous release runs against a newer backward-compatible schema;
+  * F6: misnamed/duplicate migrations are errors.
+  Before/after evidence: PR3_REVIEW_PACKAGE §11.
+* **Backup/restore failure matrix now tested:**
+  * interrupted backup;
+  * corrupted backup (checksum mismatch, and a corrupt chunk with a rewritten checksum);
+  * wrong key;
+  * partial restore;
+  * connection loss during backup and during restore;
+  * non-empty target;
+  * repeated restore;
+  * orchestrator killed mid-restore;
+  * ownership and project-record preservation across two restores.
+* **Local gate:**
+  * typecheck ✅;
+  * JSON suite 141/139/0/2;
+  * PostgreSQL suite 141/132/0/9;
+  * backup/migration tests 3× 19/19;
+  * E2E 1/1 on both backends;
+  * build ✅.
+  * Docker runs in CI only (no daemon here).
+* **Still open:** F4 (backup authenticity, AWS design), F7 (render billing, Phase 2.5), F8–F11 (P3 hardening).
+* **Score: 55 → 58 (provisional).** The two P1 backup defects that made the 55 overstated are closed, and restore
+  is now verifiable under traffic. It stays far from release: R-01 (real Gemini → MP4) and R-03/R-04 remain
+  open, and nothing has run on real AWS.
+
+## PR #3 code review (2026-11-01)
+The diff review (docs/PR3_CODE_REVIEW.md) found 2 P1 defects in backup/restore, both reproduced:
+* F1: manifest row counts were not taken from the dump's snapshot, so every restore under traffic reported
+  `verified:false`;
+* F2: a failed restore stage committed a partial restore.
+
+It also found these P2 findings:
+* F3: target URL in argv;
+* F4: backup authenticity;
+* F5: old builds refuse a newer schema, which blocks rollback.
+
+Phase 2.5 design is approved with conditions (PHASE2_5_PLAN §7); it is not implemented.
 
 ## Corrective round (2026-11-01): R-02, R-11, R-12, R-14 fixed in PR #3 — awaiting your review
 
