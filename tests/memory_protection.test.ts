@@ -245,7 +245,8 @@ describe('C exit criterion: memory stays bounded under concurrent oversized and 
     const d = await healthDetails(s.baseUrl);
     const rss1 = d.system.rssMb;
     const statuses = results.map((r) => r.status ?? r.error);
-    assert.ok(results.slice(60).every((r) => r.status === 413), `oversized rejected: ${statuses.slice(60).join(',')}`);
+    assert.ok(results.slice(60).every((r) => r.status === 413), `every oversized upload gets its 413 (no broken pipe): ${statuses.slice(60).join(',')}`);
+    assert.ok(d.requests.rejectedTooLarge >= 20, 'refused from Content-Length, before any byte was read');
     assert.ok(d.requests?.largeBodiesInFlightMax !== undefined && d.requests.largeBodiesInFlightMax <= 4, `at most 4 large bodies in memory at once: ${JSON.stringify(d.requests)}`);
     assert.ok(results.slice(0, 60).some((r) => r.status === 503), 'excess uploads refused with backpressure');
     assert.equal((await fetch(`${s.baseUrl}/api/live`)).status, 200, 'the server stays healthy');
