@@ -1,5 +1,18 @@
 # Forge Studio — Independent Re-audit + Corrective Round
 
+## Phase 2.5 Track C (R-13): implemented on branch `claude/keen-feynman-xtbvz2-track-c`; awaiting PR review
+* **Red-first:** 8 tests, all failing on `be4c48e`.
+* **Fixed:**
+  * bodies are read only after authentication;
+  * route-specific body limits, enforced from `Content-Length` and while streaming;
+  * at most `BODY_CONCURRENCY` large bodies in flight (`503 busy` + `Retry-After`);
+  * a memory guard (`503 memory_pressure` and the instance drained via readiness, with hysteresis);
+  * slow headers and slow bodies disconnected.
+* **Exit criterion:** the same attack costs +15 to 18 MB RSS instead of +102 MB.
+* **Evidence:** `docs/PHASE2_5_TRACK_C.md`.
+* **Still open from R-13:** the earlier "1 to 6 unexplained dropped sockets" note. Follow-up: client auto-retry
+  for 503 `busy` / `memory_pressure`.
+
 ## Integration (2026-11-02): PR #2 merged; PR #3 retargeted to `main`; awaiting final PR #3 decision
 * **PR #2:**
   * J1 fixed red-first (the JSON restore is all-or-nothing, and the server and a restore can never overlap);
@@ -102,7 +115,7 @@ Readiness is tracked by milestone, not by the score (see the scorecard below). N
 | **Real Gemini generation never demonstrated** (non-negotiable: real API call → render → preview → export) | ❌ open: needs a `GEMINI_API_KEY` |
 | R-03 guest sign-up / guest pool DoS | ❌ open: proposal **approved**; implementation plan `docs/PHASE2_5_PLAN.md` §1 awaiting approval (Phase 2.5 PR after PR #3 merges) |
 | R-04 render queue flooding | ❌ open: approved; plan §2 (no guest server renders, fair queue, global cap) |
-| R-13 upload memory pressure (and 1–6 unexplained dropped sockets) | ❌ open: approved; plan §3 (route limits, semaphore, memory guard, streaming upload design) |
+| R-13 upload memory pressure (and 1–6 unexplained dropped sockets) | 🟡 Track C implemented, PR pending review (`docs/PHASE2_5_TRACK_C.md`); dropped-socket note still open; upload system out of scope |
 | Fake password reset (R-05) | ❌ open: Phase 3 |
 | Google Drive identity switching (R-06) | ❌ open: Phase 3 |
 | Guest project ownership / migration on sign-up (R-07) | ❌ open: Phase 3 |
