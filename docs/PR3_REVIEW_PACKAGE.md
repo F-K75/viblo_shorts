@@ -14,7 +14,7 @@ because it is stacked on #2.
 
 ---
 
-## 1. Commit summary (26 commits, in order)
+## 1. Commit summary (29 commits, in order)
 | # | Commit | Kind | What it does |
 |---|---|---|---|
 | 1 | `25e5b90` | feat(db) | Schema `0001_initial.sql`, migration runner, connection pool, `Repo` interface, `JsonRepo` (Phase 1 behaviour) and `PostgresRepo`; contract tests run on both |
@@ -42,7 +42,10 @@ because it is stacked on #2.
 | 23 | `d782ebd` | **fix(restore) F3** | Restore target only from `RESTORE_DATABASE_URL`; runbook recovery procedures |
 | 24 | `cf5432b` | **fix(migrations) F6** | Misnamed migration files and duplicate versions are errors |
 | 25 | `288149f` | **fix(migrations) F5** | Previous release runs against a newer backward-compatible schema |
-| 26 | *(this commit)* | docs | Corrective-round evidence in this package, the code review and the re-audit |
+| 26 | `7a3add5` | docs | Corrective-round evidence in this package, the code review and the re-audit |
+| 27 | `856ddf8` | **fix(migrations)** | The backward-compatible marker is validated (expand-only allow-list); unknown directives are errors |
+| 28 | `9f4d4d8` | **fix(restore)** | Exact target state at the COMMIT boundary; read-only `verify-restore`; F1 proof, COMMIT-boundary and F3 credential-scan tests |
+| 29 | *(final docs commit)* | docs | Final evidence package (§12) and CI results |
 
 ## 2. Changed-file inventory (50 files vs `194f5c5`; ≈ +6,200 / −422)
 **Application code**
@@ -261,3 +264,101 @@ diverged migration history refused.
 
 ### 11.4 CI on the final head
 *(filled in after the run; see the RELEASE_REAUDIT entry)*
+
+## 12. Final evidence package (answers to the review questions of 2026-11-02)
+
+### 12.1 F1–F6: definitions, root causes, commits
+| # | Definition | Root cause | Commits |
+|---|---|---|---|
+| F1 | A backup's manifest row counts must describe exactly the data inside that backup | Counts were read on a separate autocommit connection (each `count(*)` its own snapshot) **before** `pg_dump` took its own, later snapshot | `af7d58c` |
+| F2 | A restore must leave the target either complete or untouched, and the operator must always know which | `psql --single-transaction` commits at end of input; a dying upstream stage (or a killed orchestrator) looks exactly like end of input. Plus F2a: a fast `age` failure became an unhandled rejection; F2b: an early psql exit stalled the pipeline forever; and the state after a failure around COMMIT was reported ambiguously | `168abe3`, `9f4d4d8` |
+| F3 | No database credential in any process's arguments, logs or error output | The restore CLI took the target URL (with password) as an argument | `d782ebd` (+ scan test in `9f4d4d8`) |
+| F4 | Backups must be authentic, not only intact | Checksum in the same bucket; age encrypts with a public key | **Open**: AWS design (Object Lock, write-only role, separate account, signed manifests) |
+| F5 | The previous release must run against a newer schema when (and only when) the newer migrations are backward-compatible | Every applied migration unknown to the build was fatal; afterwards, the compatibility marker was trusted blindly | `288149f`, `856ddf8` |
+| F6 | No migration file may ever be skipped or misread silently | The name pattern was used as a filter; duplicate versions unchecked; unknown directives ignored | `cf5432b`, `856ddf8` |
+
+### 12.2 F1: the row counts and pg_dump read the same exported snapshot
+* Code path (`createBackup`):
+  1. `BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY`;
+  2. `SELECT pg_export_snapshot()` returns an id;
+  3. `countRows()` runs **on that same connection, inside that transaction**;
+  4. `pg_dump --snapshot=<id>`. The exporting transaction stays open until `pg_dump` has finished, and is then
+     rolled back (it is read-only). PostgreSQL only lets `pg_dump` import the snapshot while that transaction is
+     open, so a wrong or expired id makes `pg_dump` fail rather than silently use a new snapshot.
+* **Proof test** (`F1 (proof)`):
+  * a wrapper records `pg_dump`'s arguments and delays it **1.5 s**, while a writer commits rows (≥ 100) in that window;
+  * any new snapshot would contain those rows, and the exported one cannot;
+  * fixed code: manifest 11 / dump 11 / late rows in the dump 0 / `verified:true`, and `pg_dump` received
+    `--snapshot=<hex>-<hex>-<n>`;
+  * **pre-F1 code: manifest 11, dump 197, 186 late rows in the dump, `verified:false`.**
+
+### 12.3 F2: behaviour at every stage, and the exact recovery state
+The tool owns the transaction. psql receives `BEGIN;`, then the SQL, then `COMMIT;` **only after** `age`,
+`pg_restore` and the filter all exited 0.
+
+| Failure point | What happens | Target state | Message / exit | Operator action |
+|---|---|---|---|---|
+| Before anything is applied: missing key file, checksum mismatch, non-empty target, bad arguments | Refused before psql starts | Unchanged | Exit 1, specific error | Fix and retry |
+| Decryption fails (wrong key; corrupt chunk even with a rewritten checksum) | All stages killed before COMMIT; rollback | **Empty** | `restore aborted, nothing was committed … age … <reason>` | Retry with the right key or backup |
+| `pg_restore` / filter fails midway; a transaction-control line appears in the stream | Same | **Empty** | `… nothing was committed … <stage> exited with N` | Retry |
+| psql fails midway (SQL error, connection killed) | psql's transaction is aborted; other stages stopped (no stall) | **Empty** | `… nothing was committed …` | Retry |
+| The restore process itself is killed (SIGKILL) | psql sees end of input without COMMIT and disconnects; the server rolls back | **Empty** (tested: 0 tables; previously 11 committed) | none (process died) | `verify-restore` → `empty` → retry |
+| COMMIT sent, never reached the server | Rolled back | **Empty** | `restore failed; nothing was committed (target database is unchanged)` | Retry (tested) |
+| COMMIT took effect, acknowledgement lost | Committed | **Complete** | `restore failed after COMMIT was sent; the target is NOT empty and its row counts MATCH the backup manifest` | `verify-restore` → `complete`; do not restore again (refused anyway) |
+| COMMIT outcome where the counts do not match (only if something else wrote to the target) | — | **Mismatch** | `… DO NOT match …; drop and recreate it` | Drop, recreate, retry |
+| Completed, but row counts differ from the manifest | Committed | Mismatch | `verified:false`, exit 1 | Do not switch; investigate |
+
+**How an operator verifies the state:** run `RESTORE_DATABASE_URL=<db> npm run db-backup -- verify-restore <name>`.
+It is read-only and prints `state` (`empty` | `complete` | `mismatch`) with every differing table; it exits 0 only
+for `complete`. Tested for all three states.
+
+### 12.4 F3: no credentials in arguments, logs or error output
+* Test `F3 (scan)` uses a real login role with a random password. It samples **every process on the host**
+  (`/proc/*/cmdline`) every 10 ms while the CLI runs:
+  * `create`;
+  * `restore` into a non-empty target;
+  * `restore` with the wrong key;
+  * `restore` with a failing connection (password in the URL);
+  * `restore` with the URL as an argument (refused);
+  * a successful `restore`;
+  * `verify-restore`.
+* Result:
+  * no process except the deliberately refused invocation (whose argv the test itself built) ever carried the
+    password;
+  * no stdout/stderr output contains it;
+  * pg tools receive credentials only via libpq environment variables (R-11 test: argv recorded by wrappers
+    around the real binaries).
+* Server and CLI logs mention only the variable **name** `DATABASE_URL`, never its value. This is by code
+  inspection of every log/error site in `server.ts`, `server/db/*` and `scripts/*`; the server's own logs are not
+  covered by a runtime scan. Database errors are logged as SQLSTATE plus message, and PostgreSQL error messages do
+  not contain passwords.
+
+### 12.5 F5: compatibility rules and how an older build behaves
+* **Marker:** `-- forge:backward-compatible`, validated by an allow-list (ADR-002):
+  * new tables, and indexes/constraints on them;
+  * non-unique indexes;
+  * nullable or defaulted `ADD COLUMN`;
+  * `COMMENT`;
+  * backfill `UPDATE`.
+
+  Anything else in a marked file is an error before anything runs (10 rejection cases tested). The applying build
+  records the flag in `schema_migrations.backward_compatible`.
+
+| Database contains, beyond this build's migrations | Older build (with F5) | Build older than F5 |
+|---|---|---|
+| Only newer migrations, all marked compatible | Starts, applies nothing, logs `schema_newer_than_build` (tested with a real server serving reads and writes) | Refuses to start |
+| Any newer migration **not** marked | Refuses: `… was not declared backward-compatible; refusing to run` | Refuses |
+| An unknown migration older than this build's newest (diverged history) | Refuses: `… diverged history` | Refuses |
+| A known migration whose file changed | Refuses (checksum) | Refuses |
+
+The marker is a claim by the migration author, which the allow-list enforces mechanically. It cannot prove semantic
+compatibility (e.g. a backfill `UPDATE` that changes meaning); that remains a code-review responsibility.
+
+### 12.6 F6: malformed file names, duplicates, invalid metadata
+| Input | Result (nothing is applied in every case) |
+|---|---|
+| `9003a_add_index.sql`, `9003_AddIndex.sql`, `903_short.sql` | `<file>: not a valid migration file name (expected NNNN_lower_snake_case.sql)` |
+| `9004_a.sql` + `9004_b.sql` | `duplicate migration version 9004 (9004_a.sql, 9004_b.sql)` |
+| `-- forge:backwards-compatible`, `-- forge:backward_compatible`, `--forge:compat`, `-- FORGE:backward-compatible` | `<file>: unknown migration directive …` |
+| Marked file with a non-expand statement | `<file> is marked backward-compatible but contains a statement that is not expand-only: "…"` |
+| `README.md` and other non-SQL files | Ignored |
