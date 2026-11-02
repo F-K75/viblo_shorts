@@ -37,11 +37,11 @@ describe('health, readiness, config', () => {
     assert.ok(d.system.heapUsedMb > 0);
     assert.equal(typeof d.ai.calls, 'number');
   });
-  test('readiness checks storage and ffmpeg', async () => {
+  test('readiness checks storage, ffmpeg and data stores', async () => {
     const r = await api('/api/ready');
     const d = await r.json();
     assert.equal(r.status, 200, JSON.stringify(d));
-    assert.deepEqual(d.checks, { storage: true, ffmpeg: true });
+    assert.deepEqual(d.checks, { storage: true, ffmpeg: true, stores: true });
   });
   test('config does not leak keys', async () => {
     const d = await (await api('/api/config')).json();

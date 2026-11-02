@@ -17,6 +17,7 @@
     ]
   },
   "include": [
+    "scripts/backup.ts",
     "vite.config.ts",
     "server.ts",
     "server/**/*.ts"

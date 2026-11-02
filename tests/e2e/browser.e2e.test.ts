@@ -23,7 +23,7 @@ const skip = !chromium ? 'playwright not installed' : !hasDist ? 'dist/ missing 
 let srv: TestServer;
 before(async () => {
   if (skip) return;
-  srv = await startTestServer({ NODE_ENV: 'production' });
+  srv = await startTestServer({ NODE_ENV: 'production', TRUST_PROXY: 'none' });
 });
 after(async () => srv?.stop());
 

@@ -106,3 +106,47 @@ export function clampNumber(value: unknown, min: number, max: number, fallback: 
   if (!Number.isFinite(n)) return fallback;
   return Math.min(max, Math.max(min, n));
 }
+
+export type TrustProxyConfig =
+  | { ok: true; value: false | number | string; description: string }
+  | { ok: false; error: string };
+
+/**
+ * Parses TRUST_PROXY. Production must state it explicitly, because both wrong defaults break rate limiting:
+ *  - unset behind a load balancer => every client shares the LB's IP (one global bucket, FS-008);
+ *  - "true" (trust every hop) => clients can spoof X-Forwarded-For and bypass per-IP limits.
+ * Accepted: "none" | "0" | "false" (directly exposed), a hop count ("1"), or Express subnet names / IP/CIDR
+ * lists ("loopback", "10.0.0.0/8,172.16.0.0/12").
+ */
+export function parseTrustProxy(raw: string | undefined, isProduction: boolean): TrustProxyConfig {
+  const v = (raw ?? '').trim();
+  if (!v) {
+    if (isProduction) {
+      return {
+        ok: false,
+        error:
+          'TRUST_PROXY must be set in production: "none" when the server is reached directly, or the number of trusted proxy hops (e.g. 1 behind one load balancer), or a comma-separated list of proxy IPs/CIDRs.',
+      };
+    }
+    return { ok: true, value: false, description: 'none (development default)' };
+  }
+  if (/^(none|0|false)$/i.test(v)) return { ok: true, value: false, description: 'none' };
+  if (/^true$/i.test(v)) {
+    if (isProduction) {
+      return { ok: false, error: 'TRUST_PROXY=true trusts every X-Forwarded-For hop, which lets clients spoof their IP. Use a hop count (e.g. 1) or proxy CIDRs.' };
+    }
+    return { ok: true, value: 1, description: '1 hop (TRUST_PROXY=true downgraded outside production)' };
+  }
+  if (/^\d+$/.test(v)) {
+    const n = Number(v);
+    if (n < 1 || n > 10) return { ok: false, error: 'TRUST_PROXY hop count must be between 1 and 10.' };
+    return { ok: true, value: n, description: `${n} hop(s)` };
+  }
+  const parts = v.split(',').map((s) => s.trim()).filter(Boolean);
+  const named = new Set(['loopback', 'linklocal', 'uniquelocal']);
+  const ipLike = /^[0-9a-fA-F:.]+(\/\d{1,3})?$/;
+  if (parts.length === 0 || !parts.every((p) => named.has(p) || ipLike.test(p))) {
+    return { ok: false, error: `TRUST_PROXY value is not a hop count, "none", or a list of IPs/CIDRs: ${v.slice(0, 80)}` };
+  }
+  return { ok: true, value: parts.join(','), description: `subnets ${parts.join(',')}` };
+}
