@@ -7,6 +7,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { startTestServer, guestToken, healthDetails, type TestServer } from './helpers/server.ts';
 import { createTestDatabase, pgSkip } from './helpers/pg.ts';
+import { execFileSync } from 'node:child_process';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
 const cleanups: Array<() => Promise<unknown>> = [];
@@ -40,6 +41,17 @@ async function waitFor<T>(fn: () => Promise<T | null | undefined | false>, ms = 
     await new Promise((r) => setTimeout(r, every));
   }
 }
+/** ffmpeg processes that are children of the server process (zombies included: `ps` lists them as <defunct>). */
+async function ffmpegChildren(s: TestServer) {
+  const pid = Number(String((await healthDetails(s.baseUrl)).renders.instance).split(':')[1]);
+  let out = '';
+  try {
+    out = execFileSync('ps', ['--ppid', String(pid), '-o', 'comm=,stat='], { encoding: 'utf8' });
+  } catch {
+    // ps exits 1 when there are no children
+  }
+  return out.split('\n').filter((l) => /ffmpeg/.test(l));
+}
 const minutesUsed = async (s: TestServer, token: string) => Number((await get(s, '/api/quota', token)).monthlyRenderMinutesUsed ?? (await get(s, '/api/user/subscription', token)).subscription?.monthlyRenderMinutesUsed);
 
 describe('B2: guests cannot start server renders', () => {
@@ -53,6 +65,8 @@ describe('B2: guests cannot start server renders', () => {
     assert.equal(queued.status, 403);
     assert.equal((await queued.json()).code, 'sign_in_required');
     assert.deepEqual((await get(s, '/api/jobs', g)).jobs, [], 'no job was created for the guest');
+    assert.equal((await healthDetails(s.baseUrl)).renders.running, 0, 'no ffmpeg was spawned for the guest');
+    assert.deepEqual(await ffmpegChildren(s), []);
     // guests keep everything else (projects)
     assert.equal((await post(s, '/api/projects', g, { title: 'guest project' })).status, 200);
   });
@@ -86,10 +100,11 @@ describe('B3: per-user and global admission limits (configurable)', () => {
     assert.deepEqual(st, [200, 200, 429]);
   });
 
-  test('global queue cap across 2 instances: 40 users at once -> exactly RENDER_QUEUE_MAX queued, the rest 429 queue_full + Retry-After', { skip: pgSkip }, async () => {
+  test('global queue cap across 2 instances: 300 users at once -> exactly RENDER_QUEUE_MAX queued, the rest 429 queue_full + Retry-After', { skip: pgSkip }, async () => {
     const db = await createTestDatabase({ migrate: false });
     cleanups.push(() => db.drop());
-    const env = { DATABASE_URL: db.url, RENDER_QUEUE_MAX: '5', MAX_CONCURRENT_RENDERS: '1' };
+    // all requests come from one test IP: lift the per-IP rate limit so only the queue cap decides
+    const env = { DATABASE_URL: db.url, RENDER_QUEUE_MAX: '25', MAX_CONCURRENT_RENDERS: '1', IP_RATE_MULTIPLIER: '100' };
     const A = await boot(env);
     const B = await boot(env);
     // occupy both workers with long renders so nothing leaves the queue during the burst
@@ -98,7 +113,7 @@ describe('B3: per-user and global admission limits (configurable)', () => {
     assert.deepEqual([longA.status, longB.status], [200, 200]);
     await new Promise((r) => setTimeout(r, 1500));
     const results = await Promise.all(
-      Array.from({ length: 40 }, async (_, i) => {
+      Array.from({ length: 300 }, async (_, i) => {
         const s = i % 2 ? A : B;
         const r = await post(s, '/api/jobs/create', s.signFirebaseToken({ sub: `b3-burst-${i}` }), job(2));
         return { status: r.status, code: (await r.json()).code, retryAfter: r.headers.get('retry-after') };
@@ -106,9 +121,11 @@ describe('B3: per-user and global admission limits (configurable)', () => {
     );
     const ok = results.filter((r) => r.status === 200).length;
     const full = results.filter((r) => r.status === 429);
-    assert.equal(ok, 5, `exactly the cap was admitted: ${results.map((r) => r.status).join(',')}`);
-    assert.equal(full.length, 35);
+    assert.equal(ok, 25, `exactly the cap was admitted: ${results.map((r) => r.status).join(',')}`);
+    assert.equal(full.length, 275, `statuses: ${[...new Set(results.map((r) => `${r.status}/${r.code}`))].join(' ')}`);
     assert.ok(full.every((r) => r.code === 'queue_full' && Number(r.retryAfter) > 0));
+    const queued = (await db.pool.query("SELECT count(*)::int AS n FROM jobs WHERE status = 'queued'")).rows[0].n;
+    assert.equal(queued, 25, 'the database holds exactly the cap');
   });
 });
 
@@ -203,6 +220,10 @@ describe('B6: timeouts', () => {
     assert.equal(j.status, 'failed');
     assert.match(j.error, /timed out/i);
     assert.equal(await minutesUsed(s, u), 0);
+    // the killed encoder is reaped: no ffmpeg child (running or <defunct>) remains
+    await new Promise((r) => setTimeout(r, 300));
+    assert.deepEqual(await ffmpegChildren(s), []);
+    assert.equal((await healthDetails(s.baseUrl)).renders.running, 0);
   });
 
   test('a job waiting in the queue longer than RENDER_QUEUE_TTL_S expires and is not charged', async () => {
@@ -265,6 +286,47 @@ describe('B7: crash recovery', () => {
       states.push((await r.getJob('job_doomed'))!.status);
     }
     assert.deepEqual(states, ['claimed#1', 'queued', 'claimed#2', 'failed', 'none', 'failed'], states.join(' '));
+  });
+});
+
+describe('B9: the synchronous render route goes through the queue', () => {
+  test('after RENDER_SYNC_WAIT_S it answers 202 + job id and the job still completes (charged once)', async () => {
+    const s = await boot({ MAX_CONCURRENT_RENDERS: '1', RENDER_SYNC_WAIT_S: '1' });
+    const u = s.signFirebaseToken({ sub: 'b9-sync' });
+    const r = await post(s, '/api/render/video', u, job(6, 'sync').payload);
+    assert.equal(r.status, 202);
+    const { jobId } = await r.json();
+    assert.match(jobId, /^job_/);
+    const done = await waitFor(async () => {
+      const x = (await get(s, `/api/jobs/${jobId}`, u)).job;
+      return x.status === 'queued' || x.status === 'processing' ? null : x;
+    });
+    assert.equal(done.status, 'completed', JSON.stringify(done));
+    await new Promise((res) => setTimeout(res, 300));
+    assert.equal(await minutesUsed(s, u), 0.1);
+  });
+
+  test('a client that disconnects while waiting cancels its job; it is not charged', async () => {
+    const s = await boot({ MAX_CONCURRENT_RENDERS: '1', RENDER_SYNC_WAIT_S: '120' });
+    const u = s.signFirebaseToken({ sub: 'b9-leaves' });
+    const ac = new AbortController();
+    const pending = fetch(`${s.baseUrl}/api/render/video`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${u}`, 'content-type': 'application/json' },
+      body: JSON.stringify(job(30, 'abandoned').payload),
+      signal: ac.signal,
+    }).catch(() => null);
+    const j = await waitFor(async () => (await get(s, '/api/jobs', u)).jobs.find((x: any) => x.status === 'processing'), 20_000);
+    ac.abort();
+    await pending;
+    const final = await waitFor(async () => {
+      const x = (await get(s, `/api/jobs/${j.id}`, u)).job;
+      return x.status === 'processing' ? null : x;
+    }, 20_000);
+    assert.equal(final.status, 'cancelled');
+    await new Promise((res) => setTimeout(res, 500));
+    assert.equal(await minutesUsed(s, u), 0);
+    assert.deepEqual(await ffmpegChildren(s), [], 'the encoder was stopped');
   });
 });
 
