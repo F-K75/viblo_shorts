@@ -45,6 +45,61 @@ const NON_TRANSACTIONAL = [
 
 const MIGRATION_NAME = /^\d{4}_[a-z0-9_]+\.sql$/;
 const BACKWARD_COMPATIBLE = /^--\s*forge:backward-compatible\s*$/m;
+const DIRECTIVE_LINE = /^\s*--\s*forge\s*:/im;
+
+/**
+ * F5/F6: migration metadata is validated, never trusted blindly.
+ *  * The only directive is `-- forge:backward-compatible`; any other (or misspelt) `-- forge:` line is an error.
+ *  * A migration carrying the marker may contain ONLY expand-only statements, i.e. statements the previous
+ *    release cannot be broken by (it writes with explicit column lists and never touches tables it does not know):
+ *      CREATE TABLE / CREATE [UNIQUE] INDEX / ADD CONSTRAINT on a table created in the same file;
+ *      CREATE INDEX (non-unique) on an existing table; ALTER TABLE … ADD COLUMN that is nullable or has a DEFAULT;
+ *      COMMENT ON …; UPDATE (backfill of new columns).
+ *    Everything else (DROP, RENAME, type changes, SET NOT NULL, new constraints or unique indexes on existing
+ *    tables, DELETE/TRUNCATE, triggers, functions, …) is rejected: such a change needs expand → code → contract.
+ */
+function validateMetadata(name: string, sql: string): boolean {
+  for (const line of sql.split('\n')) {
+    if (DIRECTIVE_LINE.test(line) && !/^--\s*forge:backward-compatible\s*$/.test(line.trim())) {
+      throw new Error(`${name}: unknown migration directive "${line.trim().slice(0, 60)}" (the only directive is "-- forge:backward-compatible"); nothing was applied`);
+    }
+  }
+  if (!BACKWARD_COMPATIBLE.test(sql)) return false;
+  const statements = sql
+    .split('\n')
+    .map((l) => l.replace(/--.*$/, ''))
+    .join('\n')
+    .split(';')
+    .map((x) => x.replace(/\s+/g, ' ').trim())
+    .filter(Boolean);
+  const created = new Set<string>();
+  const ident = (x: string) => x.replace(/"/g, '').replace(/^public\./i, '').toLowerCase();
+  for (const st of statements) {
+    let m: RegExpExecArray | null;
+    let ok = false;
+    if ((m = /^CREATE TABLE (?:IF NOT EXISTS )?([\w."]+)/i.exec(st))) {
+      created.add(ident(m[1]));
+      ok = true;
+    } else if ((m = /^CREATE (UNIQUE )?INDEX (?:IF NOT EXISTS )?[\w"]+ ON (?:ONLY )?([\w."]+)/i.exec(st))) {
+      ok = !m[1] || created.has(ident(m[2]));
+    } else if ((m = /^ALTER TABLE (?:IF EXISTS )?(?:ONLY )?([\w."]+) (.*)$/i.exec(st))) {
+      const table = ident(m[1]);
+      const actions = m[2].split(/,(?![^()]*\))/).map((a) => a.trim());
+      ok = actions.every((a) => {
+        if (created.has(table)) return /^(ADD|ALTER COLUMN [\w"]+ SET DEFAULT)\b/i.test(a) && !/\b(DROP|RENAME)\b/i.test(a);
+        if (!/^ADD COLUMN /i.test(a)) return false;
+        if (/\b(PRIMARY KEY|UNIQUE|REFERENCES|CHECK|GENERATED|CONSTRAINT)\b/i.test(a)) return false;
+        return !/\bNOT NULL\b/i.test(a) || /\bDEFAULT\b/i.test(a);
+      });
+    } else if (/^COMMENT ON /i.test(st) || /^UPDATE /i.test(st)) {
+      ok = true;
+    }
+    if (!ok) {
+      throw new Error(`${name} is marked backward-compatible but contains a statement that is not expand-only: "${st.slice(0, 80)}"; remove the marker (the previous release will then refuse to start) or split it into expand -> code -> contract`);
+    }
+  }
+  return true;
+}
 
 /**
  * Reads the migration files. F6: every *.sql file must be named NNNN_lower_snake_case.sql and versions must be
@@ -57,7 +112,7 @@ export function loadMigrations(dir = MIGRATIONS_DIR): MigrationFile[] {
   if (bad.length) throw new Error(`${bad.join(', ')}: not a valid migration file name (expected NNNN_lower_snake_case.sql); nothing was applied`);
   const files = sqlFiles.sort().map((f) => {
     const sql = fs.readFileSync(path.join(dir, f), 'utf8');
-    return { version: Number(f.slice(0, 4)), name: f, sql, checksum: crypto.createHash('sha256').update(sql).digest('hex'), backwardCompatible: BACKWARD_COMPATIBLE.test(sql) };
+    return { version: Number(f.slice(0, 4)), name: f, sql, checksum: crypto.createHash('sha256').update(sql).digest('hex'), backwardCompatible: validateMetadata(f, sql) };
   });
   for (let i = 1; i < files.length; i++) {
     if (files[i].version === files[i - 1].version) {

@@ -93,3 +93,47 @@ describe('F6: migration files are never skipped silently', { skip: pgSkip }, () 
     assert.ok(loadMigrations(REAL).length >= 2);
   });
 });
+
+describe('F5/F6: the backward-compatible marker is validated, never trusted blindly', () => {
+  const load = (name: string, sql: string) => () => loadMigrations(dir({ [name]: sql }));
+  test('expand-only statements are accepted with the marker', () => {
+    const ok = loadMigrations(
+      dir({
+        '9200_expand.sql': [
+          '-- forge:backward-compatible',
+          'CREATE TABLE IF NOT EXISTS project_tags (project_id text NOT NULL, tag text NOT NULL, PRIMARY KEY (project_id, tag));',
+          'CREATE INDEX project_tags_tag_idx ON project_tags (tag);',
+          'ALTER TABLE projects ADD COLUMN archived_at timestamptz;',
+          'ALTER TABLE projects ADD COLUMN IF NOT EXISTS pinned boolean NOT NULL DEFAULT false;',
+          "COMMENT ON COLUMN projects.pinned IS 'pinned in the list';",
+          'UPDATE projects SET archived_at = NULL WHERE archived_at IS NOT NULL;',
+        ].join('\n'),
+      }),
+    ).find((m) => m.name === '9200_expand.sql')!;
+    assert.equal(ok.backwardCompatible, true);
+  });
+  for (const [what, stmt] of [
+    ['drop column', 'ALTER TABLE projects DROP COLUMN title;'],
+    ['rename column', 'ALTER TABLE projects RENAME COLUMN title TO name;'],
+    ['type change', 'ALTER TABLE projects ALTER COLUMN title TYPE varchar(10);'],
+    ['set not null', 'ALTER TABLE projects ALTER COLUMN title SET NOT NULL;'],
+    ['NOT NULL column without default', 'ALTER TABLE projects ADD COLUMN owner_note text NOT NULL;'],
+    ['new constraint on an existing table', 'ALTER TABLE projects ADD CONSTRAINT short_title CHECK (length(title) < 10);'],
+    ['unique index on an existing table', 'CREATE UNIQUE INDEX projects_title_uq ON projects (title);'],
+    ['drop table', 'DROP TABLE jobs;'],
+    ['delete data', "DELETE FROM projects WHERE title = '';"],
+    ['trigger', 'CREATE TRIGGER t BEFORE INSERT ON projects FOR EACH ROW EXECUTE FUNCTION f();'],
+  ] as const) {
+    test(`a migration marked backward-compatible that contains a ${what} is rejected`, () => {
+      assert.throws(load('9201_bad.sql', `-- forge:backward-compatible\n${stmt}\n`), /9201_bad\.sql is marked backward-compatible but contains a statement that is not expand-only/);
+    });
+  }
+  test('the same statements are fine WITHOUT the marker (the previous release then refuses to start, by design)', () => {
+    assert.equal(loadMigrations(dir({ '9202_contract.sql': 'ALTER TABLE projects DROP COLUMN title;\n' })).find((m) => m.name === '9202_contract.sql')!.backwardCompatible, false);
+  });
+  test('an unknown or misspelt forge directive is an error, not silently ignored', () => {
+    for (const d of ['-- forge:backwards-compatible', '-- forge:backward_compatible', '--forge:compat', '-- FORGE:backward-compatible']) {
+      assert.throws(load('9203_typo.sql', `${d}\nCREATE TABLE typo_t (id int);\n`), /9203_typo\.sql: unknown migration directive/);
+    }
+  });
+});

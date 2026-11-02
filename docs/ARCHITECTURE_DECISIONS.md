@@ -46,11 +46,17 @@ line `-- forge:backward-compatible`; the applying build records that in `schema_
 A build that finds applied migrations it does not have starts **only** if all of them are newer than its own
 newest migration **and** declared backward-compatible. It then applies nothing and logs
 `schema_newer_than_build`. Everything else (an undeclared newer migration, a diverged history) still refuses to
-start. A migration may carry the marker only if it is expand-only:
-* allowed: new tables, new indexes, new nullable columns, new columns with a default, new constraints that
-  existing writes already satisfy;
-* never: drop/rename of a table or column, type changes, `NOT NULL` without a default, changed semantics of
-  existing data. Those are split into expand (marked) → code change → contract (unmarked, next release).
+start. The marker is **validated, not trusted**: `loadMigrations` rejects a marked file unless every statement is on
+this allow-list, and any other or misspelt `-- forge:` directive is an error:
+* `CREATE TABLE`, and `CREATE [UNIQUE] INDEX` / `ALTER TABLE … ADD …` on a table created in the same file;
+* `CREATE INDEX` (non-unique) on an existing table;
+* `ALTER TABLE <existing> ADD COLUMN …` that is nullable or has a `DEFAULT`, without constraints;
+* `COMMENT ON …`, and `UPDATE` (backfilling new columns).
+
+Everything else (drop/rename, type change, `SET NOT NULL`, constraints or unique indexes on existing tables,
+`DELETE`/`TRUNCATE`, triggers, functions) cannot carry the marker. Such a change is split into expand (marked) →
+code change → contract (unmarked, next release). A build older than this rule (before F5) refuses any unknown
+migration, which is also safe.
 
 The application writes with explicit column lists (no `INSERT … VALUES` without columns), which is what makes
 added columns safe for the previous release. Tested: tests/migrations.test.ts boots this build against a schema
