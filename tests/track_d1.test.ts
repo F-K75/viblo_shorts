@@ -99,3 +99,86 @@ describe('F8 (postgres): concurrent saves of one new id by two users', { skip: p
     assert.equal(String(totals.bytes), String(sum.s), 'the global storage total equals the stored projects');
   });
 });
+
+// ---------------------------------------------------------------- D4b / F9: counter rebuild under live writes and timeouts
+describe('F9 (postgres): the data-migration counter rebuild', { skip: pgSkip }, () => {
+  const emptySource = (extra: Array<{ ownerId: string; project: any }> = []) => ({ projects: extra, jobs: [], subscriptions: {}, usage: null, digest: `d1-${Date.now()}` });
+  const drift = async (db: TestDb) =>
+    (
+      await db.pool.query(
+        `SELECT u.id, u.project_count, u.storage_bytes, count(p.id)::int AS n, coalesce(sum(p.size_bytes), 0)::bigint AS bytes
+           FROM users u LEFT JOIN projects p ON p.user_id = u.id GROUP BY u.id
+         HAVING u.project_count <> count(p.id) OR u.storage_bytes <> coalesce(sum(p.size_bytes), 0)`,
+      )
+    ).rows;
+  const totalsMatch = async (db: TestDb) => {
+    const r = (
+      await db.pool.query(
+        `SELECT (SELECT bytes FROM storage_totals WHERE scope = 'all') AS all_t, (SELECT coalesce(sum(size_bytes), 0) FROM projects) AS all_s,
+                (SELECT bytes FROM storage_totals WHERE scope = 'guest') AS guest_t,
+                (SELECT coalesce(sum(p.size_bytes), 0) FROM projects p JOIN users u ON u.id = p.user_id WHERE u.kind = 'guest') AS guest_s`,
+      )
+    ).rows[0];
+    return { all: [String(r.all_t), String(r.all_s)], guest: [String(r.guest_t), String(r.guest_s)] };
+  };
+
+  test('a live write that commits while the rebuild waits for its lock is not lost (no counter drift)', async () => {
+    const { migrateJsonToPostgres } = await import('../server/db/dataMigration.ts');
+    const { r, db } = await makeRepo('postgres');
+    await r.saveProject('f9-live', proj('proj_f9_a', 'f9-live', 50));
+    // a live save in flight: same statements as saveProject, holding the user's row lock
+    const live = await db!.pool.connect();
+    try {
+      await live.query('BEGIN');
+      await live.query("SELECT 1 FROM users WHERE id = 'f9-live' FOR UPDATE");
+      const doc = JSON.stringify(proj('proj_f9_b', 'f9-live', 70));
+      const size = Buffer.byteLength(doc);
+      await live.query("INSERT INTO projects (id, user_id, title, doc, size_bytes, created_at, updated_at) VALUES ('proj_f9_b', 'f9-live', 'b', $1::jsonb, $2, now(), now())", [doc, size]);
+      await live.query("UPDATE users SET storage_bytes = storage_bytes + $1, project_count = project_count + 1 WHERE id = 'f9-live'", [size]);
+      await live.query("UPDATE storage_totals SET bytes = bytes + $1 WHERE scope = 'all'", [size]);
+      const running = migrateJsonToPostgres(db!.pool, emptySource([{ ownerId: 'f9-src', project: proj('proj_f9_src', 'f9-src', 30) }]) as any);
+      // wait until the migration is blocked on the live write's lock, then let the live write commit
+      for (let i = 0; i < 100; i++) {
+        const waiting = (await db!.pool.query("SELECT count(*)::int AS n FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock'")).rows[0].n;
+        if (waiting > 0) break;
+        await new Promise((res) => setTimeout(res, 50));
+      }
+      await live.query('COMMIT');
+      const report = await running;
+      assert.equal(report.verification.ok, true);
+    } finally {
+      live.release();
+    }
+    assert.deepEqual(await drift(db!), [], 'every user counter equals what is stored');
+    const t = await totalsMatch(db!);
+    assert.equal(t.all[0], t.all[1], `global total ${t.all.join(' vs ')}`);
+  });
+
+  test('100 000 users and 200 000 projects: the rebuild finishes under a 400 ms statement timeout, with exact counters', async () => {
+    const { migrateJsonToPostgres } = await import('../server/db/dataMigration.ts');
+    const { createPool } = await import('../server/db/pool.ts');
+    const db = await createTestDatabase();
+    dbs.push(db);
+    await db.pool.query("INSERT INTO users (id, kind) SELECT 'f9u_' || lpad(g::text, 6, '0'), CASE WHEN g % 10 = 0 THEN 'guest' ELSE 'firebase' END FROM generate_series(1, 100000) g");
+    await db.pool.query(
+      "INSERT INTO projects (id, user_id, title, doc, size_bytes, created_at, updated_at) SELECT 'proj_f9v_' || g, 'f9u_' || lpad((((g - 1) % 100000) + 1)::text, 6, '0'), 't', '{}'::jsonb, 100 + (g % 7), now(), now() FROM generate_series(1, 200000) g",
+    );
+    // counters deliberately wrong: the rebuild must make them exact
+    await db.pool.query('UPDATE users SET project_count = 0, storage_bytes = 0');
+    const saved = process.env.DATABASE_STATEMENT_TIMEOUT_MS;
+    process.env.DATABASE_STATEMENT_TIMEOUT_MS = '400';
+    const tight = createPool(db.url);
+    try {
+      const report = await migrateJsonToPostgres(tight, emptySource() as any);
+      assert.equal(report.verification.ok, true);
+    } finally {
+      if (saved === undefined) delete process.env.DATABASE_STATEMENT_TIMEOUT_MS;
+      else process.env.DATABASE_STATEMENT_TIMEOUT_MS = saved;
+      await tight.end();
+    }
+    assert.deepEqual(await drift(db), [], 'exact counters for all 100 000 users');
+    const t = await totalsMatch(db);
+    assert.equal(t.all[0], t.all[1]);
+    assert.equal(t.guest[0], t.guest[1]);
+  });
+});
