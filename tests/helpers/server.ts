@@ -76,6 +76,10 @@ export async function startTestServer(extraEnv: Record<string, string> = {}): Pr
       GUEST_MINT_PER_IP_PER_HOUR: '100000',
       GUEST_MINT_PER_SUBNET_PER_HOUR: '100000',
       GUEST_MINT_PER_DEVICE_PER_DAY: '100000',
+      // Test servers use small connection pools. The full PostgreSQL suite runs test files in parallel and, with
+      // Track A's tests added, reached 98 of the database's 100 connections at the production default (10 per
+      // server) and stalled (measured on d7ad0ce). Production keeps its default; a test can still set its own value.
+      DATABASE_POOL_MAX: '4',
       ...env,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
