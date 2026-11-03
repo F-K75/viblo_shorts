@@ -71,6 +71,11 @@ export async function startTestServer(extraEnv: Record<string, string> = {}): Pr
       GEMINI_API_KEY: '',
       PEXELS_API_KEY: '',
       HEALTH_DETAILS_TOKEN: HEALTH_TOKEN,
+      // Track A: existing tests mint many guests from 127.0.0.1. Generous guest budgets unless a test sets its own
+      // (tests/guest_protection.test.ts sets them explicitly where it tests them).
+      GUEST_MINT_PER_IP_PER_HOUR: '100000',
+      GUEST_MINT_PER_SUBNET_PER_HOUR: '100000',
+      GUEST_MINT_PER_DEVICE_PER_DAY: '100000',
       ...env,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
