@@ -461,3 +461,53 @@ describe('D6: guest tokens have exactly one accepted encoding', () => {
     }
   });
 });
+
+// ---------------------------------------------------------------- D-1 gate finding: guest-refusal stats were fire-and-forget
+// Found by the D-1 full PostgreSQL gate on 3aa217c (Track A test "shared-network refusals ... recorded apart" read the
+// stats before the refusal's own write had committed). A trigger delays only the refusal-stat writes, which makes the
+// ordering deterministic: before the fix the 429 was sent first and the diagnostics did not see the refusal yet.
+describe('Gate finding (postgres): a guest-mint refusal is recorded before the refusal is answered', { skip: pgSkip }, () => {
+  test('IP refusals and CAPTCHA failures are visible in the diagnostics as soon as the client has its answer', async () => {
+    const crypto = await import('node:crypto');
+    const pg = (await import('pg')).default;
+    const { startTestServer, healthDetails } = await import('./helpers/server.ts');
+    const { startTurnstileStub } = await import('./helpers/turnstileStub.ts');
+    const secret = `gate-secret-${crypto.randomBytes(8).toString('hex')}`;
+    const v = await startTurnstileStub({ secret, hostname: 'forge.test' });
+    const s = await startTestServer({
+      CAPTCHA_REQUIRED: 'true',
+      TURNSTILE_SECRET: secret,
+      TURNSTILE_SITE_KEY: '1x-gate-site-key',
+      TURNSTILE_HOSTNAMES: 'forge.test',
+      TURNSTILE_VERIFY_URL: v.url,
+      TRUST_PROXY: '1',
+      BACKUP_INTERVAL_HOURS: '0',
+      GUEST_MINT_PER_IP_PER_HOUR: '1',
+    });
+    const c = new pg.Client({ connectionString: s.databaseUrl });
+    try {
+      await c.connect();
+      await c.query(`CREATE FUNCTION gate_slow_stat() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN IF starts_with(NEW.key, 'stats:guest-reject:') OR starts_with(NEW.key, 'stats:guest-network-') THEN PERFORM pg_sleep(1.5); END IF; RETURN NEW; END $$`);
+      await c.query('CREATE TRIGGER gate_slow_stat BEFORE INSERT OR UPDATE ON window_counters FOR EACH ROW EXECUTE FUNCTION gate_slow_stat()');
+      const mint = (ip: string, token: string) =>
+        fetch(`${s.baseUrl}/api/auth/guest`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-forwarded-for': ip }, body: JSON.stringify({ 'cf-turnstile-response': token }) });
+      const ok = () => `ok-${crypto.randomBytes(9).toString('hex')}`;
+      assert.equal((await mint('203.0.113.9', ok())).status, 200);
+      const refused = await mint('203.0.113.9', ok());
+      assert.equal(refused.status, 429);
+      assert.equal((await refused.json()).scope, 'ip');
+      let g = (await healthDetails(s.baseUrl)).guestMints;
+      assert.equal(g.rejected['guest_rate_limited:ip'], 1, 'the IP refusal is recorded before the 429 is sent');
+      assert.equal(g.networkRefusals.thisHour.ip, 1, 'the shared-network refusal is recorded before the 429 is sent');
+      const bad = await mint('203.0.113.77', `bad-${crypto.randomBytes(9).toString('hex')}`);
+      assert.notEqual(bad.status, 200);
+      g = (await healthDetails(s.baseUrl)).guestMints;
+      assert.equal(g.rejected.captcha_failed, 1, 'the CAPTCHA failure is recorded before it is answered');
+    } finally {
+      await c.end().catch(() => {});
+      await s.stop();
+      await v.close();
+    }
+  });
+});

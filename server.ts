@@ -499,8 +499,10 @@ async function guestMintStatus() {
   };
 }
 
-function refuseGuestMint(res: express.Response, status: number, code: string, error: string, extra: Record<string, unknown> = {}, retryAfterS?: number) {
-  repo.recordStat(GUEST_REJECT_STAT + code, currentHour()).catch(() => {});
+// The refusal stats are written (best effort) BEFORE the answer is sent, so diagnostics read after a client got its
+// answer always include that refusal. They were fire-and-forget until the D-1 gate showed a read overtaking the write.
+async function refuseGuestMint(res: express.Response, status: number, code: string, error: string, extra: Record<string, unknown> = {}, retryAfterS?: number) {
+  await repo.recordStat(GUEST_REJECT_STAT + code, currentHour()).catch(() => {});
   if (retryAfterS) res.setHeader('Retry-After', String(retryAfterS));
   return res.status(status).json({ error, code, ...extra });
 }
@@ -1171,8 +1173,10 @@ app.post('/api/auth/guest', rateLimit('auth-guest', 10), async (req, res) => {
     const scope = taken.key.startsWith('gm:dev:') ? 'device' : taken.key.startsWith('gm:ip:') ? 'ip' : 'subnet';
     const retry = scope === 'device' ? (dayWindow + 24 - hour) * 3600 - Math.floor((Date.now() % 3600000) / 1000) : untilNextHour;
     // Every request here already passed the CAPTCHA: an IP or subnet refusal is shared-network impact, recorded apart.
-    repo.recordStat(GUEST_REJECT_STAT + `guest_rate_limited:${scope}`, hour).catch(() => {});
-    if (scope !== 'device') repo.recordStat(GUEST_NETWORK_REFUSAL_STAT, hour).catch(() => {});
+    await Promise.all([
+      repo.recordStat(GUEST_REJECT_STAT + `guest_rate_limited:${scope}`, hour).catch(() => {}),
+      scope !== 'device' ? repo.recordStat(GUEST_NETWORK_REFUSAL_STAT, hour).catch(() => {}) : null,
+    ]);
     res.setHeader('Retry-After', String(retry));
     return res.status(429).json({ error: 'Too many guest sessions were started from here recently. Please try again later, or sign in to continue.', code: 'guest_rate_limited', scope });
   }
