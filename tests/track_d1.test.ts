@@ -279,3 +279,41 @@ describe('F10 (postgres): concurrent start, abort and completion', { skip: pgSki
     assert.equal(await r.peekAi('user:f10r', day), expected, 'the usage count equals the committed reservations');
   });
 });
+
+describe('F10 (server, verification after the fix): settlement through the real request path', () => {
+  test('a client that disconnects after the model call started is charged; completed and failed calls keep their rules', async () => {
+    const { startTestServer } = await import('./helpers/server.ts');
+    const { startGeminiStub } = await import('./helpers/geminiStub.ts');
+    const stub = await startGeminiStub();
+    const s = await startTestServer({ GEMINI_API_KEY: 'stub-key-0123456789', GEMINI_BASE_URL: stub.baseUrl, GEMINI_MODELS: 'stub-model', LLM_TIMEOUT_MS: '8000' });
+    try {
+      const u = s.signFirebaseToken({ sub: 'f10-http' });
+      const used = async () => (await (await fetch(`${s.baseUrl}/api/quota`, { headers: { authorization: `Bearer ${u}` } })).json()).dailyQuotaUsed;
+      const call = (signal?: AbortSignal) =>
+        fetch(`${s.baseUrl}/api/generate-script`, { method: 'POST', signal, headers: { authorization: `Bearer ${u}`, 'content-type': 'application/json' }, body: JSON.stringify({ topic: 'sleep habits' }) });
+      // completed real output: charged
+      assert.equal((await call()).status, 200);
+      assert.equal(await used(), 1);
+      // the model call starts (stub waits 2 s), then the client disconnects: still charged
+      stub.delayMs = 2000;
+      const before = stub.calls;
+      const ac = new AbortController();
+      const pending = call(ac.signal).catch(() => null);
+      for (let i = 0; i < 100 && stub.calls === before; i++) await new Promise((r) => setTimeout(r, 20));
+      assert.equal(stub.calls, before + 1, 'the model call started');
+      ac.abort();
+      await pending;
+      await new Promise((r) => setTimeout(r, 2500));
+      assert.equal(await used(), 2, 'abort after the start: charged');
+      // provider failure with a complete fallback response: refunded (unchanged)
+      stub.delayMs = 0;
+      stub.mode = 'fail';
+      assert.equal((await call()).status, 200);
+      await new Promise((r) => setTimeout(r, 300));
+      assert.equal(await used(), 2, 'failed call: refunded');
+    } finally {
+      await s.stop();
+      await stub.close();
+    }
+  });
+});
