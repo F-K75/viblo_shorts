@@ -18,6 +18,13 @@ const FIREBASE_CERTS_URL =
 
 const b64url = (buf: Buffer | string) => Buffer.from(buf).toString('base64url');
 const fromB64url = (s: string) => Buffer.from(s, 'base64url');
+/**
+ * D6: exactly one accepted spelling per token part. Node's base64url decoder is lenient (it ignores the unused bits of
+ * the last character and accepts '=' padding, the standard alphabet and stray characters), so many strings decode to
+ * the same bytes. A part is accepted only if it uses the URL-safe alphabet without padding and equals the canonical
+ * re-encoding of its own bytes.
+ */
+const isCanonicalB64url = (s: string) => /^[A-Za-z0-9_-]+$/.test(s) && b64url(fromB64url(s)) === s;
 
 export class AuthService {
   private certCache: { certs: Record<string, string>; expiresAt: number } | null = null;
@@ -44,6 +51,7 @@ export class AuthService {
   verifyGuestToken(token: string, now = Date.now()): AuthIdentity | null {
     const parts = token.split('.');
     if (parts.length !== 3 || parts[0] !== 'guest') return null;
+    if (!isCanonicalB64url(parts[1]) || !isCanonicalB64url(parts[2])) return null; // D6: one representation only
     const expected = crypto.createHmac('sha256', this.secret).update(`guest.${parts[1]}`).digest();
     const given = fromB64url(parts[2]);
     if (given.length !== expected.length || !crypto.timingSafeEqual(given, expected)) return null;
