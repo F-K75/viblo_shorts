@@ -1,5 +1,37 @@
 # Forge Studio — Independent Re-audit + Corrective Round
 
+## Phase 2.5 Track A (R-03): IMPLEMENTED, awaiting review (branch `claude/keen-feynman-xtbvz2-track-a`)
+* **Not merged, not release-ready.** Evidence: `docs/PHASE2_5_TRACK_A.md`. Based on `main` @ `80e02b5`; this PR also
+  carries the Track B re-audit commit `f33c5e5` as its own commit.
+* **Red first:** on `80e02b5`, 17 of 17 new tests failed. They reproduced:
+  * mints with no CAPTCHA;
+  * a verified newcomer locked out (`429`) once an IP-rotating attacker spent the global budget;
+  * 30 of 30 token replays accepted;
+  * no device, subnet or IPv6 budgets;
+  * no outage handling, and production starting without CAPTCHA.
+  * The browser E2E against the old build showed no widget ever requested.
+* **Implemented:**
+  * server-side Turnstile;
+  * single-use tokens across instances (migration `0004`);
+  * device / IP / IPv4 /24 / IPv6 /48 budgets;
+  * the `__Host-fs_dev` cookie;
+  * a soft threshold that alerts and tightens without rejecting verified sign-ups;
+  * an optional hard ceiling (off until measured);
+  * a provider outage pauses only new guests;
+  * the hourly baseline series;
+  * the client widget.
+* **Gate:** gates 1 and 2 failed on test connection exhaustion (recorded with root causes); gate 3 on `817f204` passed:
+  * new tests 55/55 × 3 per backend;
+  * full suites with 0 failures;
+  * E2E 2/2 per backend.
+* **R-03: fixed on the branch, pending review and CI.** It is not live until the owner creates a Turnstile widget and
+  stores the secret.
+* **Decisions for the owner:**
+  * the hard-ceiling default (off until 14 days are measured);
+  * the default budgets for shared networks;
+  * the privacy text.
+  * Deviations from the plan are in Track A §3.1.
+
 ## Phase 2.5 Track B (R-04, F7): MERGED (PR #5 → `main` @ `80e02b5`, 2026-11-03)
 * **Merged with owner approval** as merge commit `80e02b5`. Its parents are the previous `main` (`53fc724`) and the
   approved head (`63de0c5`), and its tree is identical to `63de0c5`. The merge was pinned to that head SHA.

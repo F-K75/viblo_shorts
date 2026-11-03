@@ -131,8 +131,36 @@ Results: §6.
 
 No assertion was weakened, and no test was skipped.
 
-## 6. Gate results
-_Filled in after the runs complete._
+## 6. Gate results (local: PostgreSQL 16, Playwright Chromium)
+Three gates were run. The first two **failed** and are recorded here; each fix was test infrastructure only.
+
+**Gate 1, code `07dd7ef`: FAILED (PostgreSQL only).**
+* JSON: the new tests passed 55/55 × 3 and the full suite 249/0 failed.
+* With every server on PostgreSQL the new tests failed **14–15 of 55 in all three runs**, and the full suite failed 5.
+* Root cause: `sorry, too many clients already`. The Track A test file kept every server alive until the file ended;
+  about 20 servers × a pool of 10 exhausted `max_connections` (100). In the replay test the property itself still held
+  (exactly one `200`); only the extra `503 database_unavailable` responses broke the assertion.
+* Fix `d7ad0ce`: tear down after each test.
+
+**Gate 2, code `d7ad0ce`: FAILED (full PostgreSQL suite only).**
+* New tests: 55/55 × 3 on both backends. JSON full suite: 249/0 failed. E2E: 2/2 on both backends.
+* The full PostgreSQL suite failed **8** tests (Track B B6/B7/B9 and R-02), all `too many clients`. The test files run in
+  parallel and the added Track A tests pushed the combined peak over the limit.
+* A measured rerun **peaked at 98 of 100 connections and stalled**.
+* Fix `817f204`: test servers default to `DATABASE_POOL_MAX=4`. Production is unchanged (10). No Track B code or test
+  changed.
+* Remeasured: peak 92 (brief spikes; 7 of 241 samples ≥ 85; most of the run < 40), suite green.
+
+**Gate 3, code `817f204`: PASSED, one uninterrupted sequence, no retries:**
+
+| Check | JSON | PostgreSQL |
+|---|---|---|
+| New tests (`guest_protection` + `repo_contract`), run 1 / 2 / 3 | 55/55, 55/55, 55/55 | 55/55, 55/55, 55/55 |
+| Full suite | 251 tests, 249 pass, **0 fail**, 2 skipped | 251 tests, 242 pass, **0 fail**, 9 skipped |
+| Production build | pass | — |
+| Browser E2E (guest journey + CAPTCHA journey) | 2/2 | 2/2 |
+
+Skips: 2 live Gemini tests on both backends (no key, "NOT passed"; R-01); 7 JSON-only tests on PostgreSQL.
 
 ## 7. Risk register (Track A)
 | # | Risk | Note |
@@ -148,6 +176,7 @@ _Filled in after the runs complete._
 | 9 | Junk redemptions from invalid tokens. | Bounded by the 10/min per-IP pre-filter; rows expire after about 6 minutes and are swept. |
 | 10 | Soft-threshold escalation is budget halving, not an interactive-only challenge. | §3.1 item 4. |
 | 11 | ASN-level budgets not built. | Deferred by owner decision (needs a GeoIP/ASN licence). |
+| 12 | **Test connection headroom.** The full PostgreSQL suite peaks at 92 of 100 connections (brief spikes) even with test pools of 4. A future test added in parallel could exhaust it again. | Test infrastructure, not production. If CI shows it, raise the CI database's `max_connections` rather than shrinking pools further. |
 
 ## 8. Privacy-policy draft text (A9, for the owner's approval)
 > **Security cookie.** When you continue as a guest, Forge Studio sets one first-party cookie, `__Host-fs_dev`. It
