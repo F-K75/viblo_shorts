@@ -317,3 +317,93 @@ describe('F10 (server, verification after the fix): settlement through the real 
     }
   });
 });
+
+// ---------------------------------------------------------------- D4d / F11: backup integrity and TLS
+describe('F11: backup verification covers ai_reservations (counts and content) and every backup connection follows the TLS policy', () => {
+  const withEnv = async <T>(vars: Record<string, string | undefined>, fn: () => Promise<T> | T): Promise<T> => {
+    const saved: Record<string, string | undefined> = {};
+    for (const k of Object.keys(vars)) {
+      saved[k] = process.env[k];
+      if (vars[k] === undefined) delete process.env[k];
+      else process.env[k] = vars[k];
+    }
+    try {
+      return await fn();
+    } finally {
+      for (const [k, v] of Object.entries(saved)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
+  };
+  const ageKey = async () => {
+    const { execFileSync } = await import('node:child_process');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'd1-age-'));
+    const file = path.join(dir, 'key.txt');
+    execFileSync('age-keygen', ['-o', file], { stdio: 'ignore' });
+    return { file, pub: /public key: (age1\w+)/.exec(fs.readFileSync(file, 'utf8'))![1] };
+  };
+
+  test('the manifest records ai_reservations (and captcha_redemptions) with counts and content checksums; restore verification catches missing and changed rows', { skip: pgSkip }, async () => {
+    const offsite: any = await import('../server/db/offsiteBackup.ts');
+    const src = await createTestDatabase();
+    dbs.push(src);
+    const r = new PostgresRepo(src.pool, limits);
+    for (let i = 0; i < 5; i++) await r.reserveAi([{ key: 'user:f11', limit: 100 }], aiDay(), `f11-res-${String(i).padStart(4, '0')}`);
+    await (r as any).settleAi('f11-res-0000', 'commit');
+    const key = await ageKey();
+    const cfg = { target: `file://${fs.mkdtempSync(path.join(os.tmpdir(), 'd1-bk-'))}`, allowFileTarget: true };
+    const m = await offsite.createBackup(src.url, cfg, [key.pub]);
+    assert.equal(m.rowCounts.ai_reservations, 5, `ai_reservations is counted: ${JSON.stringify(m.rowCounts)}`);
+    assert.ok('captcha_redemptions' in m.rowCounts, 'captcha_redemptions is counted');
+    assert.match(m.checksums?.ai_reservations ?? '', /^[0-9a-f]{32}$/, 'a content checksum per table');
+    const dst = await createTestDatabase({ migrate: false });
+    dbs.push(dst);
+    const restored = await offsite.restoreBackup(cfg, m.name, dst.url, key.file);
+    assert.equal(restored.verified, true);
+    // incomplete restore: a missing row is reported
+    await dst.pool.query("DELETE FROM ai_reservations WHERE id = 'f11-res-0004'");
+    const missing = await offsite.verifyRestoredDatabase(cfg, m.name, dst.url);
+    assert.equal(missing.state, 'mismatch');
+    assert.deepEqual(missing.differences.filter((d: any) => d.table === 'ai_reservations'), [{ table: 'ai_reservations', expected: 5, actual: 4 }]);
+    // corrupted content with the same row count: also reported
+    await dst.pool.query("INSERT INTO ai_reservations (id, day, keys, status) VALUES ('f11-res-0004', now()::date, ARRAY['user:f11'], 'reserved')");
+    await dst.pool.query("UPDATE ai_reservations SET status = 'refunded', settled_at = now() WHERE id = 'f11-res-0000'");
+    const changed = await offsite.verifyRestoredDatabase(cfg, m.name, dst.url);
+    assert.equal(changed.state, 'mismatch', JSON.stringify(changed.differences));
+    assert.ok(changed.differences.some((d: any) => d.table === 'ai_reservations' && d.contentChanged === true), JSON.stringify(changed.differences));
+  });
+
+  test('libpqEnv applies the TLS policy to pg_dump / pg_restore / psql (never libpq\'s plaintext-allowing default)', async () => {
+    const { libpqEnv } = await import('../server/db/offsiteBackup.ts');
+    const base = 'postgres://u:p@db.example.com:5432/forge';
+    await withEnv({ NODE_ENV: 'production', DATABASE_SSLMODE: undefined, DATABASE_SSL_REJECT_UNAUTHORIZED: undefined }, () => {
+      const e = libpqEnv(base);
+      assert.equal(e.PGSSLMODE, 'verify-full', 'production default: verified TLS');
+      assert.equal(e.PGSSLROOTCERT, 'system', "verified against the system CA store unless a root certificate is given");
+    });
+    await withEnv({ NODE_ENV: 'test', DATABASE_SSLMODE: 'require', DATABASE_SSL_REJECT_UNAUTHORIZED: undefined }, () => assert.equal(libpqEnv(base).PGSSLMODE, 'verify-full'));
+    await withEnv({ NODE_ENV: 'production', DATABASE_SSLMODE: undefined, DATABASE_SSL_REJECT_UNAUTHORIZED: 'false' }, () => assert.equal(libpqEnv(base).PGSSLMODE, 'require'));
+    await withEnv({ NODE_ENV: 'production', DATABASE_SSLMODE: undefined }, () => {
+      assert.equal(libpqEnv(`${base}?sslmode=disable`).PGSSLMODE, 'disable', 'an explicit disable is honoured, as in the app');
+      assert.equal(libpqEnv(`${base}?sslmode=prefer`).PGSSLMODE, 'verify-full', 'a plaintext-allowing mode is upgraded, as in the app');
+      const ca = libpqEnv(`${base}?sslmode=verify-full&sslrootcert=/ca.pem`);
+      assert.deepEqual([ca.PGSSLMODE, ca.PGSSLROOTCERT], ['verify-full', '/ca.pem']);
+    });
+  });
+
+  test('when TLS is required, the backup tool refuses a server without TLS instead of falling back to plaintext', { skip: pgSkip }, async () => {
+    const offsite: any = await import('../server/db/offsiteBackup.ts');
+    const db = await createTestDatabase();
+    dbs.push(db);
+    const plain = db.url.replace(/[?&]sslmode=disable/, ''); // the local test server has ssl = off
+    for (const vars of [{ DATABASE_SSLMODE: 'require', NODE_ENV: 'test' }, { DATABASE_SSLMODE: undefined, NODE_ENV: 'production' }]) {
+      await withEnv(vars, async () => {
+        await assert.rejects(offsite.rowCounts(plain), /SSL|TLS/i, `rowCounts under ${JSON.stringify(vars)}`);
+        const key = await ageKey();
+        const cfg = { target: `file://${fs.mkdtempSync(path.join(os.tmpdir(), 'd1-bk-tls-'))}`, allowFileTarget: true };
+        await assert.rejects(offsite.createBackup(plain, cfg, [key.pub]), /SSL|TLS/i, `createBackup under ${JSON.stringify(vars)}`);
+      });
+    }
+  });
+});
