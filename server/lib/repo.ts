@@ -78,6 +78,19 @@ export class ProjectOwnershipError extends Error {
   }
 }
 
+/** Thrown by saveProject({ mustExist: true }) when the project no longer exists (callers answer 404, as for ownership). */
+export class ProjectNotFoundError extends Error {
+  constructor() {
+    super('Project not found');
+    this.name = 'ProjectNotFoundError';
+  }
+}
+export interface SaveProjectOptions {
+  /** The caller is updating a project it read before: refuse (ProjectNotFoundError) instead of re-creating it if it
+   *  was deleted in the meantime (F8). */
+  mustExist?: boolean;
+}
+
 export type UserKind = 'firebase' | 'guest' | 'legacy';
 export function userKindOf(userId: string): UserKind {
   if (userId.startsWith('guest_')) return 'guest';
@@ -94,8 +107,11 @@ export interface Repo {
   listProjects(userId: string): Promise<any[]>;
   listAllProjects(limit: number): Promise<{ projects: any[]; unreadable: number }>;
   getProject(id: string): Promise<{ project: any; ownerId: string } | null>;
-  /** Insert or replace. Throws ProjectOwnershipError if the id belongs to another user, StoreLimitError on quota. */
-  saveProject(userId: string, project: any): Promise<void>;
+  /**
+   * Insert or replace. Throws ProjectOwnershipError if the id belongs to another user (enforced inside the write itself,
+   * also under concurrency), ProjectNotFoundError if opts.mustExist and the project is gone, StoreLimitError on quota.
+   */
+  saveProject(userId: string, project: any, opts?: SaveProjectOptions): Promise<void>;
   deleteProject(ownerId: string, id: string): Promise<boolean>;
 
   // ---- subscriptions ----

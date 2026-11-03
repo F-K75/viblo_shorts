@@ -7,7 +7,7 @@ import path from 'path';
 import { ProjectStore, type StoreLimits } from './projectStore.ts';
 import { readJsonFile, writeJsonFileAtomic } from './storage.ts';
 import { UsageLedger } from './usage.ts';
-import { ProjectOwnershipError, type AiSettlement, type HeartbeatResult, type JobAdmission, type JobDenial, type QuotaEntry, type ReapResult, type Repo, type WindowEntry, STATS_RETENTION_WINDOWS, type ServerJob, type StoredSubscription } from './repo.ts';
+import { ProjectNotFoundError, ProjectOwnershipError, type SaveProjectOptions, type AiSettlement, type HeartbeatResult, type JobAdmission, type JobDenial, type QuotaEntry, type ReapResult, type Repo, type WindowEntry, STATS_RETENTION_WINDOWS, type ServerJob, type StoredSubscription } from './repo.ts';
 
 const MAX_STORED_JOBS = 500;
 
@@ -127,9 +127,11 @@ export class JsonRepo implements Repo {
     const project = this.store.get(id);
     return project ? { project, ownerId: owner } : null;
   }
-  async saveProject(userId: string, project: any) {
+  // Single process: the check and the write below run without an await in between, so they are atomic.
+  async saveProject(userId: string, project: any, opts: SaveProjectOptions = {}) {
     const owner = this.store.ownerOf(project.id);
     if (owner && owner !== userId) throw new ProjectOwnershipError();
+    if (opts.mustExist && !owner) throw new ProjectNotFoundError();
     this.store.put(userId, project);
   }
   async deleteProject(ownerId: string, id: string) {

@@ -32,7 +32,7 @@ import { StoreUnavailableError, freeDiskBytes } from './server/lib/storage.ts';
 import { StoreLimitError } from './server/lib/projectStore.ts';
 import { utcDay } from './server/lib/usage.ts';
 import { JsonRepo } from './server/lib/jsonRepo.ts';
-import { ProjectOwnershipError, type JobAdmission, type JobDenial, type Repo, type ServerJob, type StoredSubscription } from './server/lib/repo.ts';
+import { ProjectNotFoundError, ProjectOwnershipError, type JobAdmission, type JobDenial, type Repo, type ServerJob, type StoredSubscription } from './server/lib/repo.ts';
 import { PostgresRepo } from './server/db/pgRepo.ts';
 import { createPool, isUnavailable, isRetryableTxError, txRetryCount } from './server/db/pool.ts';
 import { migrate } from './server/db/migrate.ts';
@@ -1448,8 +1448,9 @@ app.post('/api/projects', rateLimit('projects-write', 60), async (req, res) => {
   }
   const now = new Date().toISOString();
   const project = { ...clean, id, userId, createdAt: existing?.createdAt || now, updatedAt: now };
-  // Ownership and quotas are re-checked atomically inside saveProject (ProjectOwnershipError -> 404).
-  await repo.saveProject(userId, project);
+  // Ownership and quotas are re-checked atomically inside saveProject (ProjectOwnershipError -> 404). An update must
+  // not re-create a project deleted since it was read above (F8: ProjectNotFoundError -> the same 404).
+  await repo.saveProject(userId, project, { mustExist: Boolean(existing) });
   res.json({ success: true, project });
 });
 
@@ -2853,7 +2854,7 @@ app.use((err: any, req: express.Request, res: express.Response, _next: express.N
     if (res.headersSent) return;
     return res.status(err.status).json({ error: err.message, code: err.code });
   }
-  if (err instanceof ProjectOwnershipError) {
+  if (err instanceof ProjectOwnershipError || err instanceof ProjectNotFoundError) {
     if (res.headersSent) return;
     return res.status(404).json({ error: 'Project not found' });
   }
