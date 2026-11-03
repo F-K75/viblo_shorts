@@ -1,9 +1,9 @@
 // D2 test fixture (CI only; not part of the image). Runs a REAL snapshot restore inside the container and kills the
 // process with SIGKILL in the middle of the swap, leaving a genuine unfinished-restore journal behind, exactly as a
 // crash or OOM kill would. It dies right AFTER the first live entry was moved aside and before the snapshot's entry
-// is moved in: the live store is then missing. That works for any number of store entries. (The first CI run killed
-// on the SECOND aside rename and never fired; the same fixture fires locally, cause not yet confirmed, so every rename
-// is logged to stderr.) Technique as in tests/restore_atomic.test.ts.
+// is moved in: the live store is then missing. That works for any number of store entries. Every rename is logged to
+// stderr. It must NOT run as the container's PID 1 (the kernel ignores a self-sent SIGKILL there): the guard script
+// starts it under tini. Technique as in tests/restore_atomic.test.ts.
 // Usage (inside the image): node --import tsx kill-restore-midswap.mts <snapshot-name>
 import fs from 'node:fs';
 import path from 'node:path';

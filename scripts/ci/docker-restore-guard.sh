@@ -29,7 +29,9 @@ docker stop guard-app >/dev/null && docker rm guard-app >/dev/null
 
 echo "== 2. a real restore, SIGKILLed mid-swap"
 set +e
-docker run --rm -v "$VOL":/data -v "$FIX":/ci/kill.mts:ro --entrypoint node "$IMAGE" --import tsx /ci/kill.mts "$SNAP"
+# Under tini, as the app runs: with --entrypoint node, Node is the container's PID 1, and the kernel ignores signals a
+# namespace's PID 1 sends itself without a handler, SIGKILL included (CI runs 39, 41, 43: the kill was issued, nothing died).
+docker run --rm -v "$VOL":/data -v "$FIX":/ci/kill.mts:ro --entrypoint /usr/bin/tini "$IMAGE" -- node --import tsx /ci/kill.mts "$SNAP"
 code=$?
 set -e
 echo "restore exit code: $code (137 = SIGKILL)"
