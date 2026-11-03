@@ -154,6 +154,30 @@ describe('F9 (postgres): the data-migration counter rebuild', { skip: pgSkip }, 
     assert.equal(t.all[0], t.all[1], `global total ${t.all.join(' vs ')}`);
   });
 
+  test('verification (after the fix): a migration interrupted inside the rebuild changes nothing; a re-run completes exactly', async () => {
+    const { migrateJsonToPostgres } = await import('../server/db/dataMigration.ts');
+    const db = await createTestDatabase();
+    dbs.push(db);
+    await db.pool.query("INSERT INTO users (id, kind) SELECT 'f9i_' || lpad(g::text, 4, '0'), 'firebase' FROM generate_series(1, 3000) g");
+    await db.pool.query("INSERT INTO projects (id, user_id, title, doc, size_bytes, created_at, updated_at) SELECT 'proj_f9i_' || g, 'f9i_' || lpad((((g - 1) % 3000) + 1)::text, 4, '0'), 't', '{}'::jsonb, 100, now(), now() FROM generate_series(1, 6000) g");
+    await db.pool.query('UPDATE users SET project_count = 0, storage_bytes = 0');
+    // fault injection: the rebuild fails on a user in its third page (after two pages were already rewritten)
+    await db.pool.query(`CREATE FUNCTION f9_fault() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+      IF NEW.id = 'f9i_2500' AND NEW.project_count > 0 THEN RAISE EXCEPTION 'injected failure inside the counter rebuild'; END IF; RETURN NEW; END $$`);
+    await db.pool.query('CREATE TRIGGER f9_fault BEFORE UPDATE ON users FOR EACH ROW EXECUTE FUNCTION f9_fault()');
+    const src = emptySource([{ ownerId: 'f9i_new', project: proj('proj_f9i_new', 'f9i_new', 40) }]);
+    await assert.rejects(migrateJsonToPostgres(db.pool, src as any), /injected failure inside the counter rebuild/);
+    const after = (await db.pool.query("SELECT (SELECT count(*) FROM users WHERE project_count > 0)::int AS rebuilt, (SELECT count(*) FROM projects WHERE id = 'proj_f9i_new')::int AS inserted, (SELECT count(*) FROM data_migrations)::int AS runs")).rows[0];
+    assert.deepEqual(after, { rebuilt: 0, inserted: 0, runs: 0 }, 'the whole migration rolled back: no partially rebuilt counters, no inserted rows, no run record');
+    await db.pool.query('DROP TRIGGER f9_fault ON users');
+    const report = await migrateJsonToPostgres(db.pool, src as any);
+    assert.equal(report.verification.ok, true);
+    assert.equal(report.inserted.projects, 1);
+    assert.deepEqual(await drift(db), [], 're-run: exact counters for every user');
+    const t = await totalsMatch(db);
+    assert.equal(t.all[0], t.all[1]);
+  });
+
   test('100 000 users and 200 000 projects: the rebuild finishes under a 400 ms statement timeout, with exact counters', async () => {
     const { migrateJsonToPostgres } = await import('../server/db/dataMigration.ts');
     const { createPool } = await import('../server/db/pool.ts');
