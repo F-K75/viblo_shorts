@@ -105,8 +105,10 @@ const STORE_LIMITS = {
 const GUEST_MINT_SOFT_PER_HOUR = Math.floor(envNum('GUEST_MINT_SOFT_PER_HOUR', envNum('GUEST_MINT_PER_HOUR', 1000, 1), 1));
 const GUEST_MINT_HARD_PER_HOUR = Math.floor(envNum('GUEST_MINT_HARD_PER_HOUR', 0, 0)); // 0 = no hard ceiling
 const GUEST_MINT_PER_DEVICE_PER_DAY = Math.floor(envNum('GUEST_MINT_PER_DEVICE_PER_DAY', 3, 1));
-const GUEST_MINT_PER_IP_PER_HOUR = Math.floor(envNum('GUEST_MINT_PER_IP_PER_HOUR', 5, 1));
-const GUEST_MINT_PER_SUBNET_PER_HOUR = Math.floor(envNum('GUEST_MINT_PER_SUBNET_PER_HOUR', 30, 1)); // IPv4 /24 and IPv6 /48
+// Owner decision 2026-11-03: CAPTCHA is the primary control, so the network limits are loose enough for shared
+// networks (offices, universities, carrier NAT). Review them against real traffic; never tighten them silently.
+const GUEST_MINT_PER_IP_PER_HOUR = Math.floor(envNum('GUEST_MINT_PER_IP_PER_HOUR', 20, 1));
+const GUEST_MINT_PER_SUBNET_PER_HOUR = Math.floor(envNum('GUEST_MINT_PER_SUBNET_PER_HOUR', 100, 1)); // IPv4 /24 and IPv6 /48
 // Track C (R-13): request bodies, memory and slow clients (server/lib/requestGuards.ts). All configurable.
 const BODY_LIMITS: BodyLimits = {
   projectBytes: STORE_LIMITS.maxProjectBytes + 64 * 1024, // a whole project plus JSON envelope
@@ -465,12 +467,16 @@ function rateLimit(group: string, maxPerMinute: number, opts: { ai?: boolean } =
 const STATS_WINDOWS = 30 * 24;
 const GUEST_MINT_STAT = 'stats:guest-mint';
 const GUEST_REJECT_STAT = 'stats:guest-reject:';
+// Verified (CAPTCHA-passed) requests refused by the IP or subnet limit: the signal for legitimate users on shared
+// networks, kept apart from abuse signals such as CAPTCHA failures (owner decision 2026-11-03).
+const GUEST_NETWORK_REFUSAL_STAT = 'stats:guest-network-refused';
 const currentHour = () => Math.floor(Date.now() / 3600000);
 const alerted = { softHour: -1, captchaOutageAt: 0 };
 
 async function guestMintStatus() {
   const hour = currentHour();
-  const [series, rejected] = await Promise.all([repo.statSeries(GUEST_MINT_STAT, hour - STATS_WINDOWS + 1), repo.statsInWindow(GUEST_REJECT_STAT, hour)]);
+  const from = hour - STATS_WINDOWS + 1;
+  const [series, rejected, networkSeries] = await Promise.all([repo.statSeries(GUEST_MINT_STAT, from), repo.statsInWindow(GUEST_REJECT_STAT, hour), repo.statSeries(GUEST_NETWORK_REFUSAL_STAT, from)]);
   const thisHour = series.find((p) => p.windowId === hour)?.count ?? 0;
   return {
     thisHour,
@@ -479,7 +485,12 @@ async function guestMintStatus() {
     hardCeilingPerHour: GUEST_MINT_HARD_PER_HOUR || null,
     budgets: { perDevicePerDay: GUEST_MINT_PER_DEVICE_PER_DAY, perIpPerHour: GUEST_MINT_PER_IP_PER_HOUR, perSubnetPerHour: GUEST_MINT_PER_SUBNET_PER_HOUR },
     captcha: { required: CAPTCHA.required, provider: CAPTCHA.required ? 'turnstile' : null },
-    rejected, // this hour, by reason (all instances)
+    rejected, // this hour, by reason (all instances); budget refusals carry their scope, e.g. guest_rate_limited:ip
+    // Shared-network impact: verified requests refused by the IP or /24 / /48 limit (not abuse signals).
+    networkRefusals: {
+      thisHour: { ip: rejected['guest_rate_limited:ip'] ?? 0, subnet: rejected['guest_rate_limited:subnet'] ?? 0 },
+      series: networkSeries.map((p) => ({ hour: new Date(p.windowId * 3600000).toISOString(), count: p.count })),
+    },
     // Baseline for the hard ceiling: hourly mints, last 30 days (hours without mints are omitted).
     series: series.map((p) => ({ hour: new Date(p.windowId * 3600000).toISOString(), count: p.count })),
   };
@@ -1134,7 +1145,11 @@ app.post('/api/auth/guest', rateLimit('auth-guest', 10), async (req, res) => {
     }
     const scope = taken.key.startsWith('gm:dev:') ? 'device' : taken.key.startsWith('gm:ip:') ? 'ip' : 'subnet';
     const retry = scope === 'device' ? (dayWindow + 24 - hour) * 3600 - Math.floor((Date.now() % 3600000) / 1000) : untilNextHour;
-    return refuseGuestMint(res, 429, 'guest_rate_limited', 'Too many guest sessions were started from here recently. Please try again later, or sign in to continue.', { scope }, retry);
+    // Every request here already passed the CAPTCHA: an IP or subnet refusal is shared-network impact, recorded apart.
+    repo.recordStat(GUEST_REJECT_STAT + `guest_rate_limited:${scope}`, hour).catch(() => {});
+    if (scope !== 'device') repo.recordStat(GUEST_NETWORK_REFUSAL_STAT, hour).catch(() => {});
+    res.setHeader('Retry-After', String(retry));
+    return res.status(429).json({ error: 'Too many guest sessions were started from here recently. Please try again later, or sign in to continue.', code: 'guest_rate_limited', scope });
   }
 
   const issued = authService.issueGuestToken();
