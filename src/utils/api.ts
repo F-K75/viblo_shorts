@@ -3,6 +3,7 @@
 //  - a server-signed guest token (obtained from /api/auth/guest and kept in localStorage).
 // The server never trusts a client-supplied user id.
 import { auth } from './googleDrive';
+import { captchaConfig, getCaptchaToken, guestMintErrorMessage } from './captcha';
 
 const GUEST_TOKEN_KEY = 'forge_guest_token';
 let guestTokenPromise: Promise<string> | null = null;
@@ -30,8 +31,17 @@ export async function ensureGuestSession(): Promise<{ token: string; userId: str
       // fall through and mint a new one
     }
   }
-  const res = await fetch('/api/auth/guest', { method: 'POST' });
-  if (!res.ok) throw new Error(`Could not start a guest session (${res.status})`);
+  // Track A: solve Turnstile first when the server requires it (the token is single-use and verified server-side).
+  const captcha = await captchaConfig();
+  const body = captcha ? JSON.stringify({ 'cf-turnstile-response': await getCaptchaToken(captcha.siteKey) }) : undefined;
+  const res = await fetch('/api/auth/guest', { method: 'POST', headers: body ? { 'content-type': 'application/json' } : undefined, body });
+  if (!res.ok) {
+    const code = await res
+      .json()
+      .then((j) => j?.code as string | undefined)
+      .catch(() => undefined);
+    throw new Error(guestMintErrorMessage(res.status, code));
+  }
   const data = await res.json();
   localStorage.setItem(GUEST_TOKEN_KEY, JSON.stringify({ token: data.token, expiresAt: data.expiresAt }));
   return { token: data.token, userId: data.userId };

@@ -5,7 +5,7 @@
 //  * rate limits: token buckets computed with the database clock (consistent across instances)
 //  * jobs: FOR UPDATE SKIP LOCKED claim, worker heartbeats, reaper for dead workers
 import { StoreLimitError, type StoreLimits } from '../lib/projectStore.ts';
-import { ProjectOwnershipError, userKindOf, type AdmissionContext, type AiSettlement, type HeartbeatResult, type JobAdmission, type JobDenial, type QuotaEntry, type ReapResult, type Repo, type ServerJob, type StoredSubscription } from '../lib/repo.ts';
+import { ProjectOwnershipError, userKindOf, type AdmissionContext, type AiSettlement, type HeartbeatResult, type JobAdmission, type JobDenial, type QuotaEntry, type ReapResult, type Repo, type WindowEntry, STATS_RETENTION_WINDOWS, type ServerJob, type StoredSubscription } from '../lib/repo.ts';
 import { LOCKS, withTx, type Db, type Tx } from './pool.ts';
 
 const dayDate = (day: number) => new Date(day * 86400000).toISOString().slice(0, 10);
@@ -266,6 +266,55 @@ export class PostgresRepo implements Repo {
     return { ok: true, count: Number(r.rows[0].count) };
   }
 
+  // ---------- guest registration protection (Track A) ----------
+  // Single use: the INSERT succeeds for exactly one caller per unexpired hash, on any instance (primary key).
+  async redeemOnce(key: string, ttlMs: number) {
+    const r = await this.db.query(
+      `INSERT INTO captcha_redemptions (token_hash, expires_at) VALUES ($1, now() + ($2::int * interval '1 millisecond'))
+       ON CONFLICT (token_hash) DO UPDATE SET expires_at = EXCLUDED.expires_at WHERE captcha_redemptions.expires_at < now()
+       RETURNING 1`,
+      [key, ttlMs],
+    );
+    return (r.rowCount ?? 0) > 0;
+  }
+  // All or nothing, in one transaction; rows are locked in key order, so concurrent callers cannot deadlock.
+  async takeWindows(entries: WindowEntry[]) {
+    const sorted = [...entries].sort((a, b) => a.key.localeCompare(b.key) || a.windowId - b.windowId);
+    try {
+      await withTx(this.db, async (tx) => {
+        for (const e of sorted) {
+          const r = await tx.query(
+            `INSERT INTO window_counters (key, window_id, count) VALUES ($1, $2, 1)
+             ON CONFLICT (key, window_id) DO UPDATE SET count = window_counters.count + 1
+             RETURNING count`,
+            [e.key, e.windowId],
+          );
+          if (Number(r.rows[0].count) > e.limit) throw new WindowExhausted(e.key); // rolls back every increment
+        }
+      });
+      return { ok: true as const };
+    } catch (err) {
+      if (err instanceof WindowExhausted) return { ok: false as const, key: err.key };
+      throw err;
+    }
+  }
+  async recordStat(key: string, windowId: number) {
+    const r = await this.db.query(
+      `INSERT INTO window_counters (key, window_id, count) VALUES ($1, $2, 1)
+       ON CONFLICT (key, window_id) DO UPDATE SET count = window_counters.count + 1 RETURNING count`,
+      [key, windowId],
+    );
+    return Number(r.rows[0].count);
+  }
+  async statsInWindow(prefix: string, windowId: number) {
+    const { rows } = await this.db.query('SELECT key, count FROM window_counters WHERE window_id = $1 AND starts_with(key, $2)', [windowId, prefix]);
+    return Object.fromEntries(rows.map((r: any) => [String(r.key).slice(prefix.length), Number(r.count)]));
+  }
+  async statSeries(key: string, fromWindowId: number) {
+    const { rows } = await this.db.query('SELECT window_id, count FROM window_counters WHERE key = $1 AND window_id >= $2 ORDER BY window_id', [key, fromWindowId]);
+    return rows.map((r: any) => ({ windowId: Number(r.window_id), count: Number(r.count) }));
+  }
+
   // ---------- jobs ----------
   async listJobs(userId: string, limit: number) {
     const { rows } = await this.db.query('SELECT * FROM jobs WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2', [userId, limit]);
@@ -441,9 +490,18 @@ export class PostgresRepo implements Repo {
 
   async sweep() {
     await this.db.query("DELETE FROM rate_buckets WHERE refilled_at < now() - interval '10 minutes'");
-    await this.db.query('DELETE FROM window_counters WHERE window_id < $1', [Math.floor(Date.now() / 3600000) - 48]);
+    // Limit windows are hourly ids and die after 48 h; statistics ('stats:*', the guest-mint baseline) are kept 30 days.
+    const hour = Math.floor(Date.now() / 3600000);
+    await this.db.query("DELETE FROM window_counters WHERE (window_id < $1 AND NOT starts_with(key, 'stats:')) OR window_id < $2", [hour - 48, hour - STATS_RETENTION_WINDOWS]);
+    await this.db.query('DELETE FROM captcha_redemptions WHERE expires_at < now()');
     await this.db.query("DELETE FROM ai_usage_daily WHERE day < (now() - interval '35 days')::date");
     await this.db.query("DELETE FROM ai_reservations WHERE status <> 'reserved' AND settled_at < now() - interval '35 days'");
+  }
+}
+
+class WindowExhausted extends Error {
+  constructor(readonly key: string) {
+    super(`window exhausted: ${key}`);
   }
 }
 
