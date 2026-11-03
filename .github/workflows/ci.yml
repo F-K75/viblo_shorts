@@ -125,6 +125,8 @@ jobs:
       - name: Restore guard in the container (D2)
         run: bash scripts/ci/docker-restore-guard.sh
       - name: Stopping Node also stops its ffmpeg renders (D7)
+        # independent of D2: runs even if the restore-guard step failed (the job still fails)
+        if: ${{ !cancelled() }}
         run: bash scripts/ci/docker-ffmpeg-termination.sh
       - name: Backup image has the required tools
         run: |
