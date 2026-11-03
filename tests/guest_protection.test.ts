@@ -363,3 +363,41 @@ describe('A0: guest-mint baseline measurement', () => {
     assert.equal((await healthDetails(A.baseUrl)).guestMints.thisHour, 2);
   });
 });
+
+// ---------------------------------------------------------------- verification additions (written after the implementation)
+describe('A-verify: added after the implementation (not red-first)', () => {
+  test('a provider configuration error (wrong secret) is an outage for new guests (503 + alert), never blamed on the user (403)', async () => {
+    const v = await stub();
+    const s = await boot({ ...captchaEnv(v.url), TURNSTILE_SECRET: 'not-the-secret-the-provider-expects' });
+    const m = await mint(s);
+    assert.deepEqual([m.status, m.code], [503, 'captcha_unavailable'], statuses([m]));
+    assert.match(s.logs(), /"event":"captcha_provider_unavailable","reason":"provider_invalid-input-secret"/);
+    assert.ok(!s.logs().includes('not-the-secret-the-provider-expects'), 'the configured secret is not logged');
+  });
+
+  test('an existing guest keeps working when the hard ceiling refuses new guests', async () => {
+    const v = await stub();
+    const s = await boot({ ...captchaEnv(v.url), GUEST_MINT_HARD_PER_HOUR: '1' });
+    const first = await mint(s);
+    assert.equal(first.status, 200);
+    assert.equal((await mint(s)).code, 'guest_capacity');
+    assert.equal((await api(s, '/api/projects', first.token!, { method: 'POST', body: JSON.stringify({ title: 'still works' }) })).status, 200);
+    assert.equal((await api(s, '/api/auth/me', first.token!)).status, 200);
+  });
+
+  // The device budget limits a real browser's "clear the token, mint again" loop. A scripted client can always drop or
+  // alter its cookie; scripts are held back by the CAPTCHA and the IP / subnet budgets, not by this one.
+  test('a padded or decorated device cookie is never trusted as an existing device: it is replaced with a fresh one', async () => {
+    const v = await stub();
+    const s = await boot({ ...captchaEnv(v.url), GUEST_MINT_PER_DEVICE_PER_DAY: '1' });
+    const device = crypto.randomBytes(16).toString('base64url');
+    assert.equal((await mint(s, { cookie: device })).status, 200);
+    assert.equal((await mint(s, { cookie: device })).scope, 'device', 'the same device is refused');
+    for (const variant of [`${device}=`, ` ${device}`, `${device}%00`]) {
+      const m = await mint(s, { cookie: variant });
+      // a malformed value never matches the 22-character format, so it is treated as a NEW device and replaced
+      assert.notEqual(cookieValue(m.setCookie), undefined, `variant ${JSON.stringify(variant)} gets a fresh cookie`);
+      assert.notEqual(cookieValue(m.setCookie), device);
+    }
+  });
+});
