@@ -89,7 +89,8 @@ jobs:
           SECRET=$(openssl rand -hex 32)
           HEALTH_TOKEN=$(openssl rand -hex 32)
           for n in 1 2; do
-            docker run -d --name app$n --network forge -p 300$n:3000 -e SESSION_SECRET=$SECRET -e TRUST_PROXY=none -e HEALTH_DETAILS_TOKEN=$HEALTH_TOKEN \
+            # CAPTCHA_REQUIRED=false: no Turnstile widget exists for CI (the CAPTCHA path is covered by the test suite)
+            docker run -d --name app$n --network forge -p 300$n:3000 -e SESSION_SECRET=$SECRET -e TRUST_PROXY=none -e HEALTH_DETAILS_TOKEN=$HEALTH_TOKEN -e CAPTCHA_REQUIRED=false \
               -e DATABASE_URL='postgres://postgres:postgres@db:5432/postgres?sslmode=disable' forge-studio:ci
           done
           for n in 1 2; do for i in $(seq 1 30); do curl -fsS localhost:300$n/api/ready && break; sleep 2; done; done
@@ -105,7 +106,7 @@ jobs:
           docker logs app1
       - name: Container smoke test (explicit single-instance JSON backend + volume backup CLI)
         run: |
-          docker run -d --name fs -p 3000:3000 -e SESSION_SECRET=$(openssl rand -hex 32) -e TRUST_PROXY=none -e STORAGE_BACKEND=json forge-studio:ci
+          docker run -d --name fs -p 3000:3000 -e SESSION_SECRET=$(openssl rand -hex 32) -e TRUST_PROXY=none -e STORAGE_BACKEND=json -e CAPTCHA_REQUIRED=false forge-studio:ci
           for i in $(seq 1 30); do curl -fsS localhost:3000/api/ready && break; sleep 2; done
           curl -fsS localhost:3000/api/ready
           curl -fsS -X POST localhost:3000/api/auth/guest | grep -q token
@@ -115,9 +116,12 @@ jobs:
           set +e
           timeout 60 docker run --rm -e SESSION_SECRET=$(openssl rand -hex 32) -e DATABASE_URL=postgres://x@db/x forge-studio:ci; c1=$?
           timeout 60 docker run --rm -e SESSION_SECRET=$(openssl rand -hex 32) -e TRUST_PROXY=none forge-studio:ci; c2=$?
+          timeout 60 docker run --rm -e SESSION_SECRET=$(openssl rand -hex 32) -e TRUST_PROXY=none -e STORAGE_BACKEND=json forge-studio:ci > captcha.log 2>&1; c3=$?
           set -e
-          echo "no TRUST_PROXY -> $c1 ; no DATABASE_URL/STORAGE_BACKEND -> $c2"
-          test "$c1" = 1 && test "$c2" = 1
+          cat captcha.log
+          echo "no TRUST_PROXY -> $c1 ; no DATABASE_URL/STORAGE_BACKEND -> $c2 ; no TURNSTILE_SECRET -> $c3"
+          test "$c1" = 1 && test "$c2" = 1 && test "$c3" = 1
+          grep -q 'TURNSTILE_SECRET is required' captcha.log
       - name: Backup image has the required tools
         run: |
           docker run --rm --entrypoint sh forge-backup:ci -c 'pg_dump --version && pg_restore --version && psql --version && age --version && node --version'

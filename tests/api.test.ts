@@ -46,7 +46,8 @@ describe('health, readiness, config', () => {
   });
   test('config exposes feature flags only (no keys, model names or provider details)', async () => {
     const d = await (await api('/api/config')).json();
-    assert.deepEqual(d, { features: { ai: false, stockFootage: false, billing: 'disabled' } });
+    // captcha: the public Turnstile site key when CAPTCHA is required, else null (never the secret; Track A)
+    assert.deepEqual(d, { features: { ai: false, stockFootage: false, billing: 'disabled', captcha: null } });
   });
   test('security headers present, x-powered-by removed', async () => {
     const r = await api('/api/health');

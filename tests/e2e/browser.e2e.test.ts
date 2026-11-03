@@ -23,7 +23,9 @@ const skip = !chromium ? 'playwright not installed' : !hasDist ? 'dist/ missing 
 let srv: TestServer;
 before(async () => {
   if (skip) return;
-  srv = await startTestServer({ NODE_ENV: 'production', TRUST_PROXY: 'none', ...(TEST_BACKEND === 'json' ? { STORAGE_BACKEND: 'json' } : {}) });
+  // Track A: production now requires Turnstile unless explicitly disabled. This journey runs without CAPTCHA; the
+  // CAPTCHA journey is tests/e2e/captcha.e2e.test.ts.
+  srv = await startTestServer({ NODE_ENV: 'production', TRUST_PROXY: 'none', CAPTCHA_REQUIRED: 'false', ...(TEST_BACKEND === 'json' ? { STORAGE_BACKEND: 'json' } : {}) });
 });
 after(async () => srv?.stop());
 

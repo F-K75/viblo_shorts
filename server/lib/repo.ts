@@ -47,6 +47,14 @@ export interface QuotaEntry {
   limit: number;
 }
 
+export interface WindowEntry {
+  key: string;
+  windowId: number;
+  limit: number;
+}
+/** Statistics keys ('stats:*') are kept 30 days of hourly windows (the guest-mint baseline). */
+export const STATS_RETENTION_WINDOWS = 30 * 24;
+
 export type HeartbeatResult = 'ok' | 'cancelled' | 'lost';
 export type JobDenial = [number, Record<string, unknown>];
 /** What the admission rule sees besides the user's own active jobs (counted atomically with the insert). */
@@ -115,6 +123,24 @@ export interface Repo {
   takeRateTokens(buckets: Array<{ key: string; max: number }>): Promise<{ ok: boolean; remaining: number }>;
   /** Fixed-window counter: increments only while count < limit. */
   incrementWindow(key: string, windowId: number, limit: number): Promise<{ ok: boolean; count: number }>;
+
+  // ---- guest registration protection (Track A) ----
+  /**
+   * Records `key` as used for ttlMs. True only for the first redemption while unexpired, on any instance (single-use
+   * CAPTCHA tokens; the key is a hash, never the token).
+   */
+  redeemOnce(key: string, ttlMs: number): Promise<boolean>;
+  /**
+   * Fixed-window counters, all or nothing: increments every entry only if each stays within its limit; otherwise
+   * nothing changes and the first exhausted key is returned. Atomic across instances.
+   */
+  takeWindows(entries: WindowEntry[]): Promise<{ ok: true } | { ok: false; key: string }>;
+  /** Statistics counter (no limit) for `key` in `windowId`; returns the new count. Kept STATS_RETENTION_WINDOWS. */
+  recordStat(key: string, windowId: number): Promise<number>;
+  /** All statistics counters whose key starts with `prefix` in one window, as { suffix: count }. */
+  statsInWindow(prefix: string, windowId: number): Promise<Record<string, number>>;
+  /** One statistics key's counts for windows >= fromWindowId, oldest first. */
+  statSeries(key: string, fromWindowId: number): Promise<Array<{ windowId: number; count: number }>>;
 
   // ---- render jobs ----
   listJobs(userId: string, limit: number): Promise<ServerJob[]>;

@@ -38,6 +38,7 @@ import { createPool, isUnavailable, isRetryableTxError, txRetryCount } from './s
 import { migrate } from './server/db/migrate.ts';
 import { createSnapshot, listSnapshots, pruneSnapshots, writeServerLock, removeServerLock, restoreInProgressReason } from './server/lib/backup.ts';
 import { cleanAndParseJSON, validateScript, normalizeHashtags, quoteUserInput } from './server/lib/llm.ts';
+import { CaptchaUnavailableError, TurnstileVerifier, deviceCookieHeader, newDeviceId, normalizeIp, parseCaptchaConfig, readDeviceCookie, sha256Hex, subnetOf, type CaptchaVerifier } from './server/lib/guestProtection.ts';
 import { MemoryGuard, computeMemoryBudget, containerMemoryLimitBytes, createBodyGuard, createRouteJsonParser, type BodyLimits, type MemoryBudget } from './server/lib/requestGuards.ts';
 
 dotenv.config();
@@ -97,7 +98,17 @@ const STORE_LIMITS = {
   totalMaxBytes: envNum('STORE_MAX_TOTAL_MB', 4096, 1) * MB,
   minFreeDiskBytes: envNum('MIN_FREE_DISK_MB', 256, 0) * MB,
 };
-const GUEST_MINT_PER_HOUR = envNum('GUEST_MINT_PER_HOUR', 1000, 1);
+// Track A (R-03): guest registration budgets, all configurable. Enforced across instances (Repo windows).
+// The global SOFT threshold (GUEST_MINT_PER_HOUR is its former name) alerts and tightens the per-IP and per-subnet
+// budgets; it never rejects a verified mint. The HARD ceiling is off until set from measured traffic (10x the p99
+// hourly peak once 14 days of the /api/health/details series exist).
+const GUEST_MINT_SOFT_PER_HOUR = Math.floor(envNum('GUEST_MINT_SOFT_PER_HOUR', envNum('GUEST_MINT_PER_HOUR', 1000, 1), 1));
+const GUEST_MINT_HARD_PER_HOUR = Math.floor(envNum('GUEST_MINT_HARD_PER_HOUR', 0, 0)); // 0 = no hard ceiling
+const GUEST_MINT_PER_DEVICE_PER_DAY = Math.floor(envNum('GUEST_MINT_PER_DEVICE_PER_DAY', 3, 1));
+// Owner decision 2026-11-03: CAPTCHA is the primary control, so the network limits are loose enough for shared
+// networks (offices, universities, carrier NAT). Review them against real traffic; never tighten them silently.
+const GUEST_MINT_PER_IP_PER_HOUR = Math.floor(envNum('GUEST_MINT_PER_IP_PER_HOUR', 20, 1));
+const GUEST_MINT_PER_SUBNET_PER_HOUR = Math.floor(envNum('GUEST_MINT_PER_SUBNET_PER_HOUR', 100, 1)); // IPv4 /24 and IPv6 /48
 // Track C (R-13): request bodies, memory and slow clients (server/lib/requestGuards.ts). All configurable.
 const BODY_LIMITS: BodyLimits = {
   projectBytes: STORE_LIMITS.maxProjectBytes + 64 * 1024, // a whole project plus JSON envelope
@@ -191,6 +202,19 @@ const STORAGE_BACKEND: 'postgres' | 'json' = (() => {
   }
   return 'json';
 })();
+// Track A: CAPTCHA (Cloudflare Turnstile). Checked after the proxy and storage settings so their errors come first.
+const CAPTCHA = (() => {
+  const c = parseCaptchaConfig(process.env, IS_PROD);
+  if (!c.ok) {
+    console.error(`[Config] ${c.error}`);
+    process.exit(1);
+  }
+  if (!c.config.required && IS_PROD) {
+    console.warn(JSON.stringify({ level: 'warn', event: 'captcha_disabled', note: 'CAPTCHA_REQUIRED=false: guest registration is protected only by rate limits. Not recommended in production.' }));
+  }
+  return c.config;
+})();
+const captchaVerifier: CaptchaVerifier | null = CAPTCHA.required ? new TurnstileVerifier(CAPTCHA) : null;
 const INSTANCE_ID = `${os.hostname()}:${process.pid}:${crypto.randomBytes(3).toString('hex')}`;
 let repo: Repo; // assigned in initStorage() before the server listens
 let jsonMigrationNote = '';
@@ -439,20 +463,44 @@ function rateLimit(group: string, maxPerMinute: number, opts: { ai?: boolean } =
   };
 }
 
-// Guest sessions are free to mint, so they also have a global hourly budget (FS-001): spoofed or rotating IPs
-// cannot create unbounded accounts. Shared across instances via the Repo.
-let guestMintsThisHour = 0;
-async function guestMintBudget(_req: express.Request, res: express.Response, next: express.NextFunction) {
-  const hour = Math.floor(Date.now() / 3600000);
-  const w = await repo.incrementWindow('guest-mint', hour, GUEST_MINT_PER_HOUR);
-  guestMintsThisHour = w.count;
-  if (!w.ok) {
-    res.setHeader('Retry-After', String(3600 - Math.floor((Date.now() % 3600000) / 1000)));
-    return res.status(429).json({ error: 'Guest sign-ups are temporarily paused because of high demand. Please create a free account or try again later.', code: 'guest_capacity' });
-  }
-  next();
+// ---------- guest registration protection (Track A, R-03; server/lib/guestProtection.ts) ----------
+const STATS_WINDOWS = 30 * 24;
+const GUEST_MINT_STAT = 'stats:guest-mint';
+const GUEST_REJECT_STAT = 'stats:guest-reject:';
+// Verified (CAPTCHA-passed) requests refused by the IP or subnet limit: the signal for legitimate users on shared
+// networks, kept apart from abuse signals such as CAPTCHA failures (owner decision 2026-11-03).
+const GUEST_NETWORK_REFUSAL_STAT = 'stats:guest-network-refused';
+const currentHour = () => Math.floor(Date.now() / 3600000);
+const alerted = { softHour: -1, captchaOutageAt: 0 };
+
+async function guestMintStatus() {
+  const hour = currentHour();
+  const from = hour - STATS_WINDOWS + 1;
+  const [series, rejected, networkSeries] = await Promise.all([repo.statSeries(GUEST_MINT_STAT, from), repo.statsInWindow(GUEST_REJECT_STAT, hour), repo.statSeries(GUEST_NETWORK_REFUSAL_STAT, from)]);
+  const thisHour = series.find((p) => p.windowId === hour)?.count ?? 0;
+  return {
+    thisHour,
+    softThresholdPerHour: GUEST_MINT_SOFT_PER_HOUR,
+    softThresholdTripped: thisHour >= GUEST_MINT_SOFT_PER_HOUR,
+    hardCeilingPerHour: GUEST_MINT_HARD_PER_HOUR || null,
+    budgets: { perDevicePerDay: GUEST_MINT_PER_DEVICE_PER_DAY, perIpPerHour: GUEST_MINT_PER_IP_PER_HOUR, perSubnetPerHour: GUEST_MINT_PER_SUBNET_PER_HOUR },
+    captcha: { required: CAPTCHA.required, provider: CAPTCHA.required ? 'turnstile' : null },
+    rejected, // this hour, by reason (all instances); budget refusals carry their scope, e.g. guest_rate_limited:ip
+    // Shared-network impact: verified requests refused by the IP or /24 / /48 limit (not abuse signals).
+    networkRefusals: {
+      thisHour: { ip: rejected['guest_rate_limited:ip'] ?? 0, subnet: rejected['guest_rate_limited:subnet'] ?? 0 },
+      series: networkSeries.map((p) => ({ hour: new Date(p.windowId * 3600000).toISOString(), count: p.count })),
+    },
+    // Baseline for the hard ceiling: hourly mints, last 30 days (hours without mints are omitted).
+    series: series.map((p) => ({ hour: new Date(p.windowId * 3600000).toISOString(), count: p.count })),
+  };
 }
 
+function refuseGuestMint(res: express.Response, status: number, code: string, error: string, extra: Record<string, unknown> = {}, retryAfterS?: number) {
+  repo.recordStat(GUEST_REJECT_STAT + code, currentHour()).catch(() => {});
+  if (retryAfterS) res.setHeader('Retry-After', String(retryAfterS));
+  return res.status(status).json({ error, code, ...extra });
+}
 // ==========================================
 // GEMINI LLM CLIENT (timeouts, retries, failover, metrics)
 // ==========================================
@@ -964,7 +1012,7 @@ app.get('/api/health/details', probeLimit(60), async (req, res) => {
     },
     backups: repo.kind === 'json' ? backupStatus() : { mode: 'database', note: 'PostgreSQL: encrypted off-site backups (scripts/db-backup.ts) and provider PITR; see docs/BACKUP_AND_RECOVERY.md' },
     proxy: { trust: trustProxy.ok ? trustProxy.description : 'invalid', untrustedForwardedRequests: proxyDiagnostics.untrustedForwardedRequests },
-    guestMintsThisHour,
+    guestMints: await guestMintStatus().catch(() => null),
     database: repo.kind === 'postgres' ? { txRetries: txRetryCount } : undefined,
     readinessComputations,
   });
@@ -1032,6 +1080,8 @@ app.get('/api/config', probeLimit(PROBE_LIMIT_PER_MIN), (_req, res) => {
       ai: Boolean(resolveGeminiApiKey()),
       stockFootage: hasPexelsKey(),
       billing: BILLING_MODE === 'demo' ? 'demo' : 'disabled',
+      // Public site key only; the secret never leaves the server except to Cloudflare's siteverify.
+      captcha: CAPTCHA.required ? { provider: 'turnstile', siteKey: CAPTCHA.siteKey } : null,
     },
   });
 });
@@ -1039,8 +1089,75 @@ app.get('/api/config', probeLimit(PROBE_LIMIT_PER_MIN), (_req, res) => {
 // ==========================================
 // AUTH ENDPOINTS
 // ==========================================
-app.post('/api/auth/guest', rateLimit('auth-guest', 10), guestMintBudget, (_req, res) => {
+// Guest registration (Track A). Order: cheap per-IP pre-filter -> single-use redemption -> CAPTCHA verification ->
+// budgets (only verified requests spend them) -> mint. Nothing here touches existing sessions: an outage of the
+// CAPTCHA provider or a spent budget only ever refuses NEW guests; signed-in users never come through this route.
+app.post('/api/auth/guest', rateLimit('auth-guest', 10), async (req, res) => {
+  const hour = currentHour();
+  const ip = normalizeIp(clientIp(req));
+  let device = readDeviceCookie(req.headers.cookie);
+  if (!device) {
+    device = newDeviceId();
+    res.setHeader('Set-Cookie', deviceCookieHeader(device));
+  }
+
+  if (captchaVerifier) {
+    const token = req.body?.['cf-turnstile-response'];
+    if (typeof token !== 'string' || token.length === 0 || token.length > 2048) {
+      return refuseGuestMint(res, 403, 'captcha_required', 'Please complete the verification to continue as a guest.');
+    }
+    // Single use on every instance, decided before the provider is asked (a replay never reaches it twice).
+    if (!(await repo.redeemOnce(`ts:${sha256Hex(token)}`, (CAPTCHA.maxTokenAgeS + 60) * 1000))) {
+      return refuseGuestMint(res, 403, 'captcha_replayed', 'This verification was already used. Please verify again.');
+    }
+    let verdict: Awaited<ReturnType<CaptchaVerifier['verify']>>;
+    try {
+      verdict = await captchaVerifier.verify(token, ip === 'unknown' ? undefined : ip);
+    } catch (err) {
+      if (!(err instanceof CaptchaUnavailableError)) throw err;
+      if (Date.now() - alerted.captchaOutageAt > 60000) {
+        alerted.captchaOutageAt = Date.now();
+        console.error(JSON.stringify({ level: 'error', event: 'captcha_provider_unavailable', reason: err.reason, note: 'New guest registrations are paused; existing sessions and signed-in users are unaffected.' }));
+      }
+      return refuseGuestMint(res, 503, 'captcha_unavailable', 'Guest sign-up is temporarily unavailable. Please try again shortly, or sign in to continue.', {}, 30);
+    }
+    if (!verdict.ok) {
+      return refuseGuestMint(res, 403, 'captcha_failed', 'Verification failed. Please try again.', { reason: verdict.reason });
+    }
+  }
+
+  // Budgets (all instances). Above the soft threshold, per-IP and per-subnet budgets are halved (never below 1).
+  const mintedThisHour = (await repo.statSeries(GUEST_MINT_STAT, hour))[0]?.count ?? 0;
+  const tighten = mintedThisHour >= GUEST_MINT_SOFT_PER_HOUR ? 2 : 1;
+  const dayWindow = Math.floor(hour / 24) * 24; // hour-aligned id, so the 48 h window sweep never cuts a day short
+  const entries = [
+    { key: `gm:dev:${sha256Hex(device)}`, windowId: dayWindow, limit: GUEST_MINT_PER_DEVICE_PER_DAY },
+    { key: `gm:ip:${ip}`, windowId: hour, limit: Math.max(1, Math.floor(GUEST_MINT_PER_IP_PER_HOUR / tighten)) },
+    { key: `gm:net:${subnetOf(ip)}`, windowId: hour, limit: Math.max(1, Math.floor(GUEST_MINT_PER_SUBNET_PER_HOUR / tighten)) },
+    ...(GUEST_MINT_HARD_PER_HOUR ? [{ key: 'gm:hard', windowId: hour, limit: GUEST_MINT_HARD_PER_HOUR }] : []),
+  ];
+  const taken = await repo.takeWindows(entries);
+  if (!taken.ok) {
+    const untilNextHour = 3600 - Math.floor((Date.now() % 3600000) / 1000);
+    if (taken.key === 'gm:hard') {
+      console.error(JSON.stringify({ level: 'error', event: 'guest_mint_hard_ceiling', perHour: GUEST_MINT_HARD_PER_HOUR }));
+      return refuseGuestMint(res, 429, 'guest_capacity', 'Guest sign-ups are paused because of unusually high demand. Please sign in (free) to continue.', {}, untilNextHour);
+    }
+    const scope = taken.key.startsWith('gm:dev:') ? 'device' : taken.key.startsWith('gm:ip:') ? 'ip' : 'subnet';
+    const retry = scope === 'device' ? (dayWindow + 24 - hour) * 3600 - Math.floor((Date.now() % 3600000) / 1000) : untilNextHour;
+    // Every request here already passed the CAPTCHA: an IP or subnet refusal is shared-network impact, recorded apart.
+    repo.recordStat(GUEST_REJECT_STAT + `guest_rate_limited:${scope}`, hour).catch(() => {});
+    if (scope !== 'device') repo.recordStat(GUEST_NETWORK_REFUSAL_STAT, hour).catch(() => {});
+    res.setHeader('Retry-After', String(retry));
+    return res.status(429).json({ error: 'Too many guest sessions were started from here recently. Please try again later, or sign in to continue.', code: 'guest_rate_limited', scope });
+  }
+
   const issued = authService.issueGuestToken();
+  const count = await repo.recordStat(GUEST_MINT_STAT, hour).catch(() => 0);
+  if (count >= GUEST_MINT_SOFT_PER_HOUR && alerted.softHour !== hour) {
+    alerted.softHour = hour;
+    console.warn(JSON.stringify({ level: 'warn', event: 'guest_mint_soft_threshold', perHour: GUEST_MINT_SOFT_PER_HOUR, thisHour: count, note: 'Per-IP and per-subnet guest budgets are halved for the rest of this hour. Verified sign-ups are not rejected.' }));
+  }
   res.json({ success: true, token: issued.token, userId: issued.userId, expiresAt: issued.expiresAt });
 });
 
@@ -2806,7 +2923,9 @@ function runScheduledBackup() {
 export async function startServer(): Promise<Server> {
   await initStorage(); // throws (=> exit 1) if the database never becomes reachable or a migration fails
 
-  if (IS_PROD) {
+  // SERVE_DIST=1 lets a test-mode server serve the production build (browser E2E with test stubs). It has no
+  // effect in production, which always serves dist/, nor in development (Vite).
+  if (IS_PROD || (IS_TEST && process.env.SERVE_DIST === '1')) {
     const dist = path.resolve(__dirname, 'dist');
     app.use(express.static(dist, { index: false, maxAge: '1h' }));
     app.get('*', (_req, res) => res.sendFile(path.join(dist, 'index.html')));

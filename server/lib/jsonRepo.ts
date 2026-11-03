@@ -7,7 +7,7 @@ import path from 'path';
 import { ProjectStore, type StoreLimits } from './projectStore.ts';
 import { readJsonFile, writeJsonFileAtomic } from './storage.ts';
 import { UsageLedger } from './usage.ts';
-import { ProjectOwnershipError, type AiSettlement, type HeartbeatResult, type JobAdmission, type JobDenial, type QuotaEntry, type ReapResult, type Repo, type ServerJob, type StoredSubscription } from './repo.ts';
+import { ProjectOwnershipError, type AiSettlement, type HeartbeatResult, type JobAdmission, type JobDenial, type QuotaEntry, type ReapResult, type Repo, type WindowEntry, STATS_RETENTION_WINDOWS, type ServerJob, type StoredSubscription } from './repo.ts';
 
 const MAX_STORED_JOBS = 500;
 
@@ -20,6 +20,11 @@ export class JsonRepo implements Repo {
   private buckets = new Map<string, { tokens: number; lastRefill: number }>();
   private windows = new Map<string, { windowId: number; count: number }>();
   private heartbeats = new Map<string, number>(); // jobId -> last heartbeat (ms)
+  // Track A. Single process: in-memory and atomic (no await between check and update). Not persisted: a restart
+  // forgets redemptions (the provider itself also rejects reused tokens) and the current windows.
+  private redemptions = new Map<string, number>(); // key -> expires at (ms)
+  private limitWindows = new Map<string, number>(); // `${key}@${windowId}` -> count
+  private stats = new Map<string, number>(); // `${key}@${windowId}` -> count
 
   constructor(
     dataDir: string,
@@ -196,6 +201,47 @@ export class JsonRepo implements Repo {
     return { ok: true, count: w.count };
   }
 
+  // ---------- guest registration protection (Track A) ----------
+  async redeemOnce(key: string, ttlMs: number) {
+    const now = Date.now();
+    const until = this.redemptions.get(key);
+    if (until !== undefined && until > now) return false;
+    this.redemptions.set(key, now + ttlMs);
+    return true;
+  }
+  async takeWindows(entries: WindowEntry[]) {
+    for (const e of entries) {
+      if ((this.limitWindows.get(`${e.key}@${e.windowId}`) ?? 0) + 1 > e.limit) return { ok: false as const, key: e.key };
+    }
+    for (const e of entries) {
+      const k = `${e.key}@${e.windowId}`;
+      this.limitWindows.set(k, (this.limitWindows.get(k) ?? 0) + 1);
+    }
+    return { ok: true as const };
+  }
+  async recordStat(key: string, windowId: number) {
+    const k = `${key}@${windowId}`;
+    const n = (this.stats.get(k) ?? 0) + 1;
+    this.stats.set(k, n);
+    return n;
+  }
+  async statsInWindow(prefix: string, windowId: number) {
+    const out: Record<string, number> = {};
+    for (const [k, n] of this.stats) {
+      const at = k.lastIndexOf('@');
+      if (k.startsWith(prefix) && Number(k.slice(at + 1)) === windowId) out[k.slice(prefix.length, at)] = n;
+    }
+    return out;
+  }
+  async statSeries(key: string, fromWindowId: number) {
+    const out: Array<{ windowId: number; count: number }> = [];
+    for (const [k, n] of this.stats) {
+      const at = k.lastIndexOf('@');
+      if (k.slice(0, at) === key && Number(k.slice(at + 1)) >= fromWindowId) out.push({ windowId: Number(k.slice(at + 1)), count: n });
+    }
+    return out.sort((a, b) => a.windowId - b.windowId);
+  }
+
   // ---------- jobs ----------
   private jobs(): ServerJob[] {
     return readJsonFile<ServerJob[]>(this.jobsFile, []);
@@ -360,5 +406,9 @@ export class JsonRepo implements Repo {
   async sweep() {
     const now = Date.now();
     for (const [k, b] of this.buckets) if (now - b.lastRefill > 10 * 60000) this.buckets.delete(k);
+    for (const [k, until] of this.redemptions) if (until <= now) this.redemptions.delete(k);
+    const hour = Math.floor(now / 3600000);
+    for (const k of this.limitWindows.keys()) if (Number(k.slice(k.lastIndexOf('@') + 1)) < hour - 48) this.limitWindows.delete(k);
+    for (const k of this.stats.keys()) if (Number(k.slice(k.lastIndexOf('@') + 1)) < hour - STATS_RETENTION_WINDOWS) this.stats.delete(k);
   }
 }

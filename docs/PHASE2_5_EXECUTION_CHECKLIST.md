@@ -40,6 +40,14 @@
 | A8 | Client: Turnstile widget before the first guest mint; site key from `/api/config` | Browser E2E with Cloudflare's documented test keys [to confirm at implementation time] |
 | A9 | Privacy-policy text for the device cookie (purpose: security / strictly necessary) | Draft text in docs, for your approval |
 
+**Track A status (2026-11-03):** A0–A9 implemented on `claude/keen-feynman-xtbvz2-track-a`, awaiting review.
+Evidence and the deviations from this checklist are in `docs/PHASE2_5_TRACK_A.md` §3.1:
+* migration `0004_captcha_redemptions.sql`;
+* fixed windows instead of token buckets;
+* cookie-only device id;
+* soft escalation = halved budgets + alert;
+* hard ceiling off until measured.
+
 **Needs from you before A goes live (not before implementation):** a Cloudflare Turnstile widget (free tier) and its
 secret stored in GitHub Actions or Secrets Manager. I never handle the value.
 

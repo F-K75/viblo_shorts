@@ -7,8 +7,8 @@ Rate limits are per client IP per route group (token bucket / minute). **AI** = 
 |---|---|---|---|---|
 | GET | /api/health | public | – | Liveness: uptime, memory, AI metrics, render queue |
 | GET | /api/ready | public | – | Readiness: storage writable + ffmpeg present (503 otherwise) |
-| GET | /api/config | public | – | Feature flags (key presence only, never values) |
-| POST | /api/auth/guest | public | 10 | Issue signed guest session |
+| GET | /api/config | public | – | Feature flags (key presence only, never values); `features.captcha` = `{provider:'turnstile', siteKey}` (public site key) or `null` |
+| POST | /api/auth/guest | public | 10 | Issue signed guest session. Body `{"cf-turnstile-response": token}` when CAPTCHA is required. 403 `captcha_required` / `captcha_failed` / `captcha_replayed`; 503 `captcha_unavailable` (new guests only); 429 `guest_rate_limited` (`scope`: device / ip / subnet) or `guest_capacity` (optional hard ceiling); sets the `__Host-fs_dev` security cookie. See docs/PHASE2_5_TRACK_A.md |
 | GET | /api/auth/me | user | 60 | Resolved identity |
 | GET | /api/quota | user | 60 | Plan + usage |
 | GET | /api/user/subscription | user | 60 | Subscription |

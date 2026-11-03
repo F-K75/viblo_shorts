@@ -8,6 +8,7 @@ services:
       NODE_ENV: production
       DATA_DIR: /data
       # .env must set DATABASE_URL (managed PostgreSQL), or STORAGE_BACKEND=json for an explicit single instance.
+      # .env must also set TURNSTILE_SITE_KEY, TURNSTILE_SECRET and TURNSTILE_HOSTNAMES (Track A), or CAPTCHA_REQUIRED=false.
     volumes:
       - forge-data:/data
     restart: unless-stopped
