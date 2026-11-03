@@ -474,7 +474,12 @@ describe('Gate finding (postgres): a guest-mint refusal is recorded before the r
     const { startTurnstileStub } = await import('./helpers/turnstileStub.ts');
     const secret = `gate-secret-${crypto.randomBytes(8).toString('hex')}`;
     const v = await startTurnstileStub({ secret, hostname: 'forge.test' });
+    // Always PostgreSQL (the race is between pooled connections), also when the suite runs with JSON servers.
+    const db = await createTestDatabase({ migrate: false });
+    await db.pool.end();
+    dbs.push(db);
     const s = await startTestServer({
+      DATABASE_URL: db.url,
       CAPTCHA_REQUIRED: 'true',
       TURNSTILE_SECRET: secret,
       TURNSTILE_SITE_KEY: '1x-gate-site-key',
