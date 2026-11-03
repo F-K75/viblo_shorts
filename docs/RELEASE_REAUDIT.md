@@ -1,42 +1,59 @@
 # Forge Studio — Independent Re-audit + Corrective Round
 
-## Phase 2.5 Track A (R-03): IMPLEMENTED, awaiting review (branch `claude/keen-feynman-xtbvz2-track-a`)
-* **Not merged, not release-ready.** Evidence: `docs/PHASE2_5_TRACK_A.md`. Based on `main` @ `80e02b5`; this PR also
-  carries the Track B re-audit commit `f33c5e5` as its own commit.
-* **Red first:** on `80e02b5`, 17 of 17 new tests failed. They reproduced:
-  * mints with no CAPTCHA;
-  * a verified newcomer locked out (`429`) once an IP-rotating attacker spent the global budget;
-  * 30 of 30 token replays accepted;
-  * no device, subnet or IPv6 budgets;
-  * no outage handling, and production starting without CAPTCHA.
-  * The browser E2E against the old build showed no widget ever requested.
-* **Implemented:**
-  * server-side Turnstile;
-  * single-use tokens across instances (migration `0004`);
-  * device / IP / IPv4 /24 / IPv6 /48 budgets;
-  * the `__Host-fs_dev` cookie;
-  * a soft threshold that alerts and tightens without rejecting verified sign-ups;
-  * an optional hard ceiling (off until measured);
-  * a provider outage pauses only new guests;
-  * the hourly baseline series;
-  * the client widget.
-* **Gate:** gates 1 and 2 failed on test connection exhaustion (recorded with root causes); gate 3 on `817f204` passed:
-  * new tests 55/55 × 3 per backend;
-  * full suites with 0 failures;
-  * E2E 2/2 per backend.
-* **R-03: fixed on the branch, pending review and CI.** It is not live until the owner creates a Turnstile widget and
-  stores the secret.
-* **Owner decisions (2026-11-03), recorded in Track A §10:**
-  * Hard ceiling: **off** until 14 days of traffic exist; the 10 × p99 value comes back for approval.
-  * Network limits: **20/h per IP, 100/h per /24 and /48, 3/day per device**, with halving kept. Shared-network
-    refusals are recorded separately from abuse signals.
-  * Privacy notice: **approved as a draft** with the 35-day disclosure; legal review is still required before launch.
-  * Deviations accepted: cookie only; escalation temporarily weaker (documented as not equivalent to an interactive
-    challenge); no emergency outage budget; the fixed-window burst accepted with monitoring.
-  * `/api/health/details` was verified as not public.
-* **CI run 35 on `e64615b` was green** (accepted by the owner). The final head after these changes is re-verified in
-  the PR.
-* **Merge approval is still withheld** pending the final CI evidence.
+## Phase 2.5 Track A (R-03): MERGED (PR #6 → `main` @ `6ee9c11`, 2026-11-03) and closed
+* **Merged with owner approval** as merge commit `6ee9c11`. Its parents are the previous `main` (`80e02b5`) and the
+  approved head (`ce4c5e2`), and its tree is identical to `ce4c5e2`. The merge was pinned to that head SHA.
+  * The code was tested in CI run 36 on `ffa98c0` (code `a11cf5d`).
+  * `ce4c5e2` is docs-only: its non-docs tree hash equals `ffa98c0`'s. The owner waived a CI run for it.
+* **Owner decisions** (`docs/PHASE2_5_TRACK_A.md` §10):
+  * hard ceiling off until 14 days of traffic exist; the 10 × p99 value comes back for approval;
+  * network limits of 20/h per IP and 100/h per /24 and /48, 3/day per device, with halving;
+  * shared-network refusals recorded separately;
+  * privacy notice approved as a draft (legal review still required);
+  * deviations accepted with conditions.
+* **Post-merge CI, run 38 on `main` @ `6ee9c11`: green, every job's log read:**
+
+| Job / step | Result (from the log) |
+|---|---|
+| `test`: checkout, install, typecheck | step conclusions `success`. The fetched log is capped at 5 000 lines and starts during the JSON suite, so these steps are evidenced by status only. |
+| `test`: JSON suite | 254 tests, 252 pass, **0 fail**, 0 cancelled, 2 skipped |
+| `test`: every server on PostgreSQL | 254 tests, 245 pass, **0 fail**, 0 cancelled, 9 skipped |
+| `test`: Track A (A0–A8, A-verify, A-decisions, contract tests, CAPTCHA E2E) | 32 result lines, 0 failures |
+| `test`: build; E2E | build passes; E2E JSON 2/2, PostgreSQL 2/2 |
+| `test`: `bun audit --audit-level=high` | "No vulnerabilities found (checked 389 packages, 2 below --audit-level=high, 1 ignored)" |
+| `test`: E2E step's throwaway Playwright install | npm prints "5 vulnerabilities (1 moderate, 4 high)". Track A risk 13; Track D. |
+| `docker` (complete log, 2 240 lines, 0 errors) | migrations `0001`–`0004` applied (`"version":4`); 2-instance PostgreSQL and JSON smoke tests pass; production refuses without TRUST_PROXY, without DATABASE_URL and without TURNSTILE_SECRET (exit 1 each) |
+| `live-llm` | **green badge with 0 live tests**: `# pass 0`, `# skipped 2`, "GEMINI_API_KEY not set … (NOT passed)". Not live validation. |
+
+* **Skips:**
+  * 2 live Gemini tests per backend ("GEMINI_API_KEY not set");
+  * 7 JSON-only tests on PostgreSQL;
+  * no Track A test.
+* **R-03: fixed and merged.** It is not live until the owner creates a Turnstile widget and stores the secret.
+
+### Release position after Tracks C, B and A (production release NOT approved)
+| Track | State |
+|---|---|
+| C, memory protection (R-13) | merged (`53fc724`) |
+| B, render queue and billing (R-04, F7) | merged (`80e02b5`) |
+| A, guest registration protection (R-03) | merged (`6ee9c11`), closed |
+| D, operational hardening | not started; needs authorization |
+| E, live Gemini validation (R-01) | not started; needs authorization |
+
+**Open release blockers and pre-launch requirements:**
+1. **R-01 live Gemini validation.** CI's `live-llm` passes with 0 live tests; there is no real model evidence (Track E).
+2. **Turnstile go-live:** the owner creates the widget and stores the secret; one live check against the real Cloudflare
+   widget.
+3. **Privacy policy:** legal review of the full policy (the Track A §8 draft is approved as a draft only).
+4. **Deployment and recovery evidence:** production deployment, an operational restore and recovery drill on the target
+   infrastructure. No AWS provisioning has been authorized.
+5. **Track D follow-ups:**
+   * guest-token tamper test (fix without weakening it) and evaluation of non-canonical encodings;
+   * Docker-level check that stopping Node also stops ffmpeg;
+   * the EPIPE test helper;
+   * the Playwright throwaway-install vulnerabilities;
+   * CI database connection headroom (peaks at 92 of 100).
+6. **After 14 days of traffic:** the hard-ceiling proposal for approval and a review of the guest network limits.
 
 ## Phase 2.5 Track B (R-04, F7): MERGED (PR #5 → `main` @ `80e02b5`, 2026-11-03)
 * **Merged with owner approval** as merge commit `80e02b5`. Its parents are the previous `main` (`53fc724`) and the
