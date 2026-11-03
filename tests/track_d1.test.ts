@@ -407,3 +407,57 @@ describe('F11: backup verification covers ai_reservations (counts and content) a
     }
   });
 });
+
+// ---------------------------------------------------------------- D6: one accepted representation per guest token
+describe('D6: guest tokens have exactly one accepted encoding', () => {
+  const B64URL = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+  /** Every non-canonical spelling of `part` that Node's lenient base64url decoder maps to the same bytes. */
+  const variants = (part: string): Array<[string, string]> => {
+    const out: Array<[string, string]> = [];
+    const last = part.at(-1)!;
+    const idx = B64URL.indexOf(last);
+    // 32 bytes -> 43 chars: the last char carries 4 data bits + 2 unused bits; flipping the unused bits keeps the bytes
+    for (const flip of [1, 2, 3]) out.push([`unused bits ${flip}`, part.slice(0, -1) + B64URL[idx ^ flip]]);
+    out.push(['= padding', `${part}=`]);
+    out.push(['standard alphabet', part.replace(/-/g, '+').replace(/_/g, '/')]);
+    out.push(['embedded newline', `${part.slice(0, 10)}\n${part.slice(10)}`]);
+    return out.filter(([, v]) => v !== part);
+  };
+
+  test('AuthService: canonical tokens verify; every alternative encoding of the same signature (or body) is rejected', async () => {
+    const { AuthService } = await import('../server/lib/auth.ts');
+    const auth = new AuthService('d6-secret-'.padEnd(48, 'x'), undefined);
+    for (let n = 0; n < 50; n++) {
+      const { token, userId } = auth.issueGuestToken();
+      assert.equal(auth.verifyGuestToken(token)?.userId, userId, 'a canonical token from the current implementation verifies');
+      const [, body, sig] = token.split('.');
+      for (const [why, alt] of variants(sig)) {
+        if (Buffer.compare(Buffer.from(alt, 'base64url'), Buffer.from(sig, 'base64url')) !== 0) continue; // not the same bytes: not a re-encoding
+        assert.equal(auth.verifyGuestToken(`guest.${body}.${alt}`), null, `signature re-encoded (${why}) must be rejected`);
+      }
+      for (const [why, alt] of variants(body)) assert.equal(auth.verifyGuestToken(`guest.${alt}.${sig}`), null, `body re-encoded (${why}) must be rejected`);
+    }
+    for (const bad of ['', 'guest', 'guest..', 'guest.a.b.c', 'guest.!!!.###', `guest.${'A'.repeat(10)}.`]) assert.equal(auth.verifyGuestToken(bad), null, `malformed: ${JSON.stringify(bad)}`);
+  });
+
+  test('server: a non-canonical guest token gets exactly the normal invalid-token response', async () => {
+    const { startTestServer, guestToken } = await import('./helpers/server.ts');
+    const s = await startTestServer();
+    try {
+      const token = await guestToken(s.baseUrl);
+      const [, body, sig] = token.split('.');
+      const me = (t: string) => fetch(`${s.baseUrl}/api/auth/me`, { headers: { authorization: `Bearer ${t}` } });
+      assert.equal((await me(token)).status, 200);
+      const garbage = await me(`guest.${body}.${'A'.repeat(43)}`);
+      const expected = { status: garbage.status, body: await garbage.text() };
+      assert.equal(expected.status, 401);
+      for (const [why, alt] of variants(sig)) {
+        if (Buffer.compare(Buffer.from(alt, 'base64url'), Buffer.from(sig, 'base64url')) !== 0 || alt.includes('\n')) continue;
+        const r = await me(`guest.${body}.${alt}`);
+        assert.deepEqual({ status: r.status, body: await r.text() }, expected, `re-encoded signature (${why}): same response as any invalid token`);
+      }
+    } finally {
+      await s.stop();
+    }
+  });
+});
