@@ -176,6 +176,7 @@ Skips: 2 live Gemini tests on both backends (no key, "NOT passed"; R-01); 7 JSON
 | 9 | Junk redemptions from invalid tokens. | Bounded by the 10/min per-IP pre-filter; rows expire after about 6 minutes and are swept. |
 | 10 | Soft-threshold escalation is budget halving plus an alert. **This is not equivalent to a forced interactive challenge.** Every new guest still needs a CAPTCHA. | **Accepted temporarily** by the owner (§10). |
 | 11 | ASN-level budgets not built. | Deferred by owner decision (needs a GeoIP/ASN licence). |
+| 13 | **Dependency warning in the browser-test install.** The E2E step's throwaway `npm install --no-save playwright@1` prints "5 vulnerabilities (1 moderate, 4 high)" (CI runs 35 and 36). | **Residual dependency risk, recorded by owner decision (2026-11-03).** Not gating: the gating `bun audit --audit-level=high` passes ("No vulnerabilities found") and this PR changes no dependency or lockfile. It also appears in the re-audit's Track D follow-ups (investigate the npm advisories and pin or replace the throwaway install). |
 | 12 | **Test connection headroom.** The full PostgreSQL suite peaks at 92 of 100 connections (brief spikes) even with test pools of 4. A future test added in parallel could exhaust it again. | Test infrastructure, not production. If CI shows it, raise the CI database's `max_connections` rather than shrinking pools further. |
 
 ## 8. Privacy notice: approved draft (owner, 2026-11-03)
