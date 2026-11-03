@@ -141,8 +141,16 @@ describe('projects: lifecycle and isolation', () => {
 });
 
 describe('render engine and job queue (real ffmpeg)', () => {
+  // Track B: server renders need a signed-in account (guests get 403 sign_in_required, tests/render_queue.test.ts).
+  let RA: string; // alice (signed in)
+  let RM: string; // mallory (signed in)
+  before(() => {
+    RA = srv.signFirebaseToken({ sub: 'api-render-alice' });
+    RM = srv.signFirebaseToken({ sub: 'api-render-mallory' });
+  });
+
   test('direct render produces a playable MP4 with correct size; download supports ranges', async () => {
-    const r = await post('/api/render/video', A, {
+    const r = await post('/api/render/video', RA, {
       title: "E2E: it's 100% \\ok",
       duration: 3,
       resolution: '720p',
@@ -168,7 +176,7 @@ describe('render engine and job queue (real ffmpeg)', () => {
     assert.equal((await part.arrayBuffer()).byteLength, 1024);
     assert.equal((await api(d.downloadUrl, undefined, { headers: { Range: 'bytes=99999999-' } })).status, 416);
     assert.equal((await api(d.downloadUrl, undefined, { headers: { Range: 'bytes=abc-' } })).status, 416);
-    assert.equal((await api(`/api/render/probe/${d.renderId}`, A)).status, 200);
+    assert.equal((await api(`/api/render/probe/${d.renderId}`, RA)).status, 200);
   });
 
   test('path traversal on download is rejected', async () => {
@@ -178,34 +186,34 @@ describe('render engine and job queue (real ffmpeg)', () => {
   });
 
   test('jobs: unsupported type rejected; owner-only access; cancel kills render; retry re-renders', async () => {
-    assert.equal((await post('/api/jobs/create', A, { type: 'test_task' })).status, 400);
-    const created = await (await post('/api/jobs/create', A, { type: 'render_video', payload: { duration: 30, resolution: '1080p', beats: [{ text: 'x', start_s: 0, end_s: 2 }] } })).json();
+    assert.equal((await post('/api/jobs/create', RA, { type: 'test_task' })).status, 400);
+    const created = await (await post('/api/jobs/create', RA, { type: 'render_video', payload: { duration: 30, resolution: '1080p', beats: [{ text: 'x', start_s: 0, end_s: 2 }] } })).json();
     const id = created.job.id;
-    assert.equal((await api(`/api/jobs/${id}`, M)).status, 404);
-    assert.equal((await post(`/api/jobs/${id}/cancel`, M, {})).status, 404);
+    assert.equal((await api(`/api/jobs/${id}`, RM)).status, 404);
+    assert.equal((await post(`/api/jobs/${id}/cancel`, RM, {})).status, 404);
 
-    const cancelled = await (await post(`/api/jobs/${id}/cancel`, A, {})).json();
+    const cancelled = await (await post(`/api/jobs/${id}/cancel`, RA, {})).json();
     assert.equal(cancelled.job.status, 'cancelled');
     await new Promise((r) => setTimeout(r, 800));
-    assert.equal((await (await api(`/api/jobs/${id}`, A)).json()).job.status, 'cancelled', 'cancelled job must stay cancelled');
-    assert.equal((await post(`/api/jobs/${id}/cancel`, A, {})).status, 409);
+    assert.equal((await (await api(`/api/jobs/${id}`, RA)).json()).job.status, 'cancelled', 'cancelled job must stay cancelled');
+    assert.equal((await post(`/api/jobs/${id}/cancel`, RA, {})).status, 409);
 
     // Retry re-runs a REAL render (previously it faked "completed" after a timer).
-    assert.equal((await post(`/api/jobs/${id}/retry`, A, {})).status, 200);
+    assert.equal((await post(`/api/jobs/${id}/retry`, RA, {})).status, 200);
     let job: any;
     for (let i = 0; i < 120; i++) {
-      job = (await (await api(`/api/jobs/${id}`, A)).json()).job;
+      job = (await (await api(`/api/jobs/${id}`, RA)).json()).job;
       if (job.status === 'completed' || job.status === 'failed') break;
       await new Promise((r) => setTimeout(r, 500));
     }
     assert.equal(job.status, 'completed', JSON.stringify(job));
     const head = await api(job.result.downloadUrl, undefined, { headers: { Range: 'bytes=0-63' } });
     assert.equal(head.status, 206);
-    assert.equal((await post(`/api/jobs/${id}/retry`, A, {})).status, 409, 'completed jobs cannot be retried');
+    assert.equal((await post(`/api/jobs/${id}/retry`, RA, {})).status, 409, 'completed jobs cannot be retried');
 
-    const mine = await (await api('/api/jobs', A)).json();
+    const mine = await (await api('/api/jobs', RA)).json();
     assert.ok(mine.jobs.some((j: any) => j.id === id));
-    assert.ok(!(await (await api('/api/jobs', M)).json()).jobs.some((j: any) => j.id === id));
+    assert.ok(!(await (await api('/api/jobs', RM)).json()).jobs.some((j: any) => j.id === id));
   });
 });
 

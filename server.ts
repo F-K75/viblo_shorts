@@ -32,7 +32,7 @@ import { StoreUnavailableError, freeDiskBytes } from './server/lib/storage.ts';
 import { StoreLimitError } from './server/lib/projectStore.ts';
 import { utcDay } from './server/lib/usage.ts';
 import { JsonRepo } from './server/lib/jsonRepo.ts';
-import { ProjectOwnershipError, type Repo, type ServerJob, type StoredSubscription } from './server/lib/repo.ts';
+import { ProjectOwnershipError, type JobAdmission, type JobDenial, type Repo, type ServerJob, type StoredSubscription } from './server/lib/repo.ts';
 import { PostgresRepo } from './server/db/pgRepo.ts';
 import { createPool, isUnavailable, isRetryableTxError, txRetryCount } from './server/db/pool.ts';
 import { migrate } from './server/db/migrate.ts';
@@ -72,6 +72,19 @@ const envNum = (name: string, def: number, min = 0) => {
   const n = Number(process.env[name]);
   return Number.isFinite(n) && process.env[name] !== '' && process.env[name] !== undefined ? Math.max(min, n) : def;
 };
+// Track B (R-04): render queue limits. All configurable; defaults keep one user from monopolising the renderers.
+const intEnv = (name: string, def: number, min: number) => Math.floor(envNum(name, def, min));
+const RENDER_MAX_RUNNING_PER_USER = intEnv('RENDER_MAX_RUNNING_PER_USER', 1, 1);
+const RENDER_MAX_QUEUED_PER_USER = intEnv('RENDER_MAX_QUEUED_PER_USER', 3, 0);
+const RENDER_QUEUE_MAX = intEnv('RENDER_QUEUE_MAX', 200, 1); // queued jobs across all users and instances
+const RENDER_TIMEOUT_MIN_S = intEnv('RENDER_TIMEOUT_MIN_S', 60, 1);
+const RENDER_TIMEOUT_MAX_S = Math.max(RENDER_TIMEOUT_MIN_S, intEnv('RENDER_TIMEOUT_MAX_S', 600, 1));
+const RENDER_TIMEOUT_FACTOR = envNum('RENDER_TIMEOUT_FACTOR', 3, 0.1); // wall clock allowed per second of video
+const RENDER_QUEUE_TTL_S = intEnv('RENDER_QUEUE_TTL_S', 1800, 1);
+const RENDER_MAX_ATTEMPTS = intEnv('RENDER_MAX_ATTEMPTS', 2, 1); // claims per job before a crash-looping job fails
+// /api/render/video waits this long for its job, then answers 202 + job id (the job keeps running). Keep it below the
+// load balancer's idle timeout (e.g. 60 s): a connection cut by the proxy looks like a client that left, which cancels.
+const RENDER_SYNC_WAIT_S = intEnv('RENDER_SYNC_WAIT_S', 50, 1);
 const MB = 1024 * 1024;
 // Storage limits (FS-001). Writes that would grow a user's data past these are rejected; shrinking is always allowed.
 const STORE_LIMITS = {
@@ -195,7 +208,7 @@ async function initStorage(): Promise<void> {
       console.error(`[Startup] Refusing to start: ${restoring}`);
       process.exit(1);
     }
-    const r = new JsonRepo(DATA_DIR, BACKUP_DIR, STORE_LIMITS, IS_TEST ? 50 : 1000);
+    const r = new JsonRepo(DATA_DIR, BACKUP_DIR, STORE_LIMITS, IS_TEST ? 50 : 1000, RENDER_MAX_ATTEMPTS);
     const report = r.init();
     if (report.migrated) jsonMigrationNote = ` (migrated ${report.records} from legacy file; snapshot ${report.snapshot})`;
     if (!r.ledger.available) console.error(JSON.stringify({ level: 'error', event: 'usage_ledger_unavailable', reason: r.ledger.reason }));
@@ -1393,6 +1406,7 @@ function renderVideoWithFfmpeg(
   params: RenderParams,
   trackKey: string,
   onProgress?: (pct: number, msg: string) => void,
+  timeoutS = renderTimeoutS(params.duration),
 ): Promise<{ outputPath: string; fileSize: number; duration: number }> {
   const { title, duration, resolution, beats } = params;
   const width = resolution === '720p' ? 720 : 1080;
@@ -1427,7 +1441,12 @@ function renderVideoWithFfmpeg(
     const proc = spawn('ffmpeg', args, { stdio: ['ignore', 'ignore', 'pipe'] });
     runningRenders.set(trackKey, proc);
     let stderr = '';
-    const killTimer = setTimeout(() => proc.kill('SIGKILL'), 120000); // hard ceiling per render
+    // Wall-clock limit (Track B): a hung or pathological encode is killed and the job fails as timed out (not charged).
+    let timedOut = false;
+    const killTimer = setTimeout(() => {
+      timedOut = true;
+      proc.kill('SIGKILL');
+    }, timeoutS * 1000);
     proc.stderr.on('data', (d) => {
       stderr = (stderr + d.toString()).slice(-4000);
     });
@@ -1444,21 +1463,33 @@ function renderVideoWithFfmpeg(
         return resolve({ outputPath, fileSize: fs.statSync(outputPath).size, duration });
       }
       fs.rmSync(outputPath, { force: true });
+      if (timedOut) return reject(new Error(`Render timed out after ${timeoutS} s`));
       reject(new Error(signal ? `Render aborted (${signal})` : `FFmpeg exited with code ${code}: ${stderr.slice(-300)}`));
     });
   });
 }
 
-const MAX_ACTIVE_JOBS_PER_USER = 5;
+/** Wall-clock limit for one render: RENDER_TIMEOUT_FACTOR x video seconds, within [MIN, MAX]. */
+function renderTimeoutS(durationS: number) {
+  return Math.min(RENDER_TIMEOUT_MAX_S, Math.max(RENDER_TIMEOUT_MIN_S, Math.ceil(durationS * RENDER_TIMEOUT_FACTOR)));
+}
 
 /**
- * Admission rule for creating and retrying jobs, evaluated by the Repo atomically with the insert/requeue.
- * Counts minutes already used PLUS minutes reserved by the user's other queued/processing jobs (FS-015).
+ * Admission rule for creating and retrying jobs, evaluated by the Repo atomically with the insert/requeue (on
+ * PostgreSQL under one advisory lock, so the global cap is exact across instances).
+ *  * per user: at most RENDER_MAX_RUNNING_PER_USER running + RENDER_MAX_QUEUED_PER_USER waiting (429 user_queue_full)
+ *  * globally: at most RENDER_QUEUE_MAX jobs waiting (429 queue_full): excess load is refused, not buffered
+ *  * minutes already used PLUS minutes reserved by the user's other queued/processing jobs (FS-015, 402)
+ * Every user gets the same queue: there are no paid priority tiers.
  */
-function jobAdmission(sub: Subscription, durationS: number) {
-  return (active: ServerJob[]): [number, Record<string, unknown>] | null => {
-    if (active.length >= MAX_ACTIVE_JOBS_PER_USER) {
-      return [429, { error: `You already have ${MAX_ACTIVE_JOBS_PER_USER} active render jobs. Wait for them to finish.` }];
+function jobAdmission(sub: Subscription, durationS: number): JobAdmission {
+  const perUser = RENDER_MAX_RUNNING_PER_USER + RENDER_MAX_QUEUED_PER_USER;
+  return (active, ctx) => {
+    if (active.length >= perUser) {
+      return [429, { error: `You already have ${active.length} render jobs running or waiting (limit ${perUser}). Wait for one to finish.`, code: 'user_queue_full', retryAfterS: 30 }];
+    }
+    if (ctx.globalQueued >= RENDER_QUEUE_MAX) {
+      return [429, { error: 'The render queue is full right now. Please try again in a minute.', code: 'queue_full', retryAfterS: 60 }];
     }
     const reservedSeconds = active.reduce((a, j) => a + (Number(j.payload?.duration) || 0), 0);
     if (sub.monthlyRenderMinutesUsed + (reservedSeconds + durationS) / 60 > sub.monthlyRenderMinutesLimit) {
@@ -1466,6 +1497,17 @@ function jobAdmission(sub: Subscription, durationS: number) {
     }
     return null;
   };
+}
+function sendDenial(res: express.Response, [status, body]: JobDenial) {
+  const { retryAfterS, ...rest } = body as { retryAfterS?: number };
+  if (retryAfterS) res.setHeader('Retry-After', String(retryAfterS));
+  res.status(status).json(rest);
+}
+/** B2: server renders cost CPU and storage; they need a signed-in account (guests keep editing and projects). */
+function refuseGuestRender(req: express.Request, res: express.Response) {
+  if (req.identity?.kind === 'firebase') return false; // only signed-in accounts render (guests and anything else: no)
+  res.status(403).json({ error: 'Server rendering needs a free account. Sign in to render videos.', code: 'sign_in_required' });
+  return true;
 }
 
 // ---------- render worker (every instance runs one; jobs are claimed atomically from the Repo) ----------
@@ -1481,7 +1523,7 @@ async function pumpRenderQueue() {
       workerStarting++;
       let job: ServerJob | null = null;
       try {
-        job = await repo.claimNextJob(INSTANCE_ID);
+        job = await repo.claimNextJob(INSTANCE_ID, RENDER_MAX_RUNNING_PER_USER);
       } finally {
         if (!job) workerStarting--;
       }
@@ -1545,14 +1587,24 @@ async function executeRenderJob(job: ServerJob, started: () => void) {
       error: undefined,
       result: { renderId, downloadUrl: `/api/render/download/${renderId}`, fileSize: result.fileSize, duration: result.duration, format: 'mp4' },
     };
-    if (await repo.finishJob(done, INSTANCE_ID)) {
-      await repo.addRenderMinutes(job.userId, result.duration, defaultStoredSubscription());
-    } else {
-      fs.rmSync(result.outputPath, { force: true }); // cancelled in the meantime: do not keep or bill it
+    // F7: completion and charge are one step (exactly once). If the charge cannot be recorded the job must not end
+    // up completed-but-unbilled.
+    let completed: boolean;
+    try {
+      completed = await repo.completeJob(done, INSTANCE_ID, result.duration, defaultStoredSubscription());
+    } catch (err: any) {
+      console.error(JSON.stringify({ level: 'error', event: 'render_completion_not_recorded', jobId: job.id, error: String(err?.message || err).slice(0, 300) }));
+      const now = await repo.getJob(job.id).catch(() => null);
+      // JSON: the completion may already be durable; init() then charges it exactly once. Keep its file.
+      if (now?.status === 'completed') return;
+      fs.rmSync(result.outputPath, { force: true });
+      throw new Error('The render finished but could not be recorded; it was not charged. Please retry.');
     }
+    if (!completed) fs.rmSync(result.outputPath, { force: true }); // cancelled or reassigned meanwhile: not kept, not billed
   } catch (err: any) {
     signalStarted();
-    if (stopped) return;
+    // Cancelled/reassigned, or this instance is shutting down (the shutdown hands the job back to the queue).
+    if (stopped || workerStopped) return;
     const failed: ServerJob = { ...job, status: 'failed', error: err?.message || 'Render failed', stepMessage: `Failed: ${err?.message || 'Render failed'}`, completedAt: new Date().toISOString() };
     try {
       await repo.finishJob(failed, INSTANCE_ID);
@@ -1581,34 +1633,53 @@ function sweepOldRenders() {
 sweepOldRenders();
 setInterval(sweepOldRenders, 3600000).unref();
 
+// Synchronous render (kept for API compatibility). Track B: it no longer spawns ffmpeg outside the queue. The render
+// goes through the same queue, admission limits, fairness, timeout and exactly-once billing as /api/jobs/create; the
+// request waits for the job. If the client disconnects the job is cancelled; after RENDER_SYNC_WAIT_S the request
+// answers 202 with the job id to poll.
 app.post('/api/render/video', rateLimit('render', 10), async (req, res) => {
+  if (refuseGuestRender(req, res)) return;
   const params = normalizeRenderParams(req.body);
-  if (runningRenders.size >= MAX_CONCURRENT_RENDERS) {
-    res.setHeader('Retry-After', '10');
-    return res.status(503).json({ error: 'Render capacity is full. Use /api/jobs/create to queue, or retry shortly.' });
+  const job = newJob(uid(req), 'render_video', params);
+  const denied = await repo.insertJob(job, jobAdmission(await getUserSubscription(uid(req)), params.duration));
+  if (denied) return sendDenial(res, denied);
+  let abandoned = false;
+  res.on('close', () => {
+    if (!res.writableEnded) abandoned = true;
+  });
+  void pumpRenderQueue();
+  const deadline = Date.now() + RENDER_SYNC_WAIT_S * 1000;
+  let cur: ServerJob | null = job;
+  while (!abandoned && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 250));
+    cur = await repo.getJob(job.id).catch(() => cur);
+    if (!cur || (cur.status !== 'queued' && cur.status !== 'processing')) break;
   }
-  const sub = await getUserSubscription(uid(req));
-  const minutesDenied = jobAdmission(sub, params.duration)(await repo.activeJobs(uid(req)));
-  if (minutesDenied?.[0] === 402) return res.status(402).json(minutesDenied[1]);
-  const renderId = newRenderId();
-  try {
-    const result = await renderVideoWithFfmpeg(renderId, params, renderId);
-    await repo.addRenderMinutes(uid(req), result.duration, defaultStoredSubscription());
-    res.json({
+  if (abandoned) {
+    // Nobody is waiting for this render any more: free its queue slot (a cancelled job is never charged).
+    if ((await repo.cancelJob(job.id).catch(() => null)) !== null) runningRenders.get(job.id)?.kill('SIGKILL');
+    return;
+  }
+  if (cur?.status === 'completed' && cur.result) {
+    const r = cur.result;
+    return res.json({
       success: true,
-      renderId,
-      downloadUrl: `/api/render/download/${renderId}`,
-      fileSize: result.fileSize,
-      duration: result.duration,
+      renderId: r.renderId,
+      jobId: job.id,
+      downloadUrl: r.downloadUrl,
+      fileSize: r.fileSize,
+      duration: r.duration,
       format: 'mp4',
       aspectRatio: '9:16',
       resolution: params.resolution === '720p' ? '720x1280' : '1080x1920',
-      renderedAt: new Date().toISOString(),
+      renderedAt: cur.completedAt,
     });
-  } catch (err: any) {
-    console.error('[Render] failed:', err?.message);
-    res.status(500).json({ error: 'Rendering failed. Please try again.' });
   }
+  if (cur?.status === 'queued' || cur?.status === 'processing') {
+    return res.status(202).json({ success: true, pending: true, jobId: job.id, status: cur.status, pollUrl: `/api/jobs/${job.id}` });
+  }
+  console.error(JSON.stringify({ level: 'error', event: 'sync_render_failed', jobId: job.id, status: cur?.status, error: String(cur?.error || '').slice(0, 300) }));
+  res.status(500).json({ error: /timed out/i.test(cur?.error || '') ? 'Rendering took too long and was stopped. Please try a shorter video.' : 'Rendering failed. Please try again.', jobId: job.id });
 });
 
 // Download is a capability URL (128-bit random id) so plain <a href> / <video src> work without headers.
@@ -1656,30 +1727,32 @@ async function ownJob(req: express.Request) {
   return job && (job.userId === uid(req) || isAdmin(req)) ? job : null;
 }
 // workerId is internal; never part of the API response.
-const publicJob = ({ workerId: _w, ...j }: ServerJob) => j;
+const publicJob = ({ workerId: _w, billedSeconds: _b, billingDefaults: _d, ...j }: ServerJob) => j;
+const newJob = (userId: string, type: string, params: RenderParams): ServerJob => ({
+  id: `job_${Date.now()}_${crypto.randomBytes(5).toString('hex')}`,
+  userId,
+  type,
+  payload: params,
+  status: 'queued',
+  progress: 5,
+  stepMessage: 'Queued for rendering...',
+  createdAt: new Date().toISOString(),
+});
 
 app.get('/api/jobs', rateLimit('jobs-read', 120), async (req, res) => {
   res.json({ success: true, jobs: (await repo.listJobs(uid(req), 100)).map(publicJob) });
 });
 
 app.post('/api/jobs/create', rateLimit('jobs-write', 20), async (req, res) => {
+  if (refuseGuestRender(req, res)) return;
   const { type, payload } = req.body || {};
   if (typeof type !== 'string' || !RENDER_JOB_TYPES.has(type)) {
     return res.status(400).json({ error: `Unsupported job type. Supported: ${[...RENDER_JOB_TYPES].join(', ')}` });
   }
   const params = normalizeRenderParams(payload);
-  const job: ServerJob = {
-    id: `job_${Date.now()}_${crypto.randomBytes(5).toString('hex')}`,
-    userId: uid(req),
-    type,
-    payload: params,
-    status: 'queued',
-    progress: 5,
-    stepMessage: 'Queued for rendering...',
-    createdAt: new Date().toISOString(),
-  };
+  const job = newJob(uid(req), type, params);
   const denied = await repo.insertJob(job, jobAdmission(await getUserSubscription(uid(req)), params.duration));
-  if (denied) return res.status(denied[0]).json(denied[1]);
+  if (denied) return sendDenial(res, denied);
   void pumpRenderQueue();
   res.json({ success: true, job: publicJob(job) });
 });
@@ -1701,6 +1774,7 @@ app.post('/api/jobs/:id/cancel', rateLimit('jobs-write', 60), async (req, res) =
 });
 
 app.post('/api/jobs/:id/retry', rateLimit('jobs-write', 20), async (req, res) => {
+  if (refuseGuestRender(req, res)) return;
   const job = await ownJob(req);
   if (!job) return res.status(404).json({ error: 'Job not found' });
   if (job.status !== 'failed' && job.status !== 'cancelled') {
@@ -1708,7 +1782,7 @@ app.post('/api/jobs/:id/retry', rateLimit('jobs-write', 20), async (req, res) =>
   }
   // Same admission rules as a new job, evaluated atomically (FS-015).
   const out = await repo.requeueJob(job.id, jobAdmission(await getUserSubscription(uid(req)), Number(job.payload?.duration) || 0));
-  if (out.denied) return res.status(out.denied[0]).json(out.denied[1]);
+  if (out.denied) return sendDenial(res, out.denied);
   if (!out.job) return res.status(409).json({ error: 'Job state changed; reload and try again.' });
   void pumpRenderQueue();
   res.json({ success: true, job: publicJob(out.job) });
@@ -2773,8 +2847,17 @@ export async function startServer(): Promise<Server> {
   }
   const logErr = (event: string) => (err: any) => console.error(JSON.stringify({ level: 'error', event, error: String(err?.message || err).slice(0, 300) }));
   every(2000, () => void pumpRenderQueue()); // picks up jobs queued by any instance
+  // Crash recovery: jobs of a dead worker go back to the queue (or fail after RENDER_MAX_ATTEMPTS claims).
   every(Math.max(1000, Math.floor(JOB_STALE_MS / 3)), () => {
-    repo.reapStaleJobs(JOB_STALE_MS).then((n) => n && console.warn(JSON.stringify({ level: 'warn', event: 'stale_jobs_reaped', count: n })), logErr('job_reaper_failed'));
+    repo.reapStaleJobs(JOB_STALE_MS, RENDER_MAX_ATTEMPTS).then((r) => {
+      if (!r.requeued && !r.failed) return;
+      console.warn(JSON.stringify({ level: 'warn', event: 'stale_jobs_reaped', ...r }));
+      if (r.requeued) void pumpRenderQueue();
+    }, logErr('job_reaper_failed'));
+  });
+  // Queue-wait expiry: a job nobody could render within RENDER_QUEUE_TTL_S fails (not charged) instead of piling up.
+  every(Math.min(60000, Math.max(1000, Math.floor((RENDER_QUEUE_TTL_S * 1000) / 4))), () => {
+    repo.expireQueuedJobs(RENDER_QUEUE_TTL_S * 1000).then((n) => n && console.warn(JSON.stringify({ level: 'warn', event: 'queued_jobs_expired', count: n })), logErr('job_expiry_failed'));
   });
   every(5 * 60000, () => void repo.sweep().catch(logErr('storage_sweep_failed')));
   every(Math.min(60000, Math.max(1000, Math.floor(AI_RESERVATION_TTL_MS / 3))), () => {
@@ -2790,15 +2873,13 @@ export async function startServer(): Promise<Server> {
     setTimeout(() => process.exit(code || 1), 10000).unref();
     workerStopped = true;
     for (const t of timers) clearInterval(t);
-    // Renders running here cannot finish: record that honestly now instead of waiting for the reaper.
+    // Renders running here cannot finish. A shutdown (deploy, scale-in) is not the job's fault: hand each job back
+    // to the queue now (attempt not counted) so another instance renders it, instead of failing it (Track B, B7).
     const interrupted = [...runningRenders.keys()].filter((k) => k.startsWith('job_'));
     for (const proc of runningRenders.values()) proc.kill('SIGKILL');
     await Promise.allSettled(
       interrupted.map(async (id) => {
-        const job = await repo.getJob(id);
-        if (job?.status === 'processing') {
-          await repo.finishJob({ ...job, status: 'failed', error: 'Interrupted by server shutdown', stepMessage: 'Interrupted by server shutdown — retry to run again.', completedAt: new Date().toISOString() }, INSTANCE_ID);
-        }
+        if (await repo.releaseJob(id, INSTANCE_ID)) console.warn(JSON.stringify({ level: 'warn', event: 'render_job_released_on_shutdown', jobId: id }));
       }),
     );
     server.close(async () => {

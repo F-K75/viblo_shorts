@@ -132,10 +132,12 @@ for (const kind of ['json', 'postgres'] as const) {
       const mk = (id: string, t: string) => ({ id, userId: 'u', type: 'render_video', status: 'queued' as const, progress: 5, createdAt: t, payload: { duration: 2 } });
       await r.insertJob(mk('job_1', '2026-01-01T00:00:01.000Z'));
       await r.insertJob(mk('job_2', '2026-01-01T00:00:02.000Z'));
-      const c1 = await r.claimNextJob('w1');
+      // a per-user running cap of 10: FIFO within one user
+      const c1 = await r.claimNextJob('w1', 10);
       assert.equal(c1!.id, 'job_1');
-      assert.equal((await r.claimNextJob('w2'))!.id, 'job_2');
-      assert.equal(await r.claimNextJob('w3'), null);
+      assert.equal(c1!.attempts, 1, 'a claim counts an attempt');
+      assert.equal((await r.claimNextJob('w2', 10))!.id, 'job_2');
+      assert.equal(await r.claimNextJob('w3', 10), null);
       assert.equal(await r.heartbeat('job_1', 'w1', 50, 'half'), 'ok');
       assert.equal(await r.heartbeat('job_1', 'w2', 50, 'x'), 'lost', 'other worker cannot heartbeat');
       await r.cancelJob('job_1');
@@ -149,9 +151,105 @@ for (const kind of ['json', 'postgres'] as const) {
       assert.equal(await r.getJob('job_3'), null);
       assert.equal((await r.activeJobs('u')).length, 2);
       await new Promise((res) => setTimeout(res, 50));
-      assert.equal(await r.reapStaleJobs(10), 1, 'job_2 worker stopped heart-beating');
+      assert.deepEqual(await r.reapStaleJobs(10, 1), { requeued: 0, failed: 1 }, 'job_2 worker stopped heart-beating; its 1 attempt is used up');
       assert.equal((await r.getJob('job_2'))!.status, 'failed');
       assert.deepEqual((await r.listJobs('u', 10)).map((j) => j.id).sort(), ['job_1', 'job_2']);
+    });
+
+    test('jobs (Track B): fair claim, per-user running cap, admission context, release, bounded reap, expiry', async () => {
+      const r = await makeRepo(kind);
+      const mk = (id: string, userId: string, t: string) => ({ id, userId, type: 'render_video', status: 'queued' as const, progress: 5, createdAt: t, payload: { duration: 2 } });
+      await r.insertJob(mk('job_a1', 'ua', '2026-01-01T00:00:01.000Z'));
+      await r.insertJob(mk('job_a2', 'ua', '2026-01-01T00:00:02.000Z'));
+      await r.insertJob(mk('job_a3', 'ua', '2026-01-01T00:00:03.000Z'));
+      // the admission rule sees the global queue length
+      let seen = -1;
+      await r.insertJob(mk('job_b1', 'ub', '2026-01-01T00:00:04.000Z'), (_active, ctx) => ((seen = ctx.globalQueued), null));
+      assert.equal(seen, 3);
+      const first = await r.claimNextJob('w1', 1);
+      assert.equal(first!.id, 'job_a1');
+      // ua already runs one job: ub goes next although ua's jobs are older
+      assert.equal((await r.claimNextJob('w2', 1))!.id, 'job_b1');
+      assert.equal(await r.claimNextJob('w3', 1), null, 'per-user running cap: nothing else may start');
+      // graceful release: back to the queue, the attempt is not counted
+      assert.equal(await r.releaseJob('job_a1', 'other-worker'), false, 'only the owner can release');
+      assert.equal(await r.releaseJob('job_a1', 'w1'), true);
+      const released = (await r.getJob('job_a1'))!;
+      assert.equal(released.status, 'queued');
+      assert.equal(released.attempts, 0);
+      // ua was served less recently than ub (ub is running anyway): a1 again, FIFO within ua
+      assert.equal((await r.claimNextJob('w1', 1))!.id, 'job_a1');
+      // stale worker: requeued while attempts < max
+      await new Promise((res) => setTimeout(res, 50));
+      const reaped = await r.reapStaleJobs(10, 2);
+      assert.equal(reaped.requeued, 2, JSON.stringify(reaped));
+      assert.equal((await r.getJob('job_a1'))!.status, 'queued');
+      // expiry: queued jobs older than the TTL fail (never charged)
+      await new Promise((res) => setTimeout(res, 50));
+      assert.equal(await r.expireQueuedJobs(10), 4);
+      assert.match((await r.getJob('job_a3'))!.error!, /waited too long/);
+      assert.equal(await r.claimNextJob('w1', 1), null);
+    });
+
+    test('jobs (Track B): 3 users x 3 jobs with one render slot are served round-robin', async () => {
+      const r = await makeRepo(kind);
+      const def = { plan: 'free' as const, status: 'active' as const, monthlyRenderMinutesUsed: 0, currentPeriodEnd: '2026-12-01T00:00:00.000Z' };
+      let t = Date.parse('2026-01-01T00:00:00.000Z');
+      for (const u of ['a', 'b', 'c']) {
+        for (const n of [1, 2, 3]) await r.insertJob({ id: `job_rr_${u}${n}`, userId: `rr-${u}`, type: 'render_video', status: 'queued', progress: 5, createdAt: new Date((t += 1000)).toISOString() });
+      }
+      const order: string[] = [];
+      for (let i = 0; i < 10; i++) {
+        const j = await r.claimNextJob('w', 1);
+        if (!j) break;
+        order.push(j.id.slice(-2));
+        await new Promise((res) => setTimeout(res, 5));
+        assert.equal(await r.completeJob({ ...j, status: 'completed', progress: 100, completedAt: new Date().toISOString() }, 'w', 2, def), true);
+      }
+      assert.deepEqual(order, ['a1', 'b1', 'c1', 'a2', 'b2', 'c2', 'a3', 'b3', 'c3']);
+    });
+
+    test('jobs (Track B, F7): completeJob completes and charges exactly once; a cancelled job is neither', async () => {
+      const r = await makeRepo(kind);
+      const def = { plan: 'free' as const, status: 'active' as const, monthlyRenderMinutesUsed: 0, currentPeriodEnd: '2026-12-01T00:00:00.000Z' };
+      const mk = (id: string, t: string) => ({ id, userId: 'uc', type: 'render_video', status: 'queued' as const, progress: 5, createdAt: t, payload: { duration: 30 } });
+      await r.insertJob(mk('job_c1', '2026-01-01T00:00:01.000Z'));
+      await r.insertJob(mk('job_c2', '2026-01-01T00:00:02.000Z'));
+      const c1 = (await r.claimNextJob('w1', 5))!;
+      const c2 = (await r.claimNextJob('w2', 5))!;
+      const done = (j: typeof c1) => ({ ...j, status: 'completed' as const, progress: 100, completedAt: new Date().toISOString(), result: { ok: true } });
+      assert.equal(await r.completeJob(done(c1), 'w1', 30, def), true);
+      assert.equal(await r.completeJob(done(c1), 'w1', 30, def), false, 'a second completion is refused and not charged');
+      await r.cancelJob(c2.id);
+      assert.equal(await r.completeJob(done(c2), 'w2', 30, def), false, 'cancel wins: not completed, not charged');
+      assert.equal((await r.getJob('job_c1'))!.status, 'completed');
+      assert.equal((await r.getJob('job_c2'))!.status, 'cancelled');
+      assert.equal((await r.getSubscription('uc'))!.monthlyRenderMinutesUsed, 0.5);
+    });
+
+    test('jobs (Track B, F7): recovery cannot double-charge: a stale worker that finishes after reassignment is refused', async () => {
+      const r = await makeRepo(kind);
+      const def = { plan: 'free' as const, status: 'active' as const, monthlyRenderMinutesUsed: 0, currentPeriodEnd: '2026-12-01T00:00:00.000Z' };
+      await r.insertJob({ id: 'job_re1', userId: 'ur', type: 'render_video', status: 'queued', progress: 5, createdAt: '2026-01-01T00:00:01.000Z', payload: { duration: 30 } });
+      const first = (await r.claimNextJob('w-old', 1))!;
+      await new Promise((res) => setTimeout(res, 50));
+      assert.deepEqual(await r.reapStaleJobs(10, 2), { requeued: 1, failed: 0 }, 'w-old looks dead: requeued');
+      const second = (await r.claimNextJob('w-new', 1))!;
+      assert.equal(second.attempts, 2);
+      const fin = (j: typeof first) => ({ ...j, status: 'completed' as const, progress: 100, completedAt: new Date().toISOString() });
+      assert.equal(await r.completeJob(fin(first), 'w-old', 30, def), false, 'the old worker finished late: refused, not charged');
+      assert.equal(await r.completeJob(fin(second), 'w-new', 30, def), true);
+      assert.equal(await r.completeJob(fin(second), 'w-new', 30, def), false, 'a retried completion is refused');
+      assert.equal((await r.requeueJob('job_re1')).job, null, 'a completed job cannot be retried (and so cannot be charged again)');
+      assert.equal((await r.getSubscription('ur'))!.monthlyRenderMinutesUsed, 0.5);
+    });
+
+    test('jobs (Track B): failed jobs are never charged', async () => {
+      const r = await makeRepo(kind);
+      await r.insertJob({ id: 'job_f1', userId: 'uf', type: 'render_video', status: 'queued', progress: 5, createdAt: '2026-01-01T00:00:01.000Z', payload: { duration: 30 } });
+      const c = (await r.claimNextJob('w', 1))!;
+      assert.equal(await r.finishJob({ ...c, status: 'failed', error: 'boom', completedAt: new Date().toISOString() }, 'w'), true);
+      assert.equal(await r.getSubscription('uf'), null);
     });
 
     test('subscriptions: absent by default, put/get, render minutes accumulate', async () => {
@@ -222,10 +320,48 @@ describe('PostgreSQL specifics', { skip: pgSkip }, () => {
     dbs.push(db);
     const r = new PostgresRepo(db.pool, limits);
     for (let i = 0; i < 10; i++) await r.insertJob({ id: `job_${i}`, userId: 'u', type: 'render_video', status: 'queued', progress: 5, createdAt: new Date(Date.now() + i).toISOString() });
-    const claims = await Promise.all(Array.from({ length: 15 }, (_, i) => r.claimNextJob(`w${i}`)));
+    const claims = await Promise.all(Array.from({ length: 15 }, (_, i) => r.claimNextJob(`w${i}`, 100)));
     const ids = claims.filter(Boolean).map((j) => j!.id);
     assert.equal(ids.length, 10);
     assert.equal(new Set(ids).size, 10);
+  });
+
+  test('jobs (Track B): concurrent claims never exceed the per-user running cap', async () => {
+    const db = await createTestDatabase();
+    dbs.push(db);
+    const r = new PostgresRepo(db.pool, limits);
+    // 4 users x 5 jobs, 20 concurrent claimers, cap 1 per user: exactly one running job per user
+    for (let u = 0; u < 4; u++) {
+      for (let i = 0; i < 5; i++) await r.insertJob({ id: `job_${u}_${i}`, userId: `cap-u${u}`, type: 'render_video', status: 'queued', progress: 5, createdAt: new Date(Date.now() + i).toISOString() });
+    }
+    const claims = (await Promise.all(Array.from({ length: 20 }, (_, i) => r.claimNextJob(`w${i}`, 1)))).filter(Boolean);
+    assert.equal(claims.length, 4, `${claims.length} claims`);
+    const { rows } = await db.pool.query("SELECT user_id, count(*)::int AS n FROM jobs WHERE status = 'processing' GROUP BY user_id");
+    assert.ok(rows.every((x: any) => x.n === 1), JSON.stringify(rows));
+    assert.equal(await r.claimNextJob('more', 1), null, 'every user is at the cap');
+  });
+
+  test('jobs (Track B, F7): concurrent duplicate completions of one job commit exactly one charge', async () => {
+    const db = await createTestDatabase();
+    dbs.push(db);
+    const r = new PostgresRepo(db.pool, limits);
+    const def = { plan: 'free' as const, status: 'active' as const, monthlyRenderMinutesUsed: 0, currentPeriodEnd: '2026-12-01T00:00:00.000Z' };
+    await r.insertJob({ id: 'job_dup', userId: 'dup-u', type: 'render_video', status: 'queued', progress: 5, createdAt: new Date().toISOString(), payload: { duration: 30 } });
+    const c = (await r.claimNextJob('w', 1))!;
+    const fin = { ...c, status: 'completed' as const, progress: 100, completedAt: new Date().toISOString() };
+    const out = await Promise.all(Array.from({ length: 10 }, () => r.completeJob(fin, 'w', 30, def)));
+    assert.equal(out.filter(Boolean).length, 1, JSON.stringify(out));
+    assert.equal((await r.getSubscription('dup-u'))!.monthlyRenderMinutesUsed, 0.5);
+  });
+
+  test('jobs (Track B): the global queue cap is exact under concurrent admissions', async () => {
+    const db = await createTestDatabase();
+    dbs.push(db);
+    const r = new PostgresRepo(db.pool, limits);
+    const cap = (_a: unknown, ctx: { globalQueued: number }) => (ctx.globalQueued >= 7 ? ([429, { code: 'queue_full' }] as [number, Record<string, unknown>]) : null);
+    const out = await Promise.all(Array.from({ length: 30 }, (_, i) => r.insertJob({ id: `job_g${i}`, userId: `g-u${i}`, type: 'render_video', status: 'queued', progress: 5, createdAt: new Date().toISOString() }, cap)));
+    assert.equal(out.filter((x) => x === null).length, 7);
+    assert.equal((await db.pool.query("SELECT count(*)::int AS n FROM jobs WHERE status = 'queued'")).rows[0].n, 7);
   });
 
   test('a connection lost while a client is checked out is an error, never an uncaught exception (CI regression)', async () => {

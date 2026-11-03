@@ -28,9 +28,13 @@ Edit beats/timings, caption style, voice (Gemini TTS via `/api/tts`, else browse
 * **Drive:** client-side OAuth upload (not tested here).
 
 ## 5. Background rendering (API)
-`POST /api/jobs/create {type: render_video}` → queued (max `MAX_CONCURRENT_RENDERS`) → ffmpeg →
-`GET /api/jobs/:id` → `/api/render/download/:renderId` (capability URL, Range support). Cancel kills ffmpeg;
-retry re-renders; jobs interrupted by a restart are marked failed on boot. Artifacts expire after `RENDER_TTL_HOURS`.
+`POST /api/jobs/create {type: render_video}` (signed-in users only) → queued → claimed fairly (least recently
+served user first, 1 running job per user, `MAX_CONCURRENT_RENDERS` per instance) → ffmpeg (wall-clock limit) →
+completion **and** render-minute charge in one step → `GET /api/jobs/:id` → `/api/render/download/:renderId`
+(capability URL, Range support). Cancel kills ffmpeg and is never charged; retry re-renders. A job whose instance
+crashes is requeued and rendered elsewhere (up to `RENDER_MAX_ATTEMPTS` claims); a graceful shutdown hands its jobs
+back to the queue. Jobs waiting longer than `RENDER_QUEUE_TTL_S` expire. Artifacts expire after `RENDER_TTL_HOURS`.
+See docs/PHASE2_5_TRACK_B.md.
 
 ## Failure behaviour (verified)
 | Failure | Behaviour |

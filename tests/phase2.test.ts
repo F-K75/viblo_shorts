@@ -246,12 +246,12 @@ describe('Gate 4-7: two instances on one database', { skip: pgSkip }, () => {
     const A = await boot({ ...env, DATA_DIR: tmpDir('p2-ja-') });
     const B = await boot({ ...env, DATA_DIR: tmpDir('p2-jb-') });
     const u = A.signFirebaseToken({ sub: 'job-user' });
-    // atomic admission: 12 concurrent creates over both instances, cap is 5 active jobs
+    // atomic admission: 12 concurrent creates over both instances, cap is 4 active jobs (Track B: 1 running + 3 queued)
     const creates = await Promise.all(
       Array.from({ length: 12 }, (_, i) => post([A, B][i % 2], '/api/jobs/create', u, { type: 'render_video', payload: { duration: 60, resolution: '1080p' } })),
     );
-    assert.equal(creates.filter((r) => r.status === 200).length, 5, `statuses ${creates.map((r) => r.status)}`);
-    assert.equal(creates.filter((r) => r.status === 429).length, 7);
+    assert.equal(creates.filter((r) => r.status === 200).length, 4, `statuses ${creates.map((r) => r.status)}`);
+    assert.equal(creates.filter((r) => r.status === 429).length, 8);
     const ids = await Promise.all(creates.filter((r) => r.status === 200).map(async (r) => (await r.json()).job.id));
     // cancel everything through B, wherever it runs; nothing may complete afterwards
     for (const id of ids) assert.equal((await post(B, `/api/jobs/${id}/cancel`, u, {})).status, 200);

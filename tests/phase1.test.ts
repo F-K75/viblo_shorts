@@ -169,7 +169,7 @@ describe('FS-002 corruption cannot cause global data loss', () => {
 
   test('a corrupt shared store (jobs.json) fails closed: 503, readiness down, file untouched', { skip: jsonOnly }, async () => {
     const s = await boot();
-    const a = await guestToken(s.baseUrl);
+    const a = s.signFirebaseToken({ sub: 'corrupt-jobs-user' }); // signed in: guests cannot create render jobs (Track B)
     const jobsFile = path.join(s.dataDir, 'jobs.json');
     fs.writeFileSync(jobsFile, '[{"id":"job_1","userId":"x"');
     assert.equal((await call(s, '/api/jobs', a)).status, 503);
@@ -376,7 +376,7 @@ describe('Crash scenarios and limit bypasses', () => {
 
   test('job retry obeys the active-job cap; queued jobs reserve render minutes (FS-015)', async () => {
     const s = await boot({ MAX_CONCURRENT_RENDERS: '1', FREE_MONTHLY_RENDER_MINUTES: '2' });
-    const g = await guestToken(s.baseUrl);
+    const g = s.signFirebaseToken({ sub: 'fs015-minutes' }); // signed in: guests cannot render (Track B)
     const create = (duration: number) => call(s, '/api/jobs/create', g, { method: 'POST', body: JSON.stringify({ type: 'render_video', payload: { duration, resolution: '720p' } }) });
     // render minutes: 60 s + 50 s reserved => another 15 s job exceeds the 2-minute plan even before any completes
     const j1 = await (await create(60)).json();
@@ -384,22 +384,23 @@ describe('Crash scenarios and limit bypasses', () => {
     assert.equal((await create(15)).status, 402);
     for (const j of [j1, j2]) await call(s, `/api/jobs/${j.job.id}/cancel`, g, { method: 'POST' });
 
-    // active-job cap: cancel one, fill 5 active slots with short jobs, retry must be refused
+    // active-job cap (Track B: 1 running + 3 queued per user): cancel one, fill the 4 active slots, retry must be refused
     const s2 = await boot({ MAX_CONCURRENT_RENDERS: '1', FREE_MONTHLY_RENDER_MINUTES: '100' });
-    const g2 = await guestToken(s2.baseUrl);
+    const g2 = s2.signFirebaseToken({ sub: 'fs015-cap' });
     const create2 = (duration: number) => call(s2, '/api/jobs/create', g2, { method: 'POST', body: JSON.stringify({ type: 'render_video', payload: { duration, resolution: '1080p' } }) });
     const x = await (await create2(60)).json();
     await call(s2, `/api/jobs/${x.job.id}/cancel`, g2, { method: 'POST' });
     const active: string[] = [];
-    for (let i = 0; i < 5; i++) active.push((await (await create2(60)).json()).job.id);
+    for (let i = 0; i < 4; i++) active.push((await (await create2(60)).json()).job.id);
     const retry = await call(s2, `/api/jobs/${x.job.id}/retry`, g2, { method: 'POST' });
-    assert.equal(retry.status, 429, 'retry used to bypass the 5-active-jobs cap');
+    assert.equal(retry.status, 429, 'retry used to bypass the active-jobs cap');
+    assert.equal((await retry.json()).code, 'user_queue_full');
     for (const id of active) await call(s2, `/api/jobs/${id}/cancel`, g2, { method: 'POST' });
   });
 
   test('async route failures reach the error handler (no unhandled rejection, server keeps serving)', { skip: jsonOnly }, async () => {
     const s = await boot();
-    const g = await guestToken(s.baseUrl);
+    const g = s.signFirebaseToken({ sub: 'async-failure-user' }); // signed in, so the render route reaches the subscription read
     fs.writeFileSync(path.join(s.dataDir, 'subscriptions.json'), '{bad');
     // async handler that reads subscriptions before its first await
     const r = await call(s, '/api/render/video', g, { method: 'POST', body: JSON.stringify({ duration: 2 }) });

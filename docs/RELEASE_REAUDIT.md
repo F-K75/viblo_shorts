@@ -1,25 +1,72 @@
 # Forge Studio — Independent Re-audit + Corrective Round
 
-## Phase 2.5 Track C (R-13): implemented on branch `claude/keen-feynman-xtbvz2-track-c`; awaiting PR review
-* **Red-first:** 8 tests, all failing on `be4c48e`.
-* **Fixed:**
-  * bodies are read only after authentication;
-  * route-specific body limits, enforced from `Content-Length` and while streaming;
-  * at most `BODY_CONCURRENCY` large bodies in flight (`503 busy` + `Retry-After`);
-  * a memory guard (`503 memory_pressure` and the instance drained via readiness, with hysteresis);
-  * slow headers and slow bodies disconnected.
-* **Exit criterion:** the same attack costs +15 to 18 MB RSS instead of +102 MB.
-* **Evidence:** `docs/PHASE2_5_TRACK_C.md`.
-* **Review corrections:**
-  * the memory guard now reserves ffmpeg render memory (`L = 0.8 x M - R x S`; 1 GB with 2 renders → 307 MB),
-    and insufficient or invalid budgets stop the server;
-  * recovery is proven with **real** RSS: 561 → 105 MB, and readiness returns only below 90 %.
-* **Still open:**
-  * R-13's earlier "1 to 6 unexplained dropped sockets" note (not reproduced in 13 bursts);
-  * intermittent `EPIPE` in the exit test (test-helper hypothesis);
-  * client auto-retry for 503 `busy` / `memory_pressure`;
-  * Docker-level coverage (Track D);
-  * JS-heap retention not measured.
+## Phase 2.5 Track B (R-04, F7): decisions approved, verification complete, awaiting merge decision (PR #5)
+* **Status: not merged, not release-ready.** The owner approved the five architectural decisions (2026-11-02): no
+  reservation ledger, migration `0003`, least-recently-served fairness, per-instance `MAX_CONCURRENT_RENDERS`, and
+  the sync route through the queue. **Merge is not approved.** Evidence: `docs/PHASE2_5_TRACK_B.md` (§6 gate, §7 risk
+  register, §8 review verification).
+* **Red first:** on `main` @ `53fc724`, 12 of 14 new tests failed. They reproduced:
+  * guest renders accepted;
+  * no global cap;
+  * starvation;
+  * **F7 completed-but-unbilled**;
+  * no timeout or expiry;
+  * crash and deploy failing the job.
+* **Billing verification (review):**
+  * PostgreSQL completion + charge are one transaction, proven by charge-failure injection and by SIGKILL of the
+    instance *inside* that transaction (rolled back, recovered by the other instance, charged exactly once);
+  * no double charge on stale-worker completion, retried completion or 10 concurrent completions;
+  * failed, cancelled, expired and timed-out jobs are never charged;
+  * JSON reconciliation is durable (`fsync`ed atomic writes) and idempotent across repeated restarts, its own crash
+    and a monthly reset.
+* **CI history (preserved):**
+  * run 28 failed: a test-premise error, a blocker render finishing early on a fast runner; reproduced; test-only fix;
+  * runs 29 and 30 green, all job logs read;
+  * the final head's run is recorded in the PR description.
+* **R-04: fixed on the branch.** F7: fixed on the branch.
+* **Pre-existing flaky test found during the final gate (not Track B):**
+  * the guest-token tamper test fails about 1 in 1,024 runs, because its "tamper" can be a no-op (base64url padding
+    bits);
+  * not a forgery;
+  * Track D will fix the test and consider rejecting non-canonical token encodings (`docs/PHASE2_5_TRACK_B.md` §8.8).
+* **Remaining for release:** R-01 live Gemini (Track E, blocker); Track A guest-registration protection; Track D
+  Docker-level coverage (incl. the orphan-ffmpeg container claim) and test-helper stability; deployment and recovery
+  evidence.
+
+## Phase 2.5 Track C (R-13): MERGED (PR #4 → `main` @ `53fc724`, 2026-11-02)
+* **Merged with owner approval** as merge commit `53fc724`, whose parents are the previous `main` (`be4c48e`) and the
+  approved head (`b895cfc`). `main` is byte-identical to `b895cfc`.
+* **CI:**
+  * PR run 26 on `b895cfc` and post-merge run 27 on `main` were both green, with logs inspected;
+  * JSON suite 192/190/0/2, PostgreSQL suite 192/183/0/9;
+  * E2E on both backends, build, audit and Docker all passed.
+* **Accepted evidence:**
+  * Bodies are read only after authentication.
+  * Route-specific limits.
+  * Bounded large bodies in flight: `503 busy` + `Retry-After`.
+  * A memory guard with an ffmpeg-aware budget, `L = 0.8 x M - R x S` (1 GB with 2 renders → 307 MB). Invalid or
+    insufficient budgets stop the server.
+  * Slow-client timeouts.
+  * Exit criterion: +15 to 18 MB RSS instead of +102 MB.
+  * **Real** memory recovery: e.g. 571 → 114 MB, with readiness back only below 90 %.
+* **Accepted residual risks** (recorded, not solved):
+  1. The 256 MB per-render ffmpeg reserve is a planning allowance, **not a hard per-process memory cap**.
+  2. Retention of long-lived **JavaScript heap objects is not measured**. Only Buffer memory was shown to be released.
+  3. **No automatic client retry** on 503 `busy` / `memory_pressure` (`Retry-After` is always sent). Follow-up.
+  4. **Dropped-socket failures** (R-13 note) remain **unexplained and unreproduced** (13 bursts).
+  5. **No Docker-level test of Track C** (Track D).
+  6. **Live Gemini validation is still skipped**; R-01 remains a release blocker.
+* **Test-stability follow-up (Track D):**
+  * the exit-criterion test helper can record `EPIPE` instead of a 413 under heavy local load (seen 2 times in
+    about 20 runs, never in CI);
+  * the server side was ruled out (1,600 controlled uploads all got their 413);
+  * the helper must eventually tell genuine server failures apart from client socket timing, without suppressing
+    errors.
+* **CI-reporting finding (for Track E):**
+  * on pushes to `main` the `live-llm` job **shows a green check while running zero live tests** (`# pass 0`,
+    `# skipped 2`, "GEMINI_API_KEY not set … (NOT passed)", seen in run 27);
+  * the badge must not be read as live validation;
+  * Track E should make the job fail, or not run, when the key is absent.
 
 ## Integration (2026-11-02): PR #2 merged; PR #3 retargeted to `main`; awaiting final PR #3 decision
 * **PR #2:**
@@ -123,7 +170,7 @@ Readiness is tracked by milestone, not by the score (see the scorecard below). N
 | **Real Gemini generation never demonstrated** (non-negotiable: real API call → render → preview → export) | ❌ open: needs a `GEMINI_API_KEY` |
 | R-03 guest sign-up / guest pool DoS | ❌ open: proposal **approved**; implementation plan `docs/PHASE2_5_PLAN.md` §1 awaiting approval (Phase 2.5 PR after PR #3 merges) |
 | R-04 render queue flooding | ❌ open: approved; plan §2 (no guest server renders, fair queue, global cap) |
-| R-13 upload memory pressure (and 1–6 unexplained dropped sockets) | 🟡 Track C implemented, PR pending review (`docs/PHASE2_5_TRACK_C.md`); dropped-socket note still open; upload system out of scope |
+| R-13 upload memory pressure (and 1–6 unexplained dropped sockets) | ✅ Track C merged (`53fc724`, `docs/PHASE2_5_TRACK_C.md`) with accepted residual risks; dropped-socket note still open; upload system out of scope |
 | Fake password reset (R-05) | ❌ open: Phase 3 |
 | Google Drive identity switching (R-06) | ❌ open: Phase 3 |
 | Guest project ownership / migration on sign-up (R-07) | ❌ open: Phase 3 |
