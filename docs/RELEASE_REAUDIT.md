@@ -1,37 +1,65 @@
 # Forge Studio — Independent Re-audit + Corrective Round
 
-## Phase 2.5 Track B (R-04, F7): decisions approved, verification complete, awaiting merge decision (PR #5)
-* **Status: not merged, not release-ready.** The owner approved the five architectural decisions (2026-11-02): no
-  reservation ledger, migration `0003`, least-recently-served fairness, per-instance `MAX_CONCURRENT_RENDERS`, and
-  the sync route through the queue. **Merge is not approved.** Evidence: `docs/PHASE2_5_TRACK_B.md` (§6 gate, §7 risk
-  register, §8 review verification).
-* **Red first:** on `main` @ `53fc724`, 12 of 14 new tests failed. They reproduced:
-  * guest renders accepted;
-  * no global cap;
-  * starvation;
-  * **F7 completed-but-unbilled**;
-  * no timeout or expiry;
-  * crash and deploy failing the job.
-* **Billing verification (review):**
-  * PostgreSQL completion + charge are one transaction, proven by charge-failure injection and by SIGKILL of the
-    instance *inside* that transaction (rolled back, recovered by the other instance, charged exactly once);
-  * no double charge on stale-worker completion, retried completion or 10 concurrent completions;
-  * failed, cancelled, expired and timed-out jobs are never charged;
-  * JSON reconciliation is durable (`fsync`ed atomic writes) and idempotent across repeated restarts, its own crash
-    and a monthly reset.
-* **CI history (preserved):**
-  * run 28 failed: a test-premise error, a blocker render finishing early on a fast runner; reproduced; test-only fix;
-  * runs 29 and 30 green, all job logs read;
-  * the final head's run is recorded in the PR description.
-* **R-04: fixed on the branch.** F7: fixed on the branch.
-* **Pre-existing flaky test found during the final gate (not Track B):**
-  * the guest-token tamper test fails about 1 in 1,024 runs, because its "tamper" can be a no-op (base64url padding
-    bits);
-  * not a forgery;
-  * Track D will fix the test and consider rejecting non-canonical token encodings (`docs/PHASE2_5_TRACK_B.md` §8.8).
-* **Remaining for release:** R-01 live Gemini (Track E, blocker); Track A guest-registration protection; Track D
-  Docker-level coverage (incl. the orphan-ffmpeg container claim) and test-helper stability; deployment and recovery
-  evidence.
+## Phase 2.5 Track B (R-04, F7): MERGED (PR #5 → `main` @ `80e02b5`, 2026-11-03)
+* **Merged with owner approval** as merge commit `80e02b5`. Its parents are the previous `main` (`53fc724`) and the
+  approved head (`63de0c5`), and its tree is identical to `63de0c5`. The merge was pinned to that head SHA.
+* **Owner decisions approved:**
+  * no reservation ledger: charge only on success, atomically with completion;
+  * migration `0003`;
+  * least-recently-served fairness;
+  * per-instance `MAX_CONCURRENT_RENDERS` (aggregate = instances × limit);
+  * every render goes through the queue.
+* **Accepted evidence (`docs/PHASE2_5_TRACK_B.md`):**
+  * Red first: 12 of 14 tests failed on the old code (F7 reproduced).
+  * PostgreSQL completion and charge are one transaction: charge-failure injection, and SIGKILL inside the transaction
+    rolls back as a unit, then recovery charges exactly once.
+  * No double charge: stale worker, retried completion, 10 concurrent completions.
+  * Failed, cancelled, expired and timed-out jobs are never charged.
+  * JSON reconciliation is durable and idempotent: crash while completing, crash during reconciliation, repeated
+    restarts, monthly reset.
+  * Fairness: 3 × 3 round-robin.
+  * No render path bypasses the queue.
+  * Migration upgrade path v2 → v3, and the previous release runs on the v3 schema.
+  * The run 28 failure (test premise) and its test-only fix are preserved.
+* **Post-merge CI, run 34 on `main` @ `80e02b5`: green, every job's log read:**
+
+| Job / step | Result (from the log) |
+|---|---|
+| `test`: typecheck, build | pass |
+| `test`: JSON suite | 228 tests, 226 pass, 0 fail, 0 cancelled, 2 skipped (live Gemini) |
+| `test`: every server on PostgreSQL | 228 tests, 219 pass, 0 fail, 0 cancelled, 9 skipped (2 live Gemini + 7 JSON-only) |
+| `test`: Track B billing/queue/recovery, migration and guest-token tests | 52 result lines, all `ok` |
+| `test`: E2E | JSON 1/1, PostgreSQL 1/1 |
+| `test`: `bun audit --audit-level=high` | "No vulnerabilities found" |
+| `docker` | images build; container applies `0001`–`0003` (`"version":3`); 2-instance PostgreSQL smoke; JSON smoke; unsafe config refused; backup tools present; 0 errors |
+| `live-llm` | **green badge with 0 live tests**: `# pass 0`, `# skipped 2`, "GEMINI_API_KEY not set … (NOT passed)". This is the same CI-reporting finding as run 27, **not** live validation. |
+
+* **Carried forward to Track D (owner, 2026-11-03):**
+  1. Fix the guest-token tamper test so the tamper always changes the decoded signature bytes. **Do not remove or
+     weaken the security test.**
+  2. Separately, evaluate rejecting alternative (non-canonical) encodings of the same token.
+  3. Test at Docker level that terminating Node also terminates its ffmpeg children (the `tini` / PID-namespace
+     claim is unverified).
+  4. The EPIPE exit-criterion test helper, from Track C.
+  5. The npm warning in the E2E step's throwaway install ("5 vulnerabilities"); the gating `bun audit` passes.
+* **Track B residual risks (accepted):**
+  * the JSON backend under-counts usage until restart;
+  * billing uses the requested duration;
+  * fair-claim scale is proven only to the tested load;
+  * sync wait vs. load balancer idle timeout;
+  * shutdowns longer than 10 s fall back to the reaper.
+* **Project position:**
+
+| Track | State |
+|---|---|
+| C (memory protection) | merged |
+| B (render queue and billing) | merged |
+| A (guest protection) | not started, next |
+| D (operational hardening) | not started |
+| E (live Gemini) | not started |
+
+* **Production release: NOT approved.** R-01 live Gemini is still a release blocker, and deployment readiness and
+  operational recovery evidence are still missing.
 
 ## Phase 2.5 Track C (R-13): MERGED (PR #4 → `main` @ `53fc724`, 2026-11-02)
 * **Merged with owner approval** as merge commit `53fc724`, whose parents are the previous `main` (`be4c48e`) and the
