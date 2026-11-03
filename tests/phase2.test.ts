@@ -180,7 +180,7 @@ describe('Gate 4-7: two instances on one database', { skip: pgSkip }, () => {
       GEMINI_BASE_URL: stub.baseUrl,
       GEMINI_MODELS: 'stub-model',
       FREE_DAILY_AI_QUOTA: '3',
-      GUEST_MINT_PER_HOUR: '4',
+      GUEST_MINT_HARD_PER_HOUR: '4', // Track A: the hard global cap (formerly GUEST_MINT_PER_HOUR, now soft)
       GUEST_MAX_PROJECTS: '5',
     };
     let A = await boot({ ...env, DATA_DIR: tmpDir('p2-a-') });

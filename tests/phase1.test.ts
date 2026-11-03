@@ -97,7 +97,9 @@ describe('FS-001 storage abuse', () => {
   });
 
   test('guest minting has a global hourly budget (rotating/spoofed IPs cannot mint unbounded accounts)', async () => {
-    const s = await boot({ GUEST_MINT_PER_HOUR: '3' });
+    // Track A: the hard global cap is now the opt-in GUEST_MINT_HARD_PER_HOUR (GUEST_MINT_PER_HOUR became the soft,
+    // alert-only threshold that never rejects a verified sign-up; see tests/guest_protection.test.ts A1).
+    const s = await boot({ GUEST_MINT_HARD_PER_HOUR: '3' });
     const codes: number[] = [];
     for (let i = 0; i < 5; i++) codes.push((await fetch(`${s.baseUrl}/api/auth/guest`, { method: 'POST' })).status);
     assert.deepEqual(codes, [200, 200, 200, 429, 429]);

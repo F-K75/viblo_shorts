@@ -115,6 +115,36 @@ for (const kind of ['json', 'postgres'] as const) {
       assert.deepEqual(await r.reserveAi([{ key: 'user:z', limit: 0 }], d, 'res-0005'), { ok: false, key: 'user:z' });
     });
 
+    test('guest protection (Track A): all-or-nothing windows, single-use redemption, statistics', async () => {
+      const r = await makeRepo(kind);
+      // all or nothing: a spent key blocks the whole set and nothing else is consumed
+      const set = (dev: string) => [
+        { key: `gm:dev:${dev}`, windowId: 100, limit: 2 },
+        { key: 'gm:ip:1.2.3.4', windowId: 100, limit: 3 },
+      ];
+      assert.deepEqual(await r.takeWindows(set('a')), { ok: true });
+      assert.deepEqual(await r.takeWindows(set('a')), { ok: true });
+      assert.deepEqual(await r.takeWindows(set('a')), { ok: false, key: 'gm:dev:a' }, 'device budget of 2 spent');
+      assert.deepEqual(await r.takeWindows(set('b')), { ok: true }, 'the refused call consumed no IP budget (3rd of 3)');
+      assert.deepEqual(await r.takeWindows(set('c')), { ok: false, key: 'gm:ip:1.2.3.4' });
+      assert.deepEqual(await r.takeWindows([{ key: 'gm:ip:1.2.3.4', windowId: 101, limit: 3 }]), { ok: true }, 'a new window starts empty');
+      // single use, with expiry
+      assert.equal(await r.redeemOnce('ts:abcdefabcdefabcdef', 60_000), true);
+      assert.equal(await r.redeemOnce('ts:abcdefabcdefabcdef', 60_000), false, 'second redemption refused');
+      assert.equal(await r.redeemOnce('ts:0123456789abcdef01', 30), true);
+      await new Promise((res) => setTimeout(res, 80));
+      assert.equal(await r.redeemOnce('ts:0123456789abcdef01', 60_000), true, 'an expired redemption no longer blocks');
+      // statistics: unlimited counters, a series, and one window by prefix
+      for (let i = 0; i < 3; i++) await r.recordStat('stats:guest-mint', 500);
+      await r.recordStat('stats:guest-mint', 501);
+      await r.recordStat('stats:guest-reject:captcha_failed', 501);
+      await r.recordStat('stats:guest-reject:captcha_failed', 501);
+      await r.recordStat('stats:guest-reject:captcha_required', 501);
+      assert.deepEqual(await r.statSeries('stats:guest-mint', 500), [{ windowId: 500, count: 3 }, { windowId: 501, count: 1 }]);
+      assert.deepEqual(await r.statSeries('stats:guest-mint', 501), [{ windowId: 501, count: 1 }]);
+      assert.deepEqual(await r.statsInWindow('stats:guest-reject:', 501), { captcha_failed: 2, captcha_required: 1 });
+    });
+
     test('rate buckets and windows', async () => {
       const r = await makeRepo(kind);
       const results: boolean[] = [];
@@ -268,6 +298,26 @@ for (const kind of ['json', 'postgres'] as const) {
 }
 
 describe('PostgreSQL specifics', { skip: pgSkip }, () => {
+  test('guest protection (Track A): concurrent redemptions and windows are exact; the sweep keeps statistics 30 days', async () => {
+    const db = await createTestDatabase();
+    dbs.push(db);
+    const r = new PostgresRepo(db.pool, limits);
+    const redeemed = await Promise.all(Array.from({ length: 25 }, () => r.redeemOnce('ts:concurrent-token-hash', 60_000)));
+    assert.equal(redeemed.filter(Boolean).length, 1);
+    const taken = await Promise.all(
+      Array.from({ length: 40 }, (_, i) => r.takeWindows([{ key: 'gm:net:v4:198.51.100.0/24', windowId: 7, limit: 6 }, { key: `gm:ip:198.51.100.${i}`, windowId: 7, limit: 1 }])),
+    );
+    assert.equal(taken.filter((t) => t.ok).length, 6);
+    assert.equal((await db.pool.query("SELECT count FROM window_counters WHERE key = 'gm:net:v4:198.51.100.0/24'")).rows[0].count, 6, 'refused calls left no increments');
+    const hour = Math.floor(Date.now() / 3600000);
+    await r.recordStat('stats:guest-mint', hour - 100); // 100 h old: kept (30 days)
+    await r.recordStat('stats:guest-mint', hour - 800); // older than 30 days: swept
+    await r.takeWindows([{ key: 'gm:ip:old', windowId: hour - 100, limit: 5 }]); // old limit window: swept
+    await r.sweep();
+    const left = (await db.pool.query('SELECT key, window_id FROM window_counters WHERE window_id < $1 ORDER BY key', [hour - 48])).rows.map((x: any) => `${x.key}@${hour - Number(x.window_id)}`);
+    assert.deepEqual(left, ['stats:guest-mint@100']);
+  });
+
   test('migrations are idempotent, checksummed and safe to run concurrently', async () => {
     const db = await createTestDatabase({ migrate: false });
     dbs.push(db);
