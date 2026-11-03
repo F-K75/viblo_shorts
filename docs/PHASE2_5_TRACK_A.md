@@ -50,7 +50,7 @@ cannot serve the build. That run was discarded as not meaningful and is noted he
 |---|---|---|
 | Server-side Turnstile | `TurnstileVerifier` POSTs `secret`, `response` and `remoteip` (the trusted client address) to siteverify with a hard timeout. Accepts only `success`, a hostname in `TURNSTILE_HOSTNAMES`, `action === "guest_mint"`, and `challenge_ts` no older than the maximum age. Provider-side configuration errors (`invalid-input-secret`, `missing-input-secret`, `internal-error`) are treated as an **outage** (503 + alert), never blamed on the user. | `TURNSTILE_TIMEOUT_MS=3000`, `TURNSTILE_MAX_TOKEN_AGE_S=300` |
 | Single-use tokens | `sha256(token)` is redeemed **before** the provider is asked. PostgreSQL: `INSERT … ON CONFLICT` on `captcha_redemptions` (migration `0004`, primary key), so exactly one caller wins on any instance. JSON: in-process, atomic. Rows expire (max age + 60 s) and are swept. | — |
-| Budgets | All or nothing in one transaction (`takeWindows`, rows locked in key order). Keys: device `gm:dev:<sha256(cookie)>` (per day), IP `gm:ip:<addr>`, network `gm:net:v4:a.b.c.0/24` or `gm:net:v6:xxxx:xxxx:xxxx::/48` (per hour). IPv4-mapped IPv6 is folded to IPv4, and IPv6 is canonicalised. **Only CAPTCHA-verified requests spend budgets**, so unverified floods cannot exhaust a shared subnet. The existing 10/min per-IP pre-filter stays in front. | device 3/day, IP 5/h, subnet 30/h |
+| Budgets | All or nothing in one transaction (`takeWindows`, rows locked in key order). Keys: device `gm:dev:<sha256(cookie)>` (per day), IP `gm:ip:<addr>`, network `gm:net:v4:a.b.c.0/24` or `gm:net:v6:xxxx:xxxx:xxxx::/48` (per hour). IPv4-mapped IPv6 is folded to IPv4, and IPv6 is canonicalised. **Only CAPTCHA-verified requests spend budgets**, so unverified floods cannot exhaust a shared subnet. The existing 10/min per-IP pre-filter stays in front. | device 3/day, IP 20/h, subnet 100/h (owner-approved 2026-11-03; were 5/h and 30/h) |
 | Device cookie | `__Host-fs_dev=<22-char base64url, 128-bit random>; Max-Age=31536000; Path=/; HttpOnly; Secure; SameSite=Lax`, no `Domain`. Only `sha256(value)` is used as a key. Nothing derives from the IP, the user agent or the user. A value not exactly in this format is replaced, never trusted. | — |
 | Global threshold | `GUEST_MINT_SOFT_PER_HOUR` (the former `GUEST_MINT_PER_HOUR` is still honoured as a fallback). When reached: an alert `guest_mint_soft_threshold` (once per hour per instance), and the IP and subnet budgets are halved for the rest of the hour. **It never rejects a CAPTCHA-verified sign-up.** | 1 000/h |
 | Hard ceiling | `GUEST_MINT_HARD_PER_HOUR`, all instances. `429 guest_capacity` with a sign-in path, plus an alert. **Off by default** (see §3.1 item 5). | 0 (off) |
@@ -165,30 +165,50 @@ Skips: 2 live Gemini tests on both backends (no key, "NOT passed"; R-01); 7 JSON
 ## 7. Risk register (Track A)
 | # | Risk | Note |
 |---|---|---|
-| 1 | **Shared networks.** The defaults (5/h per IP, 30/h per /24, halved above the soft threshold) can refuse guest sign-up to people behind one NAT (schools, offices, mobile CGNAT). | Only new **guests** are affected; signing in always works. All values are configurable. Tune them from the baseline series. |
+| 1 | **Shared networks.** Approved defaults: 20/h per IP, 100/h per /24 and /48, halved above the soft threshold. A large office or carrier NAT gets 20 new guest sessions per hour per public IP. | Only new **guests** are affected; signing in always works. Verified requests refused by the IP or subnet limit are recorded **separately** (`guestMints.networkRefusals`, 30-day series), apart from abuse signals (CAPTCHA failures). Review the limits against real traffic; **never tighten them silently** (owner decision). |
 | 2 | The device budget is not a defence against scripts (they can drop cookies). | By design: scripts are held back by the CAPTCHA and the IP and subnet budgets. |
-| 3 | Fixed-window boundary: up to 2 × N in a short span around the hour (or day) edge. | Accepted trade-off (§3.1 item 2). |
+| 3 | Fixed-window boundary: up to 2 × N in a short span around the hour (or day) edge. | **Accepted by the owner, with monitoring** (§10). |
 | 4 | **No live Cloudflare validation.** Only the documented siteverify contract is exercised, against a stub. | The owner must create a Turnstile widget (free) and store the secret; a live check follows (owner action). |
 | 5 | Cloudflare outage = guest sign-up paused. | By design; existing users are unaffected; signing in still works. |
-| 6 | No hard ceiling until measured. | Decision needed (§3.1 item 5). Storage is bounded by the guest pool cap meanwhile. |
+| 6 | No hard ceiling until measured. | **Owner decision: off** (`GUEST_MINT_HARD_PER_HOUR=0`). After 14 days of traffic, the 10 × p99 value is proposed for approval; it is never enabled automatically. Storage stays bounded by the guest pool cap meanwhile. |
 | 7 | JSON backend: redemptions, windows and statistics are in memory (lost on restart). | JSON is single-instance (development and rollback target). PostgreSQL is the production target. |
 | 8 | Rollback: the previous release ignores `captcha_redemptions` but its sweep deletes `stats:*` rows older than 48 h. | A rollback loses baseline history older than 48 h, not functionality. |
 | 9 | Junk redemptions from invalid tokens. | Bounded by the 10/min per-IP pre-filter; rows expire after about 6 minutes and are swept. |
-| 10 | Soft-threshold escalation is budget halving, not an interactive-only challenge. | §3.1 item 4. |
+| 10 | Soft-threshold escalation is budget halving plus an alert. **This is not equivalent to a forced interactive challenge.** Every new guest still needs a CAPTCHA. | **Accepted temporarily** by the owner (§10). |
 | 11 | ASN-level budgets not built. | Deferred by owner decision (needs a GeoIP/ASN licence). |
 | 12 | **Test connection headroom.** The full PostgreSQL suite peaks at 92 of 100 connections (brief spikes) even with test pools of 4. A future test added in parallel could exhaust it again. | Test infrastructure, not production. If CI shows it, raise the CI database's `max_connections` rather than shrinking pools further. |
 
-## 8. Privacy-policy draft text (A9, for the owner's approval)
-> **Security cookie.** When you continue as a guest, Forge Studio sets one first-party cookie, `__Host-fs_dev`. It
-> contains a random value that identifies your browser only to us. It contains no personal information and is not
-> derived from your IP address, your device or your account. We use it only to limit how many guest sessions one
-> browser can start, to prevent abuse. It is not used for analytics, advertising or tracking across sites. It is
-> strictly necessary for security, expires after one year, and can be deleted at any time in your browser settings.
+## 8. Privacy notice: approved draft (owner, 2026-11-03)
+Status: **approved as a draft**, including the owner's edit (the 35-day paragraph). **It is not final legal clearance:**
+the complete privacy policy must be reviewed before public launch. Hashed identifiers are **pseudonymous security
+identifiers, not anonymous data**.
+
+> **Starting a guest session.** To protect Forge Studio from automated sign-ups, starting a guest session involves three things:
 >
-> **Verification.** To prevent automated abuse, starting a guest session uses Cloudflare Turnstile. Cloudflare
-> processes technical information from your browser to decide whether the request is automated; see Cloudflare's
-> privacy policy. We send Cloudflare the verification token and your IP address, and keep only a one-way hash of the
-> token for a few minutes to stop it from being reused.
+> **1. A security cookie.** We set one first-party cookie, `__Host-fs_dev`, containing a random value. It contains no personal information and is not derived from your IP address, your device or your account. It is used only to limit how many guest sessions one browser can start. It is never used for analytics, advertising or cross-site tracking. It is strictly necessary for security, lasts **one year**, and you can delete it at any time in your browser settings. Our servers keep only a one-way hash of it (a pseudonymous security identifier), and only for up to **2 days**.
+>
+> **2. Your IP address.** We limit how many new guest sessions can be started from one IP address, and from one network block (the first three parts of an IPv4 address, or the first 48 bits of an IPv6 address), within an hour. For this we keep your IP address and network block for up to **2 days**. They are not written to our request logs. If many people share your connection (an office, a school or a mobile network), you may occasionally be asked to try again later or sign in instead.
+>
+> **3. Verification by Cloudflare.** We use Cloudflare Turnstile to tell people from automated scripts. Cloudflare processes technical information from your browser to make this decision (see Cloudflare's privacy policy). We send Cloudflare the verification result your browser produced and your IP address. We keep only a one-way hash of that result, for about 10 minutes, so it cannot be reused.
+>
+> **Other security and usage limits.** Separately from guest registration, Forge Studio uses IP addresses for existing rate-limiting and AI usage-quota enforcement. Some of these records may be retained for up to 35 days to enforce usage limits and protect the service.
+>
+> Signing in with an account is never subject to the guest-registration limits.
+
+What is stored, hashed, logged and retained (verified against the code on `e64615b`):
+
+| Data | Where | Form | Retention |
+|---|---|---|---|
+| `__Host-fs_dev` value | user's browser | random 128-bit value | 1 year |
+| Device identifier | limit counters (`gm:dev:*`) | SHA-256 (pseudonymous) | at most about 49 h (deleted 48 h after the window starts; the sweep runs every 5 min) |
+| IP address | limit counters (`gm:ip:*`) | plain text | at most about 49 h |
+| IPv4 /24 or IPv6 /48 | limit counters (`gm:net:*`) | plain text | at most about 49 h |
+| CAPTCHA token | `captcha_redemptions` | SHA-256 | about 6 min, deleted within about 11 min |
+| Token and IP | sent to Cloudflare siteverify | as is | Cloudflare's policy |
+| Guest-mint statistics | `stats:*` counters | counts only, no identifiers | 30 days |
+| Request logs | server logs | time, path, status, duration, user kind (no IP, token or cookie) | per log retention |
+| Existing per-minute rate limits | `rate_buckets` | IP in plain text | about 10 idle minutes |
+| Existing daily AI quota | `ai_usage_daily` | IP in plain text | 35 days |
 
 ## 9. Before Track A can go live (owner actions, not code)
 1. Create a Cloudflare Turnstile widget (free tier) for the production hostname(s), action `guest_mint`.
@@ -196,3 +216,17 @@ Skips: 2 live Gemini tests on both backends (no key, "NOT passed"; R-01); 7 JSON
    the secret's value.
 3. Approve or adjust the privacy text (§8).
 4. Decide the hard ceiling (§3.1 item 5) and review the default budgets for expected shared-network users (§7 risk 1).
+
+## 10. Owner decision record (2026-11-03)
+| Item | Decision | Condition / follow-up |
+|---|---|---|
+| Hard ceiling | **Off by default** (`GUEST_MINT_HARD_PER_HOUR=0`); no arbitrary cap | Collect 14 days of real traffic, compute 10 × p99 from `guestMints.series`, and **bring the number back for approval**; never enabled automatically |
+| `/api/health/details` exposure | Verified restricted | 404 without the diagnostics token or an admin identity (R-12); public endpoints carry no guest-mint metrics (test `A-decisions`) |
+| Network limits | **Approved:** device 3/day, IP 20/h, IPv4 /24 100/h, IPv6 /48 100/h; soft-threshold halving kept | Shared-network refusals recorded separately (`guestMints.networkRefusals` and `rejected['guest_rate_limited:ip' / ':subnet']`), apart from CAPTCHA failures. Review against real traffic; do not tighten silently. |
+| Privacy notice | **Approved with edit, as a draft** (§8) | The 35-day IP retention for existing rate limits and AI quotas is disclosed; hashed identifiers are called pseudonymous; **legal review of the full policy before public launch** |
+| Cookie only, no localStorage copy | **Accepted** | `HttpOnly` and `Secure` are kept (test A6) |
+| Weaker escalation after the soft threshold | **Accepted temporarily** | Every new guest still needs a CAPTCHA. Documented as **not equivalent** to a forced interactive challenge (risk 10). |
+| No emergency guest budget in a CAPTCHA outage | **Accepted** | Fail closed for new guests only; existing guests and signed-in users stay functional (test A7) |
+| Fixed-window boundary burst | **Accepted, with monitoring** | Up to 2 × N around a window edge (risk 3) |
+| Evidence limitation | Recorded | The fetched CI log starts at `npm test`; checkout, install and typecheck are evidenced by step status only |
+

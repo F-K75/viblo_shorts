@@ -26,11 +26,17 @@
   * E2E 2/2 per backend.
 * **R-03: fixed on the branch, pending review and CI.** It is not live until the owner creates a Turnstile widget and
   stores the secret.
-* **Decisions for the owner:**
-  * the hard-ceiling default (off until 14 days are measured);
-  * the default budgets for shared networks;
-  * the privacy text.
-  * Deviations from the plan are in Track A §3.1.
+* **Owner decisions (2026-11-03), recorded in Track A §10:**
+  * Hard ceiling: **off** until 14 days of traffic exist; the 10 × p99 value comes back for approval.
+  * Network limits: **20/h per IP, 100/h per /24 and /48, 3/day per device**, with halving kept. Shared-network
+    refusals are recorded separately from abuse signals.
+  * Privacy notice: **approved as a draft** with the 35-day disclosure; legal review is still required before launch.
+  * Deviations accepted: cookie only; escalation temporarily weaker (documented as not equivalent to an interactive
+    challenge); no emergency outage budget; the fixed-window burst accepted with monitoring.
+  * `/api/health/details` was verified as not public.
+* **CI run 35 on `e64615b` was green** (accepted by the owner). The final head after these changes is re-verified in
+  the PR.
+* **Merge approval is still withheld** pending the final CI evidence.
 
 ## Phase 2.5 Track B (R-04, F7): MERGED (PR #5 → `main` @ `80e02b5`, 2026-11-03)
 * **Merged with owner approval** as merge commit `80e02b5`. Its parents are the previous `main` (`53fc724`) and the
