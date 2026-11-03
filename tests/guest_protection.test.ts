@@ -10,7 +10,7 @@
 // The global soft threshold (GUEST_MINT_SOFT_PER_HOUR) alerts and tightens budgets but never rejects a verified mint.
 // Device cookie: __Host-fs_dev, opaque 128-bit random, Secure, HttpOnly, SameSite=Lax, Path=/, no Domain, 1 year;
 // only its SHA-256 is used as a rate-limit key.
-import { test, describe, after } from 'node:test';
+import { test, describe, after, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import pg from 'pg';
@@ -18,10 +18,15 @@ import { startTestServer, healthDetails, type TestServer } from './helpers/serve
 import { createTestDatabase, pgSkip } from './helpers/pg.ts';
 import { startTurnstileStub } from './helpers/turnstileStub.ts';
 
+// Servers, stubs and databases are torn down after EACH test. With every server on PostgreSQL
+// (TEST_STORAGE_BACKEND=postgres) each one holds a connection pool; keeping ~20 of them alive until the end of the file
+// exhausted the database's max_connections (100) and later tests got 503 database_unavailable (gate on 07dd7ef).
 const cleanups: Array<() => Promise<unknown>> = [];
-after(async () => {
-  for (const c of cleanups.reverse()) await c().catch(() => {});
-});
+const runCleanups = async () => {
+  for (const c of cleanups.splice(0).reverse()) await c().catch(() => {});
+};
+afterEach(runCleanups);
+after(runCleanups);
 
 const SECRET = `test-turnstile-secret-${crypto.randomBytes(12).toString('hex')}`;
 const HOST = 'forge.test';
