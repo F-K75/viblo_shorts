@@ -29,12 +29,12 @@ const dbs: TestDb[] = [];
 after(async () => {
   for (const d of dbs) await d.drop().catch(() => {});
 });
-async function makeRepo(kind: 'json' | 'postgres'): Promise<{ r: Repo; db?: TestDb }> {
+async function makeRepo(kind: 'json' | 'postgres'): Promise<{ r: Repo; db?: TestDb; dir?: string }> {
   if (kind === 'json') {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'd1-json-'));
     const r = new JsonRepo(dir, path.join(dir, 'backups'), limits, 0);
     r.init();
-    return { r };
+    return { r, dir };
   }
   const db = await createTestDatabase();
   dbs.push(db);
@@ -204,5 +204,78 @@ describe('F9 (postgres): the data-migration counter rebuild', { skip: pgSkip }, 
     const t = await totalsMatch(db);
     assert.equal(t.all[0], t.all[1]);
     assert.equal(t.guest[0], t.guest[1]);
+  });
+});
+
+// ---------------------------------------------------------------- D4c / F10: AI reservation lifecycle
+// Owner decision: refund only if the model call provably has not started; charge once it started or when uncertain.
+const AI_KEYS = (u: string) => [{ key: `user:${u}`, limit: 10 }];
+const aiDay = () => Math.floor(Date.now() / 86400000);
+for (const kind of ['json', 'postgres'] as const) {
+  describe(`F10 (${kind}): AI reservation lifecycle`, { skip: kind === 'postgres' ? pgSkip : false }, () => {
+    test('abort before the model started refunds; once started, abort charges; a refunded reservation can never start', async () => {
+      const { r } = await makeRepo(kind);
+      const day = aiDay();
+      const ai = r as any;
+      // not started + client abort -> refunded
+      assert.deepEqual(await r.reserveAi(AI_KEYS('f10'), day, 'f10-res-0001'), { ok: true });
+      assert.equal(await ai.settleAi('f10-res-0001', 'abort'), 'settled');
+      assert.equal(await r.peekAi('user:f10', day), 0, 'never started: released');
+      assert.equal(await ai.startAi('f10-res-0001'), false, 'a settled reservation can never start a model call');
+      // started + client abort -> committed (charged)
+      await r.reserveAi(AI_KEYS('f10'), day, 'f10-res-0002');
+      assert.equal(await ai.startAi('f10-res-0002'), true, 'atomic transition into model-call-started');
+      assert.equal(await ai.startAi('f10-res-0002'), false, 'the transition happens once');
+      assert.equal(await ai.settleAi('f10-res-0002', 'abort'), 'settled');
+      assert.equal(await r.peekAi('user:f10', day), 1, 'started: the charge is kept');
+      assert.equal(await ai.settleAi('f10-res-0002', 'refund'), 'already_settled', 'exactly one final outcome');
+      assert.equal(await r.peekAi('user:f10', day), 1);
+      // a known failure after the start is still refunded (billing model unchanged for complete responses)
+      await r.reserveAi(AI_KEYS('f10'), day, 'f10-res-0003');
+      assert.equal(await ai.startAi('f10-res-0003'), true);
+      assert.equal(await ai.settleAi('f10-res-0003', 'refund'), 'settled');
+      assert.equal(await r.peekAi('user:f10', day), 1);
+    });
+
+    test('crash recovery: expiry refunds a reservation that never started and commits one that started (uncertain = charged)', async () => {
+      const { r, dir } = await makeRepo(kind);
+      const day = aiDay();
+      const ai = r as any;
+      await r.reserveAi(AI_KEYS('f10c'), day, 'f10-crash-not-started');
+      await r.reserveAi(AI_KEYS('f10c'), day, 'f10-crash-started');
+      assert.equal(await ai.startAi('f10-crash-started'), true);
+      let recovered: any = r;
+      if (kind === 'json') {
+        // the process "crashes": a new repo over the same files (open reservations are persisted)
+        await r.close(); // flushes the ledger, as the debounced flush would have
+        recovered = new JsonRepo(dir!, path.join(dir!, 'backups'), limits, 0);
+        recovered.init();
+      }
+      await new Promise((res) => setTimeout(res, 60));
+      assert.equal(await recovered.expireAiReservations(30), 2, 'both stale reservations are settled');
+      assert.equal(await recovered.peekAi('user:f10c', day), 1, 'only the started one stays charged');
+      assert.equal(await recovered.settleAi('f10-crash-started', 'refund'), 'already_settled');
+    });
+  });
+}
+
+describe('F10 (postgres): concurrent start, abort and completion', { skip: pgSkip }, () => {
+  test('40 rounds of start racing abort, commit and duplicate settles: one final outcome each, never a double refund or double charge', async () => {
+    const { r, db } = await makeRepo('postgres');
+    const ai = r as any;
+    const day = aiDay();
+    let expected = 0;
+    for (let i = 0; i < 40; i++) {
+      const id = `f10-race-${String(i).padStart(4, '0')}`;
+      await r.reserveAi([{ key: 'user:f10r', limit: 1000 }], day, id);
+      const [started, a1, a2, c] = await Promise.all([ai.startAi(id), ai.settleAi(id, 'abort'), ai.settleAi(id, 'abort'), i % 2 ? ai.settleAi(id, 'commit') : ai.settleAi(id, 'abort')]);
+      const settled = [a1, a2, c].filter((x) => x === 'settled').length;
+      assert.equal(settled, 1, `round ${i}: exactly one settlement (${[a1, a2, c]})`);
+      const row = (await db!.pool.query('SELECT status, started_at FROM ai_reservations WHERE id = $1', [id])).rows[0];
+      if (row.status === 'refunded') assert.equal(started, false, `round ${i}: a refunded reservation never started`);
+      if (started) assert.equal(row.status, 'committed', `round ${i}: a started reservation is never refunded by an abort`);
+      if (row.status === 'committed') expected++;
+    }
+    assert.equal(await r.peekAi('user:f10r', day), expected, 'the usage count equals the committed reservations');
   });
 });
