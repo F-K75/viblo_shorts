@@ -5,6 +5,7 @@ import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import { createServer as createHttpServer, type Server } from 'http';
+import { AsyncLocalStorage } from 'async_hooks';
 import { fileURLToPath } from 'url';
 import { spawn, type ChildProcess } from 'child_process';
 import { GoogleGenAI, Type } from '@google/genai';
@@ -446,18 +447,20 @@ function rateLimit(group: string, maxPerMinute: number, opts: { ai?: boolean } =
         });
       }
       req.aiReservation = { id: reservationId, keys: [userKey, ipKey], day };
-      // Settle once when the response is done:
-      //  * real model output, or the client aborted (the model may still have run) -> commit (charged);
-      //  * fallback / validation error / provider failure with a complete response -> refund.
-      // If settling fails, the reservation stays open and expiry refunds it (the user is never charged for a
-      // failure; at worst a successful call is not charged).
+      // Settle once when the response is done (F10, owner decision 2026-11-03):
+      //  * real model output -> commit (charged);
+      //  * fallback / validation error / provider failure with a complete response -> refund;
+      //  * the client disconnected -> abort: refunded if the model call never started, charged once it started.
+      // If settling fails, the reservation stays open and expiry settles it the same way as an abort.
       res.on('close', () => {
-        const outcome = req.aiSucceeded || !res.writableFinished ? 'commit' : 'refund';
+        const outcome = req.aiSucceeded ? 'commit' : !res.writableFinished ? 'abort' : 'refund';
         repo.settleAi(reservationId, outcome).catch((err) => {
           console.error(JSON.stringify({ level: 'error', event: 'ai_quota_settle_failed', outcome, error: String(err?.message || err).slice(0, 200) }));
         });
       });
       res.setHeader('X-Daily-Quota-Remaining', String(Math.max(0, sub.dailyQuotaLimit - (await repo.peekAi(userKey, day)))));
+      // The handler runs inside this context, so the model call can mark the reservation started (beginModelCall).
+      return aiCallContext.run({ reservationId, res, started: false }, () => next());
     }
     next();
   };
@@ -559,6 +562,27 @@ class LlmUnavailableError extends Error {
   }
 }
 
+// F10: the AI reservation of the current request (set by rateLimit(..., { ai: true })).
+const aiCallContext = new AsyncLocalStorage<{ reservationId: string; res: express.Response; started: boolean }>();
+/** The model call was not made because its reservation is already settled (e.g. refunded after a client abort). */
+class AiCallAbortedError extends LlmUnavailableError {
+  constructor() {
+    super('The request ended before the model call started; the call was not made.', 'llm_error');
+  }
+}
+/**
+ * Must run immediately before the first model invocation of a request. Records the atomic transition "model call
+ * started" on the reservation; from then on a client abort is charged. If the client is already gone, or the
+ * reservation was already settled (refunded), the call is NOT made, so a refunded reservation never reaches the model.
+ */
+async function beginModelCall() {
+  const ctx = aiCallContext.getStore();
+  if (!ctx || ctx.started) return;
+  if (ctx.res.destroyed || ctx.res.socket?.destroyed) throw new AiCallAbortedError();
+  if (!(await repo.startAi(ctx.reservationId))) throw new AiCallAbortedError();
+  ctx.started = true;
+}
+
 /**
  * Invokes the configured Gemini models in order with per-attempt timeout, bounded retries
  * for transient errors and failover. Never loops unbounded: max models × 2 attempts.
@@ -568,6 +592,7 @@ async function generateGeminiContentWithFallback(
   params: { contents: any; config?: any },
   label = 'generate',
 ) {
+  await beginModelCall(); // F10: from here on the reservation is "model call started"
   let lastError: any = null;
   for (const model of LLM_MODELS) {
     const maxAttempts = 2;
@@ -2352,6 +2377,7 @@ app.post('/api/tts', rateLimit('tts', 25, { ai: true }), async (req, res) => {
   if (aiClient) {
     const started = Date.now();
     try {
+      await beginModelCall(); // F10
       llmMetrics.calls++;
       const response = await aiClient.models.generateContent({
         model: TTS_MODEL,
@@ -2981,7 +3007,8 @@ export async function startServer(): Promise<Server> {
   });
   every(5 * 60000, () => void repo.sweep().catch(logErr('storage_sweep_failed')));
   every(Math.min(60000, Math.max(1000, Math.floor(AI_RESERVATION_TTL_MS / 3))), () => {
-    repo.expireAiReservations(AI_RESERVATION_TTL_MS).then((n) => n && console.warn(JSON.stringify({ level: 'warn', event: 'ai_reservations_expired_refunded', count: n })), logErr('ai_reservation_expiry_failed'));
+    // Stale reservations are settled as an abort: refunded if the model call never started, committed if it did.
+    repo.expireAiReservations(AI_RESERVATION_TTL_MS).then((n) => n && console.warn(JSON.stringify({ level: 'warn', event: 'ai_reservations_expired', count: n })), logErr('ai_reservation_expiry_failed'));
   });
   void pumpRenderQueue(); // queued jobs that survived a restart
 

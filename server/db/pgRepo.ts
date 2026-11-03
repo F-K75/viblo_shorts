@@ -212,13 +212,18 @@ export class PostgresRepo implements Repo {
 
   async settleAi(reservationId: string, outcome: AiSettlement): Promise<'settled' | 'already_settled'> {
     return withTx(this.db, async (tx) => {
-      // Conditional transition: only an open reservation can be settled, so a duplicate/retried settle is a no-op.
+      // Conditional transition: only an open reservation can be settled, so a duplicate/retried settle is a no-op and
+      // there is exactly one final outcome. 'abort' decides on the row itself (started_at), in the same statement, so
+      // it cannot race the start transition.
       const r = await tx.query(
-        `UPDATE ai_reservations SET status = $2, settled_at = now() WHERE id = $1 AND status = 'reserved' RETURNING day, keys`,
-        [reservationId, outcome === 'commit' ? 'committed' : 'refunded'],
+        `UPDATE ai_reservations SET settled_at = now(),
+           status = CASE WHEN $2 = 'commit' THEN 'committed' WHEN $2 = 'refund' THEN 'refunded'
+                         WHEN started_at IS NULL THEN 'refunded' ELSE 'committed' END
+         WHERE id = $1 AND status = 'reserved' RETURNING day, keys, status`,
+        [reservationId, outcome],
       );
       if (r.rowCount === 0) return 'already_settled' as const;
-      if (outcome === 'refund') {
+      if (r.rows[0].status === 'refunded') {
         const { day, keys } = r.rows[0];
         for (const key of [...(keys as string[])].sort()) {
           await tx.query('UPDATE ai_usage_daily SET count = GREATEST(0, count - 1) WHERE day = $1 AND key = $2', [day, key]);
@@ -228,15 +233,26 @@ export class PostgresRepo implements Repo {
     });
   }
 
+  async startAi(reservationId: string) {
+    const r = await this.db.query(
+      "UPDATE ai_reservations SET started_at = now() WHERE id = $1 AND status = 'reserved' AND started_at IS NULL RETURNING 1",
+      [reservationId],
+    );
+    return (r.rowCount ?? 0) > 0;
+  }
+
   async expireAiReservations(ttlMs: number) {
-    // SKIP LOCKED: a reservation being settled right now by its request is left alone (no lock wait, no double settle).
+    // The SELECT runs in autocommit, so its row locks are released immediately (F10: the old comment claimed
+    // otherwise). Correctness does not depend on them: settleAi is a conditional open -> settled transition, so a
+    // reservation that its request settles concurrently is settled exactly once. Stale reservations are settled as an
+    // abort: refunded if the model call never started, committed if it did (uncertain = charged).
     const { rows } = await this.db.query(
       `SELECT id FROM ai_reservations WHERE status = 'reserved' AND created_at < now() - ($1::int * interval '1 millisecond')
        ORDER BY created_at LIMIT 500 FOR UPDATE SKIP LOCKED`,
       [Math.max(1, Math.floor(ttlMs))],
     );
     let n = 0;
-    for (const { id } of rows) if ((await this.settleAi(id, 'refund')) === 'settled') n++;
+    for (const { id } of rows) if ((await this.settleAi(id, 'abort')) === 'settled') n++;
     return n;
   }
 

@@ -168,6 +168,9 @@ export class JsonRepo implements Repo {
   async settleAi(reservationId: string, outcome: AiSettlement) {
     return this.ledger.settle(reservationId, outcome);
   }
+  async startAi(reservationId: string) {
+    return this.ledger.start(reservationId);
+  }
   async expireAiReservations(ttlMs: number) {
     return this.ledger.expire(ttlMs);
   }

@@ -40,7 +40,13 @@ export interface ServerJob {
   billingDefaults?: StoredSubscription;
 }
 
-export type AiSettlement = 'commit' | 'refund';
+/**
+ * How a request ended (F10, owner decision 2026-11-03):
+ *  * commit: real model output, charge it;
+ *  * refund: the request completed without a charged result (fallback, validation, provider failure);
+ *  * abort:  the client disconnected: refund only if the model call never started, otherwise charge (it may have run).
+ */
+export type AiSettlement = 'commit' | 'refund' | 'abort';
 
 export interface QuotaEntry {
   key: string;
@@ -130,7 +136,15 @@ export interface Repo {
    * settled (or unknown) reservation is a no-op, so retries can never double-refund.
    */
   settleAi(reservationId: string, outcome: AiSettlement): Promise<'settled' | 'already_settled'>;
-  /** Refunds reservations left open longer than ttlMs (crashed request, failed settle). Returns how many. */
+  /**
+   * Atomic transition into "model call started", allowed once and only while the reservation is open. False means
+   * the call must NOT be made (already settled, e.g. refunded after a client abort, or already started).
+   */
+  startAi(reservationId: string): Promise<boolean>;
+  /**
+   * Settles reservations left open longer than ttlMs (crashed request, failed settle) as an abort: refunded if the
+   * model call never started, committed if it started (uncertain = charged). Returns how many were settled.
+   */
   expireAiReservations(ttlMs: number): Promise<number>;
   peekAi(key: string, day: number): Promise<number>;
 

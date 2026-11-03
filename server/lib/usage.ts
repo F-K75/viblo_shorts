@@ -2,9 +2,10 @@
 // PostgreSQL backend (R-02):
 //  * reserve(entries, id) is a synchronous all-or-nothing check-and-increment, so concurrent requests in this
 //    process cannot exceed a limit (no await between check and increment). Idempotent per id.
-//  * settle(id, 'commit' | 'refund') happens exactly once; a repeated settle is a no-op (no double refund).
-//  * open reservations are persisted, and expire() refunds those never settled (crash, failed settle), so a
-//    failed request cannot consume quota permanently.
+//  * settle(id, 'commit' | 'refund' | 'abort') happens exactly once; a repeated settle is a no-op (no double refund).
+//  * start(id) records the model call starting (F10): an abort refunds only a reservation that never started.
+//  * open reservations are persisted, and expire() settles those never settled (crash, failed settle): refunded if
+//    the model call never started, committed if it did (uncertain = charged).
 // Counts and open reservations are flushed to usage.json (debounced, and on shutdown) and reloaded at boot.
 // A corrupt usage.json is never overwritten: the ledger fails closed (AI endpoints answer 503).
 import { readJsonFile, writeJsonFileAtomic, StoreUnavailableError } from './storage.ts';
@@ -13,6 +14,8 @@ interface OpenReservation {
   keys: string[];
   day: number;
   at: number;
+  /** F10: when the model call started (persisted, so crash recovery knows the call may have run). */
+  started?: number;
 }
 interface UsageFile {
   v: 1 | 2;
@@ -86,15 +89,29 @@ export class UsageLedger {
     return { ok: true };
   }
 
-  /** Settles a reservation exactly once. Unknown or already-settled ids are a no-op. */
-  settle(id: string, outcome: 'commit' | 'refund'): 'settled' | 'already_settled' {
+  /** F10: atomic transition into "model call started"; only once, only while open. */
+  start(id: string): boolean {
+    this.assertAvailable();
+    const r = this.open.get(id);
+    if (!r || r.started) return false;
+    r.started = Date.now();
+    this.markDirty();
+    return true;
+  }
+
+  /**
+   * Settles a reservation exactly once. Unknown or already-settled ids are a no-op. 'abort' refunds only a reservation
+   * whose model call never started (F10).
+   */
+  settle(id: string, outcome: 'commit' | 'refund' | 'abort'): 'settled' | 'already_settled' {
     this.assertAvailable();
     const r = this.open.get(id);
     if (!r) return 'already_settled';
     this.open.delete(id);
     this.settled.add(id);
     if (this.settled.size > 50000) this.settled.clear(); // bounded; ids are random, re-use is not expected
-    if (outcome === 'refund' && r.day === utcDay()) {
+    const refund = outcome === 'refund' || (outcome === 'abort' && !r.started);
+    if (refund && r.day === utcDay()) {
       // a reservation from a previous day was never counted in today's totals
       for (const k of r.keys) {
         const v = (this.counts.get(k) || 0) - 1;
@@ -106,14 +123,14 @@ export class UsageLedger {
     return 'settled';
   }
 
-  /** Refunds reservations left open longer than ttlMs. */
+  /** Settles reservations left open longer than ttlMs as an abort: refunded if never started, else committed (F10). */
   expire(ttlMs: number): number {
     if (this.unavailableReason) return 0;
     const cutoff = Date.now() - ttlMs;
     let n = 0;
     for (const [id, r] of [...this.open]) {
       if (r.at < cutoff) {
-        this.settle(id, 'refund');
+        this.settle(id, 'abort');
         n++;
       }
     }
