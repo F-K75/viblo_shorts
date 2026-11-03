@@ -1,5 +1,49 @@
 # Forge Studio — Independent Re-audit + Corrective Round
 
+## Phase 2.5 Track D-1 (F8, F9, F10, F11, D6, D2, D7): ready for review (F-K75/viblo_shorts#7), NOT merged
+* **Evidence:** `docs/PHASE2_5_TRACK_D1.md`. Base: `main` @ `6ee9c11` plus `14c1438`. Head: the commit after `a5a4093` (docs
+  only). D-2 has not been started. Passing CI is not merge approval and not release approval.
+* **Fixed, each red-first on `6ee9c11`:**
+  * F8: ownership enforced inside the save; deleted projects are not resurrected.
+  * F9: the migration counter rebuild is correct under live writes and bounded per statement.
+  * F10: an AI reservation is refunded only if the model call provably never started.
+  * F11: backups verify `ai_reservations` by count and content; every backup connection follows the TLS policy.
+  * D6: guest tokens accept exactly one encoding.
+* **Verified in the real container (CI run 44):**
+  * D2: the restore guard refuses after a real SIGKILLed restore, the volume stays unchanged, and recovery works.
+  * D7: no tini, Node or ffmpeg process survives `docker stop` or a SIGKILL to Node only.
+* **Gate finding in merged Track A code:**
+  * refusal stats were written fire-and-forget, so diagnostics could miss them;
+  * the test is intermittent: it failed locally on `3aa217c` but passed in CI;
+  * a deterministic red test reproduces it; fixed in `a7b083e`, in its own commit.
+* **D2 CI history:**
+  * runs 39 and 41–43 failed because the test fixture ran as the container's PID 1, which ignores a self-sent SIGKILL;
+  * the cause was confirmed from a rename log; fixed in `a5a4093`.
+* **Local gate (`419351d`; later commits are CI scripts and docs only):**
+  * D-1 tests: 18/18 three times on JSON and three times on PostgreSQL;
+  * full JSON suite: 272 tests, 270 pass, 0 fail, 2 skipped;
+  * full PostgreSQL suite: 272 tests, 263 pass, 0 fail, 9 skipped;
+  * build passes; E2E 2/2 on each backend.
+* **CI run 44 (`a5a4093`):**
+  * `test`: same totals as the local gate;
+  * `docker`: migrations to version 5; smoke tests, D2 and D7 pass; 0 errors;
+  * `live-llm`: 0 live tests.
+
+### Risk register changes (D-1)
+| Item | Before | After |
+|---|---|---|
+| F8 cross-user overwrite on concurrent create; resurrection on update-after-delete | open (P2) | **fixed** (pending merge) |
+| F9 counter drift and statement timeout in the migration rebuild | open (P3; mitigated by runbook write freeze) | **fixed** (pending merge). New residual: live saves wait on the migration's row locks. The runbook write freeze still applies. |
+| F10 abort charged / crash expiry refunded regardless of model-call state | open | **fixed** per owner decision. Accepted risk: an uncertain state is charged. |
+| F11 `ai_reservations` unverified; backup connections bypass TLS (libpq `prefer`) | open | **fixed** (pending merge). Residual: `PGSSLROOTCERT=system` needs libpq 16 or later (image ships 17). |
+| D6 malleable guest-token encodings | open (owner: reject) | **fixed** (pending merge); tamper test unchanged |
+| D2 restore guard untested in a real container | open | **verified in CI** |
+| D7 ffmpeg survival on Node termination | open | **verified in CI** (normal and forced) |
+| Track A refusal stats recorded after the answer | not known | **found and fixed** in D-1 (pending merge). Residual: a refusal waits for its stat write. |
+| D8 EPIPE in upload test helper | open | open (D-2) |
+| D9 Playwright throwaway-install vulnerabilities | open | open (D-2) |
+| CI database connection headroom (92 of 100) | open | open (not re-measured) |
+
 ## Phase 2.5 Track A (R-03): MERGED (PR #6 → `main` @ `6ee9c11`, 2026-11-03) and closed
 * **Merged with owner approval** as merge commit `6ee9c11`. Its parents are the previous `main` (`80e02b5`) and the
   approved head (`ce4c5e2`), and its tree is identical to `ce4c5e2`. The merge was pinned to that head SHA.
@@ -37,7 +81,7 @@
 | C, memory protection (R-13) | merged (`53fc724`) |
 | B, render queue and billing (R-04, F7) | merged (`80e02b5`) |
 | A, guest registration protection (R-03) | merged (`6ee9c11`), closed |
-| D, operational hardening | not started; needs authorization |
+| D, operational hardening | authorized; D-1 ready for review (F-K75/viblo_shorts#7), D-2 waits for the D-1 merge |
 | E, live Gemini validation (R-01) | not started; needs authorization |
 
 **Open release blockers and pre-launch requirements:**

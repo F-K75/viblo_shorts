@@ -1,6 +1,6 @@
 # Phase 2.5 Track D-1: security and data hardening (F8, F9, F10, F11, D6, D2, D7)
 
-**Status: DRAFT (gate and CI in progress). Not merged.** D-2 has not been started; per the owner's instruction it waits for D-1 to be
+**Status: ready for review. Not merged.** D-2 has not been started; per the owner's instruction it waits for D-1 to be
 reviewed and merged. Passing CI is not merge approval and not production-release approval.
 
 * **Base:** `main` @ `6ee9c11` (Track A merge) plus the docs-only re-audit commit `14c1438` (incorporated as the first
@@ -22,9 +22,9 @@ for the gate finding). Tests marked *verification* were written after the fix an
 | F10 | `e4a05ff` | `6bd68b1`; verification `400e6c7` |
 | F11 | `148561c` | `f1f485a` |
 | D6 | `8136041` | `1b07ab7` |
-| D2 + D7 | verification checks of existing behaviour (CI docker job) | `3aa217c` |
-| Gate finding (§8) | test and fix in one commit; red evidence below | `a7b083e` |
-| Evidence docs | — | this commit |
+| D2 + D7 | verification checks of existing behaviour (CI docker job) | `3aa217c`; D2 fixture corrections `8dd680a`, `a5a4093` (§6) |
+| Gate finding (§8) | test and fix in one commit; red evidence below | `a7b083e`; test correction `419351d` |
+| Evidence docs | — | `106212a` (draft), this commit (final) |
 
 ---
 
@@ -204,6 +204,18 @@ Expected results:
 * `backup recover` reports `"state": "rolled-back"`.
 * The app then starts and serves both the snapshot project and the newer one.
 
+**First CI runs failed, and the cause was in the test fixture, not the product.**
+* Runs 39, 41, 42 and 43 failed with "restore finished without being killed (the fixture did not trigger)", exit 3.
+* My first explanation (only one store entry, so the second aside rename never happened) was **wrong**. The same
+  fixture fired locally against a data directory with two entries.
+* `8dd680a` made the fixture log every rename. Run 43 then showed the hook matching
+  `/data/projects -> /data/projects.pre-restore-…` and issuing the SIGKILL, yet the process carried on.
+* **Root cause:** with `--entrypoint node`, Node was the container's PID 1. The kernel ignores signals that a
+  PID-namespace init process sends itself without a handler, SIGKILL included. Locally Node is never PID 1.
+* `a5a4093` runs the fixture under the image's tini, as the app runs. Run 44 then passed every assertion (§10).
+* `8dd680a` also kills right after the *first* aside rename, so the check works for any number of store entries. It
+  makes the D7 step run even if D2 fails, so one check cannot hide the other's evidence.
+
 ## 7. D7: stopping Node also stops its ffmpeg renders (verification)
 `scripts/ci/docker-ffmpeg-termination.sh` uses the production image: tini is PID 1 and Node is its child. It starts a
 real 1080p, 60 s render and reads the host PIDs of tini, Node and ffmpeg through `docker top`.
@@ -218,7 +230,9 @@ Both cases must leave **no** tini, Node or ffmpeg host PID alive. This is checke
 `NODE_ENV=test` is used only so that a throwaway Firebase test key is accepted: renders need a signed-in user.
 
 **Local limitation (D2 and D7).** The image cannot be built in this environment, because the proxy blocks the Debian
-mirror (CONNECT 403). Both checks have run only in CI; see §10.
+mirror (CONNECT 403). Both checks ran only in CI (§10). The D2 flow was also run locally without Docker (same scripts,
+same environment, a scratch copy of the fixture): exit 137, journal present, refusal with exit 1, `rolled-back`, both
+projects served. D7 has no local equivalent.
 
 ## 8. Gate finding: guest-mint refusal stats were recorded after the answer (merged Track A code)
 **Found by** the D-1 full PostgreSQL gate on `3aa217c`. The failing test was Track A `A-decisions` "shared-network
@@ -246,13 +260,62 @@ later; it is still refused, and limit enforcement does not depend on the stat.
 ---
 
 ## 9. Local gate (final head)
-_Pending: the local gate on the final head is running; results will replace this line._
+Run on `419351d`. The later commits (`8dd680a`, `106212a`, `a5a4093` and this one) change only `scripts/ci/`,
+`.github/workflows/ci.yml` and `docs/` (`git diff --stat 419351d a5a4093`), so no application or test code changed after
+the gate. Local PostgreSQL 16; logs are in the session scratchpad.
+
+| Check | JSON | PostgreSQL |
+|---|---|---|
+| `tests/track_d1.test.ts`, run 1 | 18/18 | 18/18 |
+| `tests/track_d1.test.ts`, run 2 | 18/18 | 18/18 |
+| `tests/track_d1.test.ts`, run 3 | 18/18 | 18/18 |
+| Full suite (272 tests) | 270 pass, **0 fail**, 0 cancelled, 2 skipped | 263 pass, **0 fail**, 0 cancelled, 9 skipped |
+| Build (`tsc` ×2, `vite build`) | passes | passes |
+| Browser E2E | 2/2 | 2/2 |
+
+**Earlier gate on `3aa217c`, failures reported, not retried silently:**
+* JSON full suite, 1 failure: Track C "60 slow 450 KB uploads + 20 oversized…", 2 of 20 oversized uploads got
+  `write EPIPE` instead of 413. This is the known intermittent test-helper issue, D8, scheduled for D-2. It did not
+  recur on `419351d`. That does **not** mean it is fixed.
+* PostgreSQL full suite, 1 failure: Track A `A-decisions`. Root-caused and fixed (§8).
 
 ## 10. CI
-_Pending: CI on the final head (run 39 on 3aa217c failed in the D2 step; see the PR)._
+**Run 44 on `a5a4093`: green. Every job's log was read.**
+
+| Job / step | Result (from the log) |
+|---|---|
+| `test`: checkout, install, typecheck | step conclusions `success`. The fetched log is capped at 5 000 lines and starts during the JSON suite, so these steps are evidenced by status only. |
+| `test`: JSON suite | 272 tests, 270 pass, **0 fail**, 0 cancelled, 2 skipped |
+| `test`: every server on PostgreSQL | 272 tests, 263 pass, **0 fail**, 0 cancelled, 9 skipped |
+| `test`: D-1 tests (F8, F9, F10, F11, D6, gate finding) | 11 suites `ok` in each suite run |
+| `test`: build; E2E | build passes; E2E JSON 2/2, PostgreSQL 2/2 |
+| `test`: `bun audit --audit-level=high` | "No vulnerabilities found (checked 389 packages, 2 below --audit-level=high, 1 ignored)" |
+| `test`: E2E step's throwaway Playwright install | npm still prints "5 vulnerabilities (1 moderate, 4 high)". Track A risk 13; D-2 (D9). |
+| `docker` (complete log, 2 305 lines, 0 `##[error]`) | migrations `0001`–`0005` applied (`"version":5`); two-instance PostgreSQL and JSON smoke tests pass; production refuses without TRUST_PROXY, without DATABASE_URL and without TURNSTILE_SECRET (exit 1 each) |
+| `docker`: D2 | restore exit 137; `.restore-in-progress.json` and `projects.pre-restore-…` present; app exit 1 with "Refusing to start: an interrupted restore … phase swapping"; "volume unchanged by the refused start (11 files, sha256 identical)"; recover `"state": "rolled-back"`; "D2 PASSED" |
+| `docker`: D7 | normal: tini, Node and ffmpeg host PIDs read, container exit 0, "ff-normal PASSED … no orphan"; forced (SIGKILL to Node only): container exit 137, "ff-forced PASSED … no orphan"; "D7 PASSED" |
+| `docker`: backup image | `pg_dump`/`pg_restore`/`psql` 17.11, age 1.1.1, Node v22.23.4 |
+| `live-llm` | skipped on pull requests: **0 live tests**. Not live validation. |
+
+**Earlier failed runs on this PR (all root-caused):**
+
+| Run | Head | Failure | Cause / fix |
+|---|---|---|---|
+| 39 | `3aa217c` | docker: D2 fixture did not fire | Node as PID 1 (§6); fixed in `a5a4093` |
+| 40 | `a7b083e` | test: gate-finding test in the JSON suite (`client password must be a string`) | test needed its own database; `419351d` |
+| 41, 42, 43 | `419351d`, `8dd680a`, `106212a` | docker: D2 fixture did not fire | same as run 39; run 43 is where the rename log confirmed the cause and D7 first passed |
+
+`test` in run 39 (`3aa217c`) was green, including the Track A test that failed locally. It is intermittent, which is why
+it needed a deterministic reproduction (§8).
 
 ## 11. Skipped tests (with reasons)
-_Pending: filled from the final gate and CI logs._
+The same skips appear locally and in CI run 44. No D-1 test is skipped.
+
+| Skipped test(s) | Backend | Reason |
+|---|---|---|
+| 2 live Gemini tests (`LIVE: generate-script…`, `LIVE: generate-clips…`) | both | `GEMINI_API_KEY` not set; reported as "NOT passed". Track E. |
+| 7 JSON-specific tests (corrupt shards, volume snapshot restore, legacy store migration, scheduled snapshot, async route failures on a corrupt store) | PostgreSQL | JSON-backend specific; PostgreSQL equivalents are in `tests/phase2.test.ts` |
+| `live-llm` CI job | — | does not run on pull requests |
 
 ## 12. Accepted risks (owner decisions) vs. unresolved defects
 **Accepted risks (owner decisions):**
@@ -265,4 +328,7 @@ _Pending: filled from the final gate and CI logs._
 * The gate finding: a refusal waits for its stat write (§8).
 
 **Unresolved defects:**
-_Pending: D2 first CI run failed (fixture did not fire; cause unconfirmed); re-run on 8dd680a in progress._
+None introduced by D-1. Still open and tracked for D-2 (not in D-1's scope):
+* D8: intermittent `write EPIPE` in the Track C upload test (seen on `3aa217c`, not on `419351d`).
+* D9: the Playwright throwaway install reports 5 vulnerabilities (1 moderate, 4 high).
+* The CI database connection headroom from Track A is unchanged, and not re-measured in D-1.
