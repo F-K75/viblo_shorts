@@ -406,3 +406,46 @@ describe('A-verify: added after the implementation (not red-first)', () => {
     }
   });
 });
+
+// ---------------------------------------------------------------- owner decisions of 2026-11-03 (red first for the new behaviour)
+describe('A-decisions: owner decisions of 2026-11-03', () => {
+  test('approved defaults: 3 per device per day, 20 per IP per hour, 100 per IPv4 /24 and IPv6 /48 per hour; hard ceiling off', async () => {
+    const v = await stub();
+    // empty values = the server's own defaults (the test helper otherwise sets generous budgets)
+    const s = await boot({ ...captchaEnv(v.url), GUEST_MINT_PER_DEVICE_PER_DAY: '', GUEST_MINT_PER_IP_PER_HOUR: '', GUEST_MINT_PER_SUBNET_PER_HOUR: '' });
+    const g = (await healthDetails(s.baseUrl)).guestMints;
+    assert.deepEqual(g.budgets, { perDevicePerDay: 3, perIpPerHour: 20, perSubnetPerHour: 100 });
+    assert.equal(g.hardCeilingPerHour, null);
+  });
+
+  test('shared-network refusals of verified requests are recorded apart from abuse signals (CAPTCHA failures), with a 30-day series', async () => {
+    const v = await stub();
+    const s = await boot({ ...captchaEnv(v.url), GUEST_MINT_PER_IP_PER_HOUR: '1', GUEST_MINT_PER_SUBNET_PER_HOUR: '2' });
+    assert.equal((await mint(s, { ip: '198.51.100.1' })).status, 200);
+    assert.equal((await mint(s, { ip: '198.51.100.1' })).scope, 'ip'); // verified, refused by the IP limit
+    assert.equal((await mint(s, { ip: '198.51.100.2' })).status, 200);
+    assert.equal((await mint(s, { ip: '198.51.100.3' })).scope, 'subnet'); // verified, refused by the /24 limit
+    await mint(s, { token: tok('bad') }); // an abuse signal, not a shared-network refusal
+    const g = (await healthDetails(s.baseUrl)).guestMints;
+    assert.equal(g.rejected['guest_rate_limited:ip'], 1);
+    assert.equal(g.rejected['guest_rate_limited:subnet'], 1);
+    assert.equal(g.rejected.captcha_failed, 1);
+    assert.deepEqual(g.networkRefusals.thisHour, { ip: 1, subnet: 1 });
+    assert.equal(g.networkRefusals.series.at(-1).count, 2);
+    assert.ok(g.networkRefusals.series.length <= 720);
+  });
+
+  test('guest-mint diagnostics are not public: /api/health/details needs the diagnostics token or an admin; public endpoints do not carry them', async () => {
+    const v = await stub();
+    const s = await boot(captchaEnv(v.url));
+    const guest = await mint(s);
+    for (const auth of [undefined, `Bearer ${'x'.repeat(48)}`, `Bearer ${guest.token}`]) {
+      const r = await fetch(`${s.baseUrl}/api/health/details`, { headers: auth ? { authorization: auth } : {} });
+      assert.equal(r.status, 404, `details refused for ${auth ? auth.slice(0, 14) : 'no credential'}`);
+      assert.ok(!(await r.text()).includes('guestMints'));
+    }
+    for (const p of ['/api/health', '/api/live', '/api/ready', '/api/config']) {
+      assert.ok(!(await (await fetch(`${s.baseUrl}${p}`)).text()).includes('guestMints'), `${p} does not expose guest-mint metrics`);
+    }
+  });
+});
