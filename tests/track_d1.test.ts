@@ -516,3 +516,24 @@ describe('Gate finding (postgres): a guest-mint refusal is recorded before the r
     }
   });
 });
+
+// ---------------------------------------------------------------- D-1 review pass (owner decisions of 2026-11-09)
+// R1: F10 on the JSON backend. The ledger is written on a 1 s debounce (production setting). A crash right after the
+// model call started must not lose "started": otherwise recovery refunds a call that may have run (and cost money).
+describe('Review R1 (json): the model-call start is durable before the provider is called', () => {
+  test('a crash (no flush, no close) right after the start: recovery does not refund', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'd1-r1-'));
+    const r = new JsonRepo(dir, path.join(dir, 'backups'), limits, 1000); // production debounce
+    r.init();
+    const day = aiDay();
+    assert.deepEqual(await r.reserveAi(AI_KEYS('r1'), day, 'r1-res-0001'), { ok: true });
+    await new Promise((res) => setTimeout(res, 1300)); // the reservation itself reaches disk via the debounced flush
+    assert.equal(await (r as any).startAi('r1-res-0001'), true);
+    // crash: the process dies now. No close(), no flush; the debounce timer never fires in the dead process.
+    const recovered = new JsonRepo(dir, path.join(dir, 'backups'), limits, 1000);
+    recovered.init();
+    assert.equal(await recovered.expireAiReservations(0), 1, 'the open reservation is recovered and settled');
+    assert.equal(await recovered.peekAi('user:r1', day), 1, 'a call that started (may have cost money) is not refunded');
+    await recovered.close();
+  });
+});
