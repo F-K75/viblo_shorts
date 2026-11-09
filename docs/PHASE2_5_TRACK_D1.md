@@ -433,7 +433,7 @@ called.
 | 5 | HTTP 200, usage > 0, output unusable (unparseable or empty; the user gets the template) | yes | yes | billable | **charge** |
 | 6 | HTTP 200, usage reported as 0 | yes | yes | not billable | refund (unless another attempt charges) |
 | 7 | HTTP 200 without usage metadata | yes | yes, usage unknown | uncertain | **charge** |
-| 8 | HTTP 4xx/5xx error response (`ApiError` with a numeric status): 400, 401/403 (credentials), 429, 500, 503 | yes | provider answered with an error | not billable **(see note A)** | refund (unless another attempt charges) |
+| 8 | HTTP 4xx/5xx error response (`ApiError` with a numeric status): 400, 401/403 (credentials), 429, 500, 503 | yes | provider answered with an error; whether it bills is **not verified** | uncertain (**owner decision 2026-11-09**, `d19a521`) | **charge** (conservative) |
 | 9 | Timeout (our `AbortSignal.timeout`), network reset or other error without an HTTP status | yes | **unknown** | uncertain | **charge** |
 | 10 | Client disconnects while an attempt is in flight | yes | resolved by the attempt's own outcome | 4 to 9 | settlement **waits** for the attempt's outcome; no new attempt starts after the disconnect |
 | 11 | The process crashes while an attempt is in flight | yes | unknown | attempt left open | recovery (expiry) **charges**, never an automatic refund |
@@ -443,7 +443,7 @@ called.
 **Retries and failover:** each retry or failover model is its own attempt (rows 4 to 9), and the rule applies across all
 of them:
 * 500 then success: charged once.
-* 500 then 500: refunded.
+* 500 then 500: charged once (both attempts uncertain).
 * Timeout then success: charged once.
 * Timeout then 500: charged (the timeout was uncertain).
 
@@ -456,12 +456,27 @@ of them:
 * Tested: 8 parallel attempts racing 3 settlements, 20 rounds, both backends. Result: exactly one settlement, a charge of
   0 or 1, and always charged when any attempt was billable or uncertain.
 
-**Note A (needs the owner's decision):** row 8 assumes that a provider error response is not billed.
-* I could not confirm this against Google's documentation. This session's network blocks `ai.google.dev`, and the
-  Google Cloud pricing page returned no readable text.
-* **Conservative alternative:** classify 4xx/5xx as `uncertain` (charged). The change is one line in
-  `attemptResultOfError`, plus test expectations.
-* **Middle option:** 429 and 401/403 not billable (request rejected before processing); every other 4xx/5xx uncertain.
+**Row 8, owner decision (2026-11-09): conservative.**
+* Google's billing for error responses could not be verified: this session's network blocks `ai.google.dev`.
+* An unknown provider billing outcome must never become an automatic refund, so every provider error after invocation
+  is `uncertain` and charged.
+* This is our reservation-settlement policy. **It is not a claim that Gemini billed the request.**
+* Implemented in `d19a521`, red first in `16e52fb`.
+* **Accepted consequence:** during a provider outage, failed calls consume the user's daily AI quota. They still get
+  the template fallback.
+
+**Policy summary (owner's table):**
+
+| Situation | Settlement |
+|---|---|
+| Local validation fails before provider invocation | refund (rows 1–2) |
+| Durable attempt write fails | provider not invoked; refund (row 3) |
+| Provider returns success | charge according to confirmed usage (rows 4–6; usage reported as 0 → refund) |
+| Provider returns HTTP 4xx/5xx | charge, conservatively (row 8) |
+| Network timeout after invocation | charge (row 9) |
+| Provider response cannot be classified | charge (rows 7, 9, 13) |
+| Multiple attempts, at least one uncertain or billable | one charge (one unit per reservation) |
+| All attempts provably never started | refund |
 
 
 **Evidence:**
@@ -469,11 +484,13 @@ of them:
   * unusable output with usage → charged;
   * 0 usage → refunded;
   * no usage metadata → charged;
-  * 500 on every attempt → refunded;
+  * 500 on every attempt → charged once (`d19a521`; refunded before the owner's decision);
+  * HTTP 400 from the provider → charged (`d19a521`);
   * 500 then success → charged once, and on PostgreSQL `attempts_total=2, attempts_open=0, billable_attempts=1,
-    billable_tokens=30`;
+    uncertain_attempts=1, billable_tokens=30`;
   * timeouts → charged;
-  * a disconnect during an attempt that then returns 500 → refunded, with no provider call after the disconnect.
+  * a disconnect during an attempt that then returns 500 → charged (`d19a521`), with no provider call after the
+    disconnect.
 * **Repository level (both backends).** Lifecycle, idempotency, crash in flight → charged, crash after a failed attempt
   → refunded.
 * **PostgreSQL.** 40 rounds of begin racing settlement: an attempt that began is never refunded while open, and a
@@ -487,6 +504,9 @@ of them:
   * every attempt end is recorded, also after settlement.
 
   Mutations caught: open attempts ignored at settlement; settlement without the `status = 'reserved'` condition.
+* **Phase 1 quota test** (`tests/phase1.test.ts`), changed with the owner's decision (`16e52fb`): an invalid request
+  (no provider call) still costs nothing. Provider error responses now consume quota: 2 failed calls use a quota of 2,
+  and the third request gets 429.
 * **Earlier D-1 F10 tests** were migrated to the attempt API (`startAi` → `beginAiAttempt`, `'abort'` → `'usage'`). One
   assertion changed meaning: several attempts per reservation are now allowed and recorded.
 
