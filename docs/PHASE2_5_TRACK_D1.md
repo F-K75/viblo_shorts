@@ -600,15 +600,35 @@ schema migrations; the data migration's own rollback is in §2). Re-run after fi
 | 5xx or network errors | 0 | 0 |
 | Refusal stats recorded vs. refusals sent | equal | equal |
 
-**Residual risk (not removed by the fix):**
+**Longer sustained flood (5 min per phase, current code `779a5fa`, pool 10):**
+
+| 5 min phase | Healthy database | Slow stat writes (300 ms) |
+|---|---|---|
+| Legitimate signups | 44 422 sent, **all 200**; 148.1/s | 2 139 sent, **all 200**; 7.1/s |
+| Signup p50 / p95 / p99 / max | 32.6 / 48.4 / 60.9 / 163 ms | 690 / 908 / 933 / 1 201 ms |
+| No-token refusals | 298 209, all 403; 994/s; p50 / p95 / p99 14 / 23 / 30 ms | 8 032, all 403; 26.8/s; p50 / p95 / p99 569 / 714 / 834 ms |
+| IP-limited refusals | 22 780, all 429; p99 59 ms | 919, all 429; p99 1 217 ms |
+| Pool waiting p50 / p95 / p99 / max | 12 / 16 / 17 / 17 | 16 / 18 / 19 / 19 |
+| Connection acquire p50 / p95 / p99 / max | 4 / 7 / 15 / 19 ms | 141 / 263 / 290 / 385 ms |
+| 5xx or network errors | 0 | 0 |
+| Refusal stats recorded | 306 241 captcha_required and 23 699 ip, exactly the refusals sent (both phases) | |
+
+Over 5 minutes the numbers match the 60 s runs. Nothing degrades over time: the pool queue stays bounded, latency does
+not grow, and no request fails.
+
+**Owner decision (2026-11-09): accepted temporarily.**
+* Keep the implementation and the pool size of 10.
+* No separate pool and no in-memory batching in D-1, because refusal accounting must stay durable.
+* Revisit isolation (a dedicated bounded queue, or a separate pool with its benefit measured) in a later workstream.
+
+**Residual risk (not removed by the fix; accepted temporarily):**
 * Refusals and legitimate signups share one pool of 10. Under a refusal flood while the database is slow, the pool is
   saturated (10 connections, 15–20 waiting) and legitimate signups take 0.7–1 s at p50–p99.
 * That is 3.6× faster than before the fix, at 3× the throughput, with no errors, but it is not isolated.
-* **Options, not implemented, for the owner to decide:**
-  * a separate small pool or a bounded queue for stat writes;
-  * sampling or aggregating refusal stats in memory.
+* **Not implemented, per the owner's decision:** a separate pool or bounded queue (a later workstream), and in-memory
+  batching (rejected: refusal accounting must stay durable).
 
-### 13.8 CI finding: F1 write-storm precondition (`6db5dbd`)
+### 13.8 CI finding: F1 write-storm precondition (`6db5dbd`, `7f345e2`, `7e09960`)
 **What failed.** CI run `42614874907` on `fa88a9e` (`test` job, JSON-suite step: 281 tests, 278 pass, 1 fail) failed
 only the **precondition** of the F1 test: "the writer really ran during the backup (2 writes)", where more than 20 were
 expected. The backup and restore assertions never failed.
@@ -620,9 +640,18 @@ expected. The backup and restore assertions never failed.
 **Cause.** The CI writer was about 100× slower, likely from disk contention with the parallel test files. That is not
 confirmed from the log.
 
-**Fix.** The old precondition could also pass with no write overlapping the backup. It now waits for 20 committed
-writes (up to 15 s), then requires at least 1 write committed **during** `createBackup`. The restore assertions are
-unchanged. The file passed 3 of 3 runs.
+**Fix, in three steps.** The restore assertions (verified, row counts) were never changed.
+1. **`6db5dbd`.** The old precondition ("more than 20 writes in total") could pass with **no** write overlapping the
+   backup. The test now waits for 20 committed writes (up to 15 s), then requires writes committed **during**
+   `createBackup`. These conditions imply the old one, so nothing was weakened.
+2. **`7f345e2` (owner review).** The counter increments after a write's commit returned, so one counted write may have
+   committed just before the backup. The test now requires **at least 2** writes counted during the backup, which
+   guarantees one that committed entirely inside it.
+3. **`7e09960`.** CI on `e4eb1e0` then showed the real problem: "writes committed while the backup ran (0; 29 in
+   total)". The seed is tiny, so the backup takes milliseconds, less than one CI write. The original check would have
+   passed this run without any overlap. About 25 MB of incompressible padding was added in a non-application table
+   (outside `BACKUP_TABLES`, so verification is unaffected). `pg_dump` plus `age` now take long enough on any machine.
+   Locally: 1 778–2 181 writes during the backup, and 3 of 3 runs of the file pass (17/17).
 
 ### 13.9 Local gate
 | Check | Result |
@@ -645,9 +674,10 @@ _Pending: CI run 51 on `fa9b618` (code head) and the run on the final docs head;
 * **Accepted (owner):**
   * an uncertain attempt is charged;
   * a crash with an attempt in flight is charged.
-* **Needs the owner's decision:**
-  1. F10 row 8: whether HTTP 4xx/5xx is not billable (unverified against Google's documentation).
-  2. Track A: the shared pool under refusal floods (§13.7).
+* **Decided by the owner (2026-11-09):**
+  1. F10 row 8: provider HTTP 4xx/5xx is charged conservatively (`d19a521`). This is our policy, not proof of provider
+     billing. Accepted consequence: provider outages consume users' daily AI quota.
+  2. Track A shared pool: accepted temporarily (§13.7). Isolation is deferred to a later workstream; no batching.
 * **Residual:**
   * F9: live writes wait during `migrate`; the runbook freeze prevents this.
   * F11: `PGSSLROOTCERT=system` needs libpq 16 or later.
