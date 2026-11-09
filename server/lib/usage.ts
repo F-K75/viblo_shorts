@@ -2,10 +2,11 @@
 // PostgreSQL backend (R-02):
 //  * reserve(entries, id) is a synchronous all-or-nothing check-and-increment, so concurrent requests in this
 //    process cannot exceed a limit (no await between check and increment). Idempotent per id.
-//  * settle(id, 'commit' | 'refund' | 'abort') happens exactly once; a repeated settle is a no-op (no double refund).
-//  * start(id) records the model call starting (F10): an abort refunds only a reservation that never started.
-//  * open reservations are persisted, and expire() settles those never settled (crash, failed settle): refunded if
-//    the model call never started, committed if it did (uncertain = charged).
+//  * settle(id, 'usage' | 'commit' | 'refund') happens exactly once; a repeated settle is a no-op (no double refund).
+//  * beginAttempt(id) / endAttempt(id, result) record every provider attempt (review R2); beginAttempt is written to
+//    disk synchronously before the provider is called (review R1). 'usage' charges iff an attempt was billable,
+//    uncertain or is still open (or the reservation was started by the previous release); otherwise it refunds.
+//  * open reservations are persisted, and expire() settles those never settled (crash, failed settle) by usage.
 // Counts and open reservations are flushed to usage.json (debounced, and on shutdown) and reloaded at boot.
 // A corrupt usage.json is never overwritten: the ledger fails closed (AI endpoints answer 503).
 import { readJsonFile, writeJsonFileAtomic, StoreUnavailableError } from './storage.ts';
@@ -14,8 +15,10 @@ interface OpenReservation {
   keys: string[];
   day: number;
   at: number;
-  /** F10: when the model call started (persisted, so crash recovery knows the call may have run). */
+  /** F10: when the first provider attempt began (persisted, so crash recovery knows a call may have run). */
   started?: number;
+  /** Review R2: provider attempts (absent on reservations written by the previous release). */
+  attempts?: { total: number; open: number; billable: number; uncertain: number; tokens: number };
 }
 interface UsageFile {
   v: 1 | 2;
@@ -89,38 +92,61 @@ export class UsageLedger {
     return { ok: true };
   }
 
-  /** F10: atomic transition into "model call started"; only once, only while open. */
-  start(id: string): boolean {
+  /**
+   * Review R1/R2: records that a provider attempt begins, only while the reservation is open. Written to disk NOW,
+   * before the caller invokes the provider: with the debounced flush a crash in the next second lost the start and
+   * recovery refunded a call that may have run. If the write fails, the attempt is undone and refused (no provider
+   * call without a durable record).
+   */
+  beginAttempt(id: string): boolean {
     this.assertAvailable();
     const r = this.open.get(id);
-    if (!r || r.started) return false;
-    r.started = Date.now();
-    // Review R1: written to disk NOW, before the caller invokes the provider. With the debounced flush a crash in
-    // the next second lost "started" and recovery refunded a call that may have run. If the write fails, the start
-    // is undone and refused, so the model is not called without a durable record.
+    if (!r) return false;
+    const prev = { started: r.started, attempts: r.attempts ? { ...r.attempts } : undefined };
+    r.started ??= Date.now();
+    const a = (r.attempts ??= { total: 0, open: 0, billable: 0, uncertain: 0, tokens: 0 });
+    a.total++;
+    a.open++;
     this.dirty = true;
     try {
       this.writeNow();
     } catch (err: any) {
-      delete r.started;
-      console.error(JSON.stringify({ level: 'error', event: 'usage_start_not_persisted', error: String(err?.message || err) }));
+      if (prev.started === undefined) delete r.started;
+      if (prev.attempts) r.attempts = prev.attempts;
+      else delete r.attempts;
+      console.error(JSON.stringify({ level: 'error', event: 'usage_attempt_not_persisted', error: String(err?.message || err) }));
       return false;
     }
     return true;
   }
 
+  /** Review R2: the outcome of an attempt. Accounting only; a settled reservation is already decided (no-op). */
+  endAttempt(id: string, result: { billable: 'yes' | 'no' | 'uncertain'; tokens: number }) {
+    const a = this.open.get(id)?.attempts;
+    if (!a) return;
+    a.open = Math.max(0, a.open - 1);
+    if (result.billable === 'yes') {
+      a.billable++;
+      a.tokens += Math.max(0, Math.floor(result.tokens) || 0);
+    } else if (result.billable === 'uncertain') a.uncertain++;
+    this.markDirty();
+  }
+
   /**
-   * Settles a reservation exactly once. Unknown or already-settled ids are a no-op. 'abort' refunds only a reservation
-   * whose model call never started (F10).
+   * Settles a reservation exactly once. Unknown or already-settled ids are a no-op. 'usage' (review R2): charged iff an
+   * attempt was billable, uncertain or is still open, or the reservation was started without attempt records (the
+   * previous release); otherwise refunded.
    */
-  settle(id: string, outcome: 'commit' | 'refund' | 'abort'): 'settled' | 'already_settled' {
+  settle(id: string, outcome: 'commit' | 'refund' | 'usage'): 'settled' | 'already_settled' {
     this.assertAvailable();
     const r = this.open.get(id);
     if (!r) return 'already_settled';
     this.open.delete(id);
     this.settled.add(id);
     if (this.settled.size > 50000) this.settled.clear(); // bounded; ids are random, re-use is not expected
-    const refund = outcome === 'refund' || (outcome === 'abort' && !r.started);
+    const a = r.attempts;
+    const chargedByUsage = a ? a.billable > 0 || a.uncertain > 0 || a.open > 0 : r.started !== undefined;
+    const refund = outcome === 'refund' || (outcome === 'usage' && !chargedByUsage);
     if (refund && r.day === utcDay()) {
       // a reservation from a previous day was never counted in today's totals
       for (const k of r.keys) {
@@ -133,14 +159,14 @@ export class UsageLedger {
     return 'settled';
   }
 
-  /** Settles reservations left open longer than ttlMs as an abort: refunded if never started, else committed (F10). */
+  /** Settles reservations left open longer than ttlMs by usage (review R2). */
   expire(ttlMs: number): number {
     if (this.unavailableReason) return 0;
     const cutoff = Date.now() - ttlMs;
     let n = 0;
     for (const [id, r] of [...this.open]) {
       if (r.at < cutoff) {
-        this.settle(id, 'abort');
+        this.settle(id, 'usage');
         n++;
       }
     }

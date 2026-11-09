@@ -208,7 +208,8 @@ describe('F9 (postgres): the data-migration counter rebuild', { skip: pgSkip }, 
 });
 
 // ---------------------------------------------------------------- D4c / F10: AI reservation lifecycle
-// Owner decision: refund only if the model call provably has not started; charge once it started or when uncertain.
+// Owner decision 2026-11-03, refined by review R2 (2026-11-09): settlement by actual provider usage. Here an attempt
+// that began and has no recorded outcome is still open, which is charged (unknown outcome).
 const AI_KEYS = (u: string) => [{ key: `user:${u}`, limit: 10 }];
 const aiDay = () => Math.floor(Date.now() / 86400000);
 for (const kind of ['json', 'postgres'] as const) {
@@ -219,20 +220,20 @@ for (const kind of ['json', 'postgres'] as const) {
       const ai = r as any;
       // not started + client abort -> refunded
       assert.deepEqual(await r.reserveAi(AI_KEYS('f10'), day, 'f10-res-0001'), { ok: true });
-      assert.equal(await ai.settleAi('f10-res-0001', 'abort'), 'settled');
+      assert.equal(await ai.settleAi('f10-res-0001', 'usage'), 'settled');
       assert.equal(await r.peekAi('user:f10', day), 0, 'never started: released');
-      assert.equal(await ai.startAi('f10-res-0001'), false, 'a settled reservation can never start a model call');
+      assert.equal(await ai.beginAiAttempt('f10-res-0001'), false, 'a settled reservation can never start a model call');
       // started + client abort -> committed (charged)
       await r.reserveAi(AI_KEYS('f10'), day, 'f10-res-0002');
-      assert.equal(await ai.startAi('f10-res-0002'), true, 'atomic transition into model-call-started');
-      assert.equal(await ai.startAi('f10-res-0002'), false, 'the transition happens once');
-      assert.equal(await ai.settleAi('f10-res-0002', 'abort'), 'settled');
+      assert.equal(await ai.beginAiAttempt('f10-res-0002'), true, 'atomic transition into model-call-started');
+      assert.equal(await ai.beginAiAttempt('f10-res-0002'), true, 'review R2: every provider attempt is recorded (retry / failover)');
+      assert.equal(await ai.settleAi('f10-res-0002', 'usage'), 'settled');
       assert.equal(await r.peekAi('user:f10', day), 1, 'started: the charge is kept');
       assert.equal(await ai.settleAi('f10-res-0002', 'refund'), 'already_settled', 'exactly one final outcome');
       assert.equal(await r.peekAi('user:f10', day), 1);
-      // a known failure after the start is still refunded (billing model unchanged for complete responses)
+      // an explicit refund (repository callers only; the request path settles by usage) still refunds
       await r.reserveAi(AI_KEYS('f10'), day, 'f10-res-0003');
-      assert.equal(await ai.startAi('f10-res-0003'), true);
+      assert.equal(await ai.beginAiAttempt('f10-res-0003'), true);
       assert.equal(await ai.settleAi('f10-res-0003', 'refund'), 'settled');
       assert.equal(await r.peekAi('user:f10', day), 1);
     });
@@ -243,7 +244,7 @@ for (const kind of ['json', 'postgres'] as const) {
       const ai = r as any;
       await r.reserveAi(AI_KEYS('f10c'), day, 'f10-crash-not-started');
       await r.reserveAi(AI_KEYS('f10c'), day, 'f10-crash-started');
-      assert.equal(await ai.startAi('f10-crash-started'), true);
+      assert.equal(await ai.beginAiAttempt('f10-crash-started'), true);
       let recovered: any = r;
       if (kind === 'json') {
         // the process "crashes": a new repo over the same files (open reservations are persisted)
@@ -268,7 +269,7 @@ describe('F10 (postgres): concurrent start, abort and completion', { skip: pgSki
     for (let i = 0; i < 40; i++) {
       const id = `f10-race-${String(i).padStart(4, '0')}`;
       await r.reserveAi([{ key: 'user:f10r', limit: 1000 }], day, id);
-      const [started, a1, a2, c] = await Promise.all([ai.startAi(id), ai.settleAi(id, 'abort'), ai.settleAi(id, 'abort'), i % 2 ? ai.settleAi(id, 'commit') : ai.settleAi(id, 'abort')]);
+      const [started, a1, a2, c] = await Promise.all([ai.beginAiAttempt(id), ai.settleAi(id, 'usage'), ai.settleAi(id, 'usage'), i % 2 ? ai.settleAi(id, 'commit') : ai.settleAi(id, 'usage')]);
       const settled = [a1, a2, c].filter((x) => x === 'settled').length;
       assert.equal(settled, 1, `round ${i}: exactly one settlement (${[a1, a2, c]})`);
       const row = (await db!.pool.query('SELECT status, started_at FROM ai_reservations WHERE id = $1', [id])).rows[0];
@@ -528,7 +529,7 @@ describe('Review R1 (json): the model-call start is durable before the provider 
     const day = aiDay();
     assert.deepEqual(await r.reserveAi(AI_KEYS('r1'), day, 'r1-res-0001'), { ok: true });
     await new Promise((res) => setTimeout(res, 1300)); // the reservation itself reaches disk via the debounced flush
-    assert.equal(await (r as any).startAi('r1-res-0001'), true);
+    assert.equal(await (r as any).beginAiAttempt('r1-res-0001'), true);
     // crash: the process dies now. No close(), no flush; the debounce timer never fires in the dead process.
     const recovered = new JsonRepo(dir, path.join(dir, 'backups'), limits, 1000);
     recovered.init();

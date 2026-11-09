@@ -41,12 +41,22 @@ export interface ServerJob {
 }
 
 /**
- * How a request ended (F10, owner decision 2026-11-03):
- *  * commit: real model output, charge it;
- *  * refund: the request completed without a charged result (fallback, validation, provider failure);
- *  * abort:  the client disconnected: refund only if the model call never started, otherwise charge (it may have run).
+ * How a reservation is settled (review R2, owner decision 2026-11-09):
+ *  * usage:  what the server always uses. Charged iff an attempt was billable, uncertain or is still open (or the row
+ *            was started by the previous release); otherwise refunded. A recorded start alone does not decide it.
+ *  * commit / refund: explicit outcomes for repository callers and maintenance; the request path does not use them.
  */
-export type AiSettlement = 'commit' | 'refund' | 'abort';
+export type AiSettlement = 'commit' | 'refund' | 'usage';
+/**
+ * Outcome of one provider attempt: 'yes' = the provider reported usage > 0 (billable even if the output was unusable);
+ * 'no' = the provider answered with an error, or reported 0 usage; 'uncertain' = unknown (timeout, network error, no
+ * usage metadata), charged.
+ */
+export interface AiAttemptResult {
+  billable: 'yes' | 'no' | 'uncertain';
+  /** Provider-reported total tokens of this attempt (0 when unknown or not billable). */
+  tokens: number;
+}
 
 export interface QuotaEntry {
   key: string;
@@ -132,18 +142,21 @@ export interface Repo {
    */
   reserveAi(entries: QuotaEntry[], day: number, reservationId: string): Promise<{ ok: true } | { ok: false; key: string }>;
   /**
-   * Settles a reservation exactly once: 'commit' keeps the charge, 'refund' returns it. Settling an already
-   * settled (or unknown) reservation is a no-op, so retries can never double-refund.
+   * Settles a reservation exactly once ('usage', or explicit 'commit' / 'refund'; see AiSettlement). Settling an
+   * already settled (or unknown) reservation is a no-op, so retries can never double-refund.
    */
   settleAi(reservationId: string, outcome: AiSettlement): Promise<'settled' | 'already_settled'>;
   /**
-   * Atomic transition into "model call started", allowed once and only while the reservation is open. False means
-   * the call must NOT be made (already settled, e.g. refunded after a client abort, or already started).
+   * Durably records that a provider attempt begins (review R1/R2), BEFORE the provider is called. Only while the
+   * reservation is open; false means the attempt must NOT be made (already settled).
    */
-  startAi(reservationId: string): Promise<boolean>;
+  beginAiAttempt(reservationId: string): Promise<boolean>;
+  /** Records the outcome of an attempt begun with beginAiAttempt. Accounting only; never changes a settled charge. */
+  endAiAttempt(reservationId: string, result: AiAttemptResult): Promise<void>;
   /**
-   * Settles reservations left open longer than ttlMs (crashed request, failed settle) as an abort: refunded if the
-   * model call never started, committed if it started (uncertain = charged). Returns how many were settled.
+   * Settles reservations left open longer than ttlMs (crashed request, failed settle) by usage: an attempt still open
+   * at the crash, or one with an unknown outcome, is charged; no attempt or only non-billable ones are refunded.
+   * Returns how many were settled.
    */
   expireAiReservations(ttlMs: number): Promise<number>;
   peekAi(key: string, day: number): Promise<number>;

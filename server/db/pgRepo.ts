@@ -5,7 +5,7 @@
 //  * rate limits: token buckets computed with the database clock (consistent across instances)
 //  * jobs: FOR UPDATE SKIP LOCKED claim, worker heartbeats, reaper for dead workers
 import { StoreLimitError, type StoreLimits } from '../lib/projectStore.ts';
-import { ProjectNotFoundError, ProjectOwnershipError, userKindOf, type SaveProjectOptions, type AdmissionContext, type AiSettlement, type HeartbeatResult, type JobAdmission, type JobDenial, type QuotaEntry, type ReapResult, type Repo, type WindowEntry, STATS_RETENTION_WINDOWS, type ServerJob, type StoredSubscription } from '../lib/repo.ts';
+import { ProjectNotFoundError, ProjectOwnershipError, userKindOf, type SaveProjectOptions, type AdmissionContext, type AiSettlement, type AiAttemptResult, type HeartbeatResult, type JobAdmission, type JobDenial, type QuotaEntry, type ReapResult, type Repo, type WindowEntry, STATS_RETENTION_WINDOWS, type ServerJob, type StoredSubscription } from '../lib/repo.ts';
 import { LOCKS, withTx, type Db, type Tx } from './pool.ts';
 
 /** Advisory-lock class for per-project-id locks (two-key form; distinct from the single-key LOCKS in pool.ts). */
@@ -213,12 +213,15 @@ export class PostgresRepo implements Repo {
   async settleAi(reservationId: string, outcome: AiSettlement): Promise<'settled' | 'already_settled'> {
     return withTx(this.db, async (tx) => {
       // Conditional transition: only an open reservation can be settled, so a duplicate/retried settle is a no-op and
-      // there is exactly one final outcome. 'abort' decides on the row itself (started_at), in the same statement, so
-      // it cannot race the start transition.
+      // there is exactly one final outcome. 'usage' (review R2) decides on the row itself, in the same statement, so it
+      // cannot race an attempt beginning or ending: charged iff an attempt was billable or uncertain, an attempt is
+      // still open (outcome unknown), or the row was started by the previous release (started_at, no attempt records).
       const r = await tx.query(
         `UPDATE ai_reservations SET settled_at = now(),
            status = CASE WHEN $2 = 'commit' THEN 'committed' WHEN $2 = 'refund' THEN 'refunded'
-                         WHEN started_at IS NULL THEN 'refunded' ELSE 'committed' END
+                         WHEN billable_attempts > 0 OR uncertain_attempts > 0 OR attempts_open > 0
+                              OR (started_at IS NOT NULL AND attempts_total = 0) THEN 'committed'
+                         ELSE 'refunded' END
          WHERE id = $1 AND status = 'reserved' RETURNING day, keys, status`,
         [reservationId, outcome],
       );
@@ -233,26 +236,38 @@ export class PostgresRepo implements Repo {
     });
   }
 
-  async startAi(reservationId: string) {
+  async beginAiAttempt(reservationId: string) {
+    // Committed (autocommit) before the caller invokes the provider: a crash from here on finds an open attempt.
     const r = await this.db.query(
-      "UPDATE ai_reservations SET started_at = now() WHERE id = $1 AND status = 'reserved' AND started_at IS NULL RETURNING 1",
+      `UPDATE ai_reservations SET started_at = coalesce(started_at, now()), attempts_total = attempts_total + 1, attempts_open = attempts_open + 1
+       WHERE id = $1 AND status = 'reserved' RETURNING 1`,
       [reservationId],
     );
     return (r.rowCount ?? 0) > 0;
   }
 
+  async endAiAttempt(reservationId: string, result: AiAttemptResult) {
+    // Accounting only (also after settlement, so the audit columns stay complete); the charge was decided at settlement.
+    await this.db.query(
+      `UPDATE ai_reservations SET attempts_open = GREATEST(0, attempts_open - 1),
+         billable_attempts = billable_attempts + $2, uncertain_attempts = uncertain_attempts + $3, billable_tokens = billable_tokens + $4
+       WHERE id = $1`,
+      [reservationId, result.billable === 'yes' ? 1 : 0, result.billable === 'uncertain' ? 1 : 0, result.billable === 'yes' ? Math.max(0, Math.floor(result.tokens) || 0) : 0],
+    );
+  }
+
   async expireAiReservations(ttlMs: number) {
-    // The SELECT runs in autocommit, so its row locks are released immediately (F10: the old comment claimed
-    // otherwise). Correctness does not depend on them: settleAi is a conditional open -> settled transition, so a
-    // reservation that its request settles concurrently is settled exactly once. Stale reservations are settled as an
-    // abort: refunded if the model call never started, committed if it did (uncertain = charged).
+    // The SELECT runs in autocommit, so its row locks are released immediately. Correctness does not depend on them:
+    // settleAi is a conditional open -> settled transition, so a reservation that its request settles concurrently is
+    // settled exactly once. Stale reservations are settled by usage (review R2): an attempt open at the crash or with
+    // an unknown outcome is charged; no attempt, or only non-billable ones, are refunded.
     const { rows } = await this.db.query(
       `SELECT id FROM ai_reservations WHERE status = 'reserved' AND created_at < now() - ($1::int * interval '1 millisecond')
        ORDER BY created_at LIMIT 500 FOR UPDATE SKIP LOCKED`,
       [Math.max(1, Math.floor(ttlMs))],
     );
     let n = 0;
-    for (const { id } of rows) if ((await this.settleAi(id, 'abort')) === 'settled') n++;
+    for (const { id } of rows) if ((await this.settleAi(id, 'usage')) === 'settled') n++;
     return n;
   }
 
