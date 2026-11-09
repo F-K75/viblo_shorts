@@ -5,7 +5,7 @@
 // CAPTCHA stub; nothing else is touched. Pool size: the production default (DATABASE_POOL_MAX=10).
 import crypto from 'node:crypto';
 import pg from 'pg';
-import { startTestServer } from '../../tests/helpers/server.ts';
+import { startTestServer, HEALTH_TOKEN } from '../../tests/helpers/server.ts';
 import { createTestDatabase } from '../../tests/helpers/pg.ts';
 import { startTurnstileStub } from '../../tests/helpers/turnstileStub.ts';
 
@@ -49,11 +49,28 @@ async function phase(name: string) {
       peakConn = Math.max(peakConn, n);
     } catch {}
   }, 200);
+  // The server's own pool, from /api/health/details: 'waiting' = requests queued for a connection; 'latencyMs' = a
+  // SELECT 1 through the same pool, i.e. the time to obtain a connection (plus a trivial query).
+  const poolWaiting: number[] = [];
+  const acquireMs: number[] = [];
+  const poolSampler = setInterval(async () => {
+    try {
+      const d: any = await (await fetch(`${s.baseUrl}/api/health/details`, { headers: { authorization: `Bearer ${HEALTH_TOKEN}` } })).json();
+      const st = d?.checks?.stores ?? d?.store ?? d;
+      const found = JSON.stringify(d).match(/"latencyMs":(\d+)[^}]*"pool":\{"total":(\d+),"idle":(\d+),"waiting":(\d+)\}/);
+      if (found) {
+        acquireMs.push(Number(found[1]));
+        poolWaiting.push(Number(found[4]));
+      }
+      void st;
+    } catch {}
+  }, 250);
   const refusers = Array.from({ length: 15 }, async () => { while (Date.now() < end) await post('refusal_no_token', {}, ip(), out); });
   const ipLimited = Array.from({ length: 5 }, async () => { while (Date.now() < end) { const a = ip(); await post('mint_before_ip_refusal', ok(), a, out); await post('refusal_ip_limited', ok(), a, out); } });
   const minters = Array.from({ length: 5 }, async () => { while (Date.now() < end) await post('successful_mint', ok(), ip(), out); });
   await Promise.all([...refusers, ...ipLimited, ...minters]);
   clearInterval(sampler);
+  clearInterval(poolSampler);
   const classes = [...new Set(out.map((x) => x.cls))].sort();
   for (const cls of classes) {
     const xs = out.filter((x) => x.cls === cls);
@@ -61,9 +78,11 @@ async function phase(name: string) {
     const pct = (p: number) => ms[Math.min(ms.length - 1, Math.floor(ms.length * p))].toFixed(1);
     const st: Record<string, number> = {};
     for (const x of xs) st[x.status] = (st[x.status] || 0) + 1;
-    console.log(`${label} ${name} ${cls.padEnd(24)} n=${String(xs.length).padStart(5)} p50=${pct(0.5)}ms p95=${pct(0.95)}ms p99=${pct(0.99)}ms max=${ms.at(-1)!.toFixed(1)}ms statuses=${JSON.stringify(st)}`);
+    console.log(`${label} ${name} ${cls.padEnd(24)} n=${String(xs.length).padStart(5)} rate=${(xs.length / (PHASE_MS / 1000)).toFixed(1)}/s p50=${pct(0.5)}ms p95=${pct(0.95)}ms p99=${pct(0.99)}ms max=${ms.at(-1)!.toFixed(1)}ms statuses=${JSON.stringify(st)}`);
   }
   console.log(`${label} ${name} total=${out.length} req/s=${(out.length / (PHASE_MS / 1000)).toFixed(0)} 5xx_or_network=${out.filter((x) => x.status >= 500 || x.status < 0).length} peak_app_db_connections=${peakConn}`);
+  const q = (xs: number[], p: number) => (xs.length ? [...xs].sort((a, b) => a - b)[Math.min(xs.length - 1, Math.floor(xs.length * p))] : NaN);
+  console.log(`${label} ${name} pool samples=${poolWaiting.length} waiting p50=${q(poolWaiting, 0.5)} p95=${q(poolWaiting, 0.95)} max=${Math.max(...poolWaiting)}; connection-acquire (SELECT 1 via the app pool) p50=${q(acquireMs, 0.5)}ms p95=${q(acquireMs, 0.95)}ms max=${Math.max(...acquireMs)}ms`);
 }
 try {
   await phase('healthy');
