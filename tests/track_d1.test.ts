@@ -537,3 +537,161 @@ describe('Review R1 (json): the model-call start is durable before the provider 
     await recovered.close();
   });
 });
+
+// R2: F10 billing follows actual provider usage (owner decision 2026-11-09). A recorded start alone no longer charges:
+//  * never started -> refund; a provider response with usage > 0 -> charge (also when its output is unusable);
+//  * a provider error response (HTTP 4xx/5xx) -> not billable; a response reporting 0 tokens -> not billable;
+//  * an attempt whose outcome is unknown (timeout, network error, crash, no usage metadata) -> charged (uncertain);
+//  * failover: every attempt is tracked; the reservation's single unit is charged if any attempt was billable or uncertain.
+describe('Review R2 (server): settlement by actual provider usage', () => {
+  test('each provider outcome settles by its usage; failover is tracked per attempt; a disconnect waits for the attempt', async () => {
+    const { startTestServer } = await import('./helpers/server.ts');
+    const { startGeminiStub } = await import('./helpers/geminiStub.ts');
+    const stub = await startGeminiStub();
+    const s = await startTestServer({ GEMINI_API_KEY: 'stub-key-0123456789', GEMINI_BASE_URL: stub.baseUrl, GEMINI_MODELS: 'stub-model', LLM_TIMEOUT_MS: '600' });
+    const pgc = s.databaseUrl ? new (await import('pg')).default.Client({ connectionString: s.databaseUrl }) : null;
+    try {
+      if (pgc) await pgc.connect();
+      const u = s.signFirebaseToken({ sub: 'r2-http' });
+      const used = async () => (await (await fetch(`${s.baseUrl}/api/quota`, { headers: { authorization: `Bearer ${u}` } })).json()).dailyQuotaUsed;
+      const call = (signal?: AbortSignal) =>
+        fetch(`${s.baseUrl}/api/generate-script`, { method: 'POST', signal, headers: { authorization: `Bearer ${u}`, 'content-type': 'application/json' }, body: JSON.stringify({ topic: 'sleep habits' }) });
+      const settleWait = () => new Promise((r) => setTimeout(r, 300));
+      let n = await used();
+      const expectCharge = async (charged: boolean, why: string) => {
+        await settleWait();
+        n += charged ? 1 : 0;
+        assert.equal(await used(), n, why);
+      };
+      // a response with usage but unusable output: billable, charged (the user gets the template fallback)
+      stub.mode = 'garbage';
+      assert.equal((await call()).status, 200);
+      await expectCharge(true, 'provider returned usage (30 tokens): charged although the output was unusable');
+      // a response that reports zero usage: not billable, refunded
+      stub.mode = 'zero';
+      assert.equal((await call()).status, 200);
+      await expectCharge(false, 'provider reported 0 tokens: refunded');
+      // a response without usage metadata: uncertain, charged
+      stub.mode = 'nousage';
+      assert.equal((await call()).status, 200);
+      await expectCharge(true, 'no usage metadata: uncertain, charged');
+      // provider error responses on every attempt: not billable, refunded
+      stub.mode = 'fail';
+      assert.equal((await call()).status, 200);
+      await expectCharge(false, 'HTTP 500 on every attempt: refunded');
+      // failover: the first attempt fails (500), the retry succeeds: one unit, both attempts tracked
+      stub.mode = 'ok';
+      stub.queue = ['fail', 'ok'];
+      assert.equal((await call()).status, 200);
+      await expectCharge(true, 'retry succeeded: charged once');
+      if (pgc) {
+        const row = (await pgc.query("SELECT status, attempts_total, attempts_open, billable_attempts, uncertain_attempts, billable_tokens FROM ai_reservations WHERE status <> 'reserved' ORDER BY created_at DESC LIMIT 1")).rows[0];
+        assert.deepEqual(
+          { ...row, billable_tokens: Number(row.billable_tokens) },
+          { status: 'committed', attempts_total: 2, attempts_open: 0, billable_attempts: 1, uncertain_attempts: 0, billable_tokens: 30 },
+          'both attempts and the billable tokens are recorded',
+        );
+      }
+      // timeouts (the provider may have processed the request): uncertain, charged
+      stub.mode = 'ok';
+      stub.delayMs = 1000;
+      assert.equal((await call()).status, 200);
+      await expectCharge(true, 'attempts timed out: uncertain, charged');
+      // the client disconnects while an attempt is in flight; the provider then answers with an error.
+      // Settlement waits for the attempt's outcome: not billable, refunded; no further attempt after the disconnect.
+      await new Promise((r) => setTimeout(r, 1200)); // let the timed-out stub requests drain
+      stub.mode = 'fail';
+      stub.delayMs = 400;
+      const before = stub.calls;
+      const ac = new AbortController();
+      const pending = call(ac.signal).catch(() => null);
+      for (let i = 0; i < 100 && stub.calls === before; i++) await new Promise((r) => setTimeout(r, 10));
+      ac.abort();
+      await pending;
+      await new Promise((r) => setTimeout(r, 1500));
+      assert.equal(stub.calls, before + 1, 'no provider call after the client left');
+      await expectCharge(false, 'disconnect during an attempt that then failed with HTTP 500: refunded');
+    } finally {
+      await pgc?.end().catch(() => {});
+      await s.stop();
+      await stub.close();
+    }
+  });
+});
+
+for (const kind of ['json', 'postgres'] as const) {
+  describe(`Review R2 (${kind}): attempt lifecycle in the repository`, { skip: kind === 'postgres' ? pgSkip : false }, () => {
+    test('begin/end attempts, settlement by usage, crash recovery, idempotency', async () => {
+      const { r } = await makeRepo(kind);
+      const ai = r as any;
+      const day = aiDay();
+      const k = 'user:r2r';
+      const keys = [{ key: k, limit: 100 }];
+      const charged = async () => r.peekAi(k, day);
+      // never started -> refunded; a settled reservation can never begin an attempt
+      await r.reserveAi(keys, day, 'r2-res-a');
+      assert.equal(await ai.settleAi('r2-res-a', 'usage'), 'settled');
+      assert.equal(await charged(), 0);
+      assert.equal(await ai.beginAiAttempt('r2-res-a'), false);
+      // an attempt that ended with a provider error -> refunded
+      await r.reserveAi(keys, day, 'r2-res-b');
+      assert.equal(await ai.beginAiAttempt('r2-res-b'), true);
+      await ai.endAiAttempt('r2-res-b', { billable: 'no', tokens: 0 });
+      assert.equal(await ai.settleAi('r2-res-b', 'usage'), 'settled');
+      assert.equal(await charged(), 0, 'started, provider answered with an error: refunded');
+      // billable attempt -> committed; duplicate settles and late attempt ends change nothing
+      await r.reserveAi(keys, day, 'r2-res-c');
+      assert.equal(await ai.beginAiAttempt('r2-res-c'), true);
+      await ai.endAiAttempt('r2-res-c', { billable: 'yes', tokens: 42 });
+      assert.equal(await ai.settleAi('r2-res-c', 'usage'), 'settled');
+      assert.equal(await ai.settleAi('r2-res-c', 'usage'), 'already_settled');
+      await ai.endAiAttempt('r2-res-c', { billable: 'no', tokens: 0 });
+      assert.equal(await charged(), 1);
+      // uncertain attempt -> committed
+      await r.reserveAi(keys, day, 'r2-res-d');
+      assert.equal(await ai.beginAiAttempt('r2-res-d'), true);
+      await ai.endAiAttempt('r2-res-d', { billable: 'uncertain', tokens: 0 });
+      assert.equal(await ai.settleAi('r2-res-d', 'usage'), 'settled');
+      assert.equal(await charged(), 2);
+      // crash while an attempt is in flight: recovery does not refund
+      await r.reserveAi(keys, day, 'r2-res-e');
+      assert.equal(await ai.beginAiAttempt('r2-res-e'), true);
+      // crash after an attempt definitively failed and before settlement: recovery refunds (no billable usage)
+      await r.reserveAi(keys, day, 'r2-res-f');
+      assert.equal(await ai.beginAiAttempt('r2-res-f'), true);
+      await ai.endAiAttempt('r2-res-f', { billable: 'no', tokens: 0 });
+      await new Promise((res) => setTimeout(res, 40));
+      assert.equal(await r.expireAiReservations(10), 2);
+      assert.equal(await charged(), 3, 'in-flight attempt at the crash: charged; failed attempt: refunded');
+    });
+  });
+}
+
+describe('Review R2 (postgres): legacy rows and concurrency', { skip: pgSkip }, () => {
+  test('a reservation started by the previous release (started_at set, no attempt records) is never refunded by recovery', async () => {
+    const { r, db } = await makeRepo('postgres');
+    const day = aiDay();
+    await r.reserveAi([{ key: 'user:r2l', limit: 10 }], day, 'r2-legacy');
+    await db!.pool.query("UPDATE ai_reservations SET started_at = now() - interval '1 hour', created_at = now() - interval '1 hour' WHERE id = 'r2-legacy'");
+    assert.equal(await r.expireAiReservations(1000), 1);
+    assert.equal(await r.peekAi('user:r2l', day), 1, 'legacy started row: uncertain, charged');
+  });
+
+  test('40 rounds of attempt begin racing settlement: an attempt that began is never refunded while open; a refunded reservation never began', async () => {
+    const { r, db } = await makeRepo('postgres');
+    const ai = r as any;
+    const day = aiDay();
+    let committed = 0;
+    for (let i = 0; i < 40; i++) {
+      const id = `r2-race-${String(i).padStart(4, '0')}`;
+      await r.reserveAi([{ key: 'user:r2race', limit: 1000 }], day, id);
+      const [begun, s1, s2] = await Promise.all([ai.beginAiAttempt(id), ai.settleAi(id, 'usage'), ai.settleAi(id, 'usage')]);
+      assert.equal([s1, s2].filter((x) => x === 'settled').length, 1, `round ${i}: one settlement`);
+      const row = (await db!.pool.query('SELECT status FROM ai_reservations WHERE id = $1', [id])).rows[0];
+      if (begun) assert.equal(row.status, 'committed', `round ${i}: settled while the attempt was open -> charged`);
+      else assert.equal(row.status, 'refunded', `round ${i}: never began -> refunded`);
+      if (row.status === 'committed') committed++;
+    }
+    assert.equal(await r.peekAi('user:r2race', day), committed);
+  });
+});
