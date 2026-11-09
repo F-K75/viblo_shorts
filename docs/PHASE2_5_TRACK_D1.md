@@ -32,6 +32,10 @@ for the gate finding). Tests marked *verification* were written after the fix an
 **Problem.** Two users saving the same *new* project id at once could both succeed. The loser overwrote the winner's
 document and charged its own quota counters. An update racing a delete re-created the deleted project.
 
+**Exposure (correction, review of 2026-11-09).** Over HTTP, project ids are always issued by the server (`server.ts`,
+"an unknown client id is treated as a new project with a fresh id"). So the new-id race was reachable only at the
+repository layer. The defect a client could actually trigger was the resurrection. The fix and tests are unchanged.
+
 **Root cause.** `saveProject` locked the existing row with `FOR UPDATE`, but an id that does not exist yet has no row to
 lock. Both transactions saw "new". The second `INSERT … ON CONFLICT (id) DO UPDATE` then had no owner predicate. The
 update route also had no way to say "this must still exist".
@@ -96,6 +100,10 @@ the middle of the pages. The whole migration rolls back: no partial counters and
 exact counters.
 
 ## 3. F10: AI reservation lifecycle: refund only if the model call provably never started
+> **Superseded in part by the review pass (§13, R1 and R2, owner decisions of 2026-11-09).** The charge now follows the
+> recorded provider usage of every attempt, not the start alone, and the start is written to disk synchronously on the
+> JSON backend. This section describes the D-1 implementation as first reviewed.
+
 **Owner decision (2026-11-03):** "Refund if the model call has provably not started. Charge if it has started or its
 state is uncertain."
 
