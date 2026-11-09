@@ -78,19 +78,69 @@ on), keep hourly for 48 h, daily for 35 days, monthly for 12 months (bucket life
 * When the database is back, the pool reconnects automatically. No restart is needed.
 
 ## 6. Cut-over runbook: JSON → PostgreSQL
-1. **Rehearse on staging** with a copy of production `DATA_DIR`: `npm run data-migration -- plan` (dry run;
-   changes nothing) and check `verification.ok` and the source counts.
-2. Announce a short write freeze; stop the JSON server (the migration refuses to run while it holds the lock).
-3. `npm run data-migration -- migrate`: takes a verified JSON snapshot, migrates in one transaction, verifies
-   owner + content of every record, and rolls back on any mismatch.
-4. Start the app with `DATABASE_URL`; smoke test (sign-in, list projects, save, guest flow).
-5. Run `npm run db-backup -- create` and **restore it into a scratch database** (§4) — this satisfies the
-   source-retention condition of ADR-005.
-6. Keep the JSON directory and snapshot read-only for the observation window (proposed 30 days).
+**A write freeze is required for every run of `migrate`: the first cut-over AND any re-run, including re-runs during
+the observation window while PostgreSQL instances are live.** A run holds a row lock on every `users` row and on
+`storage_totals` until it commits (Track D-1 F9, `docs/PHASE2_5_TRACK_D1.md` §2). It is correct even if writes arrive,
+but live saves and deletes wait for it, and those that wait longer than the request statement timeout (default 10 s)
+fail.
+
+0. **Rehearse on staging** with a copy of production `DATA_DIR`: `npm run data-migration -- plan` (dry run; changes
+   nothing). Check `verification.ok` and the source counts.
+1. **Enter the write freeze.** Announce it. Stop **every** application instance: the JSON server, and on a re-run every
+   PostgreSQL instance. The application has no maintenance mode, so stopping the instances is the freeze.
+2. **Verify that all application writers have stopped.**
+   * JSON: `migrate` refuses to run while the JSON server holds its data-directory lock. Never pass `--force` to get
+     past it.
+   * PostgreSQL: connected as an operator to the target database, the following must return **no row** whose
+     `application_name` starts with `forge-studio:`. Every application instance connects with
+     `application_name = forge-studio:<instance id>`.
+     ```sql
+     SELECT application_name, state, count(*) FROM pg_stat_activity
+      WHERE datname = current_database() AND pid <> pg_backend_pid()
+      GROUP BY 1, 2 ORDER BY 1;
+     ```
+3. **Confirm that no write is outstanding.** The following must return **no rows**, meaning no other session is running
+   a statement or holding an open transaction:
+   ```sql
+   SELECT pid, application_name, state, xact_start FROM pg_stat_activity
+    WHERE datname = current_database() AND pid <> pg_backend_pid()
+      AND (state <> 'idle' OR backend_xid IS NOT NULL OR xact_start IS NOT NULL);
+   ```
+   If a row remains, wait for it or find its owner. Do not terminate application sessions while instances should
+   already be stopped; find out why one is still connected.
+4. **Run the migration (or the re-run):** `npm run data-migration -- migrate`.
+   * It takes a verified JSON snapshot.
+   * It migrates in one transaction under an advisory lock.
+   * It verifies the owner and content of every record, and rolls back on any mismatch.
+   * Re-running it is idempotent and never overwrites newer PostgreSQL rows (they are reported as `diverged`).
+5. **Verify PostgreSQL data integrity** before resuming:
+   * The report has `verification.ok: true`, with empty `missing`, `wrongOwner` and `contentMismatch`. Review every
+     `diverged` entry.
+   * The quota counters equal a recount. Both queries must return 0:
+     ```sql
+     SELECT count(*) FROM users u
+      WHERE u.storage_bytes <> coalesce((SELECT sum(p.size_bytes) FROM projects p WHERE p.user_id = u.id), 0)
+         OR u.project_count <> (SELECT count(*) FROM projects p WHERE p.user_id = u.id);
+     SELECT count(*) FROM storage_totals t
+      WHERE t.bytes <> (SELECT coalesce(sum(p.size_bytes), 0) FROM projects p JOIN users u ON u.id = p.user_id
+                         WHERE t.scope = 'all' OR (t.scope = 'guest' AND u.kind = 'guest'));
+     ```
+   * On the first cut-over, run `npm run db-backup -- create` and **restore it into a scratch database** (§4). This
+     satisfies the source-retention condition of ADR-005.
+6. **Resume the application writers.** Start the instances with `DATABASE_URL` (on the first cut-over these are the
+   first PostgreSQL instances). This ends the freeze.
+7. **Verify normal operation.**
+   * Every instance answers `GET /api/ready` with `"ready": true`.
+   * Smoke test: sign-in, list projects, save, guest flow.
+   * The logs show no `database_unavailable` or `db_tx_conflict_exhausted` events.
+   * Announce the end of the freeze.
+
+Keep the JSON directory and snapshot read-only for the observation window (proposed 30 days).
 
 **Rollback** (any time during the window, tested):
 1. Stop the PostgreSQL instances.
 2. `npm run data-migration -- export /new/empty/dir`: verified export including writes made after go-live.
 3. Start the app with `STORAGE_BACKEND=json DATA_DIR=/new/empty/dir` (single instance).
 
-Re-running `migrate` is safe: it is idempotent and never overwrites newer PostgreSQL rows (reported as `diverged`).
+Re-running `migrate` is idempotent and never overwrites newer PostgreSQL rows (reported as `diverged`), but **only
+under the write freeze of steps 1–3**, also while PostgreSQL instances are live.
