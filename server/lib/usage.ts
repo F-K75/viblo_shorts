@@ -95,7 +95,17 @@ export class UsageLedger {
     const r = this.open.get(id);
     if (!r || r.started) return false;
     r.started = Date.now();
-    this.markDirty();
+    // Review R1: written to disk NOW, before the caller invokes the provider. With the debounced flush a crash in
+    // the next second lost "started" and recovery refunded a call that may have run. If the write fails, the start
+    // is undone and refused, so the model is not called without a durable record.
+    this.dirty = true;
+    try {
+      this.writeNow();
+    } catch (err: any) {
+      delete r.started;
+      console.error(JSON.stringify({ level: 'error', event: 'usage_start_not_persisted', error: String(err?.message || err) }));
+      return false;
+    }
     return true;
   }
 
@@ -150,16 +160,21 @@ export class UsageLedger {
     }
   }
 
+  /** Writes the whole ledger synchronously (atomic rename); throws on failure. */
+  private writeNow() {
+    writeJsonFileAtomic(
+      this.file,
+      { v: 2, day: this.day, counts: Object.fromEntries(this.counts), reservations: Object.fromEntries(this.open) } satisfies UsageFile,
+      0,
+    );
+    this.dirty = false;
+  }
+
   /** Writes the ledger now. Never writes over a file that failed to load. */
   flush() {
     if (!this.dirty || this.unavailableReason) return;
     try {
-      writeJsonFileAtomic(
-        this.file,
-        { v: 2, day: this.day, counts: Object.fromEntries(this.counts), reservations: Object.fromEntries(this.open) } satisfies UsageFile,
-        0,
-      );
-      this.dirty = false;
+      this.writeNow();
     } catch (err: any) {
       console.error(JSON.stringify({ level: 'error', event: 'usage_flush_failed', error: String(err?.message || err) }));
     }
