@@ -407,6 +407,75 @@ describe('F11: backup verification covers ai_reservations (counts and content) a
       });
     }
   });
+
+  // ---- Review R4 (owner decision 2026-11-09): TLS-required restore and verify-restore, tested end to end ----
+  const tlsBackup = async () => {
+    const offsite: any = await import('../server/db/offsiteBackup.ts');
+    const src = await createTestDatabase();
+    dbs.push(src);
+    const r = new PostgresRepo(src.pool, limits);
+    for (let i = 0; i < 3; i++) await r.reserveAi([{ key: 'user:r4', limit: 100 }], aiDay(), `r4-res-${String(i).padStart(4, '0')}`);
+    const key = await ageKey();
+    const cfg = { target: `file://${fs.mkdtempSync(path.join(os.tmpdir(), 'd1-r4-'))}`, allowFileTarget: true };
+    const m = await offsite.createBackup(src.url, cfg, [key.pub]); // source side: the local test server (TLS off)
+    const dst = await createTestDatabase({ migrate: false });
+    dbs.push(dst);
+    return { offsite, cfg, m, key, dst };
+  };
+  const tablesIn = async (db: TestDb) => Number((await db.pool.query("SELECT count(*) AS n FROM information_schema.tables WHERE table_schema = 'public'")).rows[0].n);
+  const TLS_REQUIRED = { DATABASE_SSLMODE: 'require', DATABASE_SSL_REJECT_UNAUTHORIZED: 'false', NODE_ENV: 'test' };
+
+  test('R4: restore and verify-restore with TLS required: every connection (Node client and psql) negotiates TLS; none is plaintext', { skip: pgSkip }, async () => {
+    const { startPgTlsProxy } = await import('./helpers/pgTlsProxy.ts');
+    const { offsite, cfg, m, key, dst } = await tlsBackup();
+    const proxy = await startPgTlsProxy(dst.url);
+    try {
+      await withEnv(TLS_REQUIRED, async () => {
+        const restored = await offsite.restoreBackup(cfg, m.name, proxy.url, key.file);
+        assert.equal(restored.verified, true, 'the restore through TLS completes and verifies');
+        const check = await offsite.verifyRestoredDatabase(cfg, m.name, proxy.url);
+        assert.equal(check.state, 'complete', JSON.stringify(check.differences));
+      });
+      const c = proxy.connections;
+      assert.ok(c.length >= 5, `restore (target check, server version, psql, verification) + verify-restore: ${JSON.stringify(c)}`);
+      assert.deepEqual(c.filter((x) => !x.tls || x.plaintext), [], 'no connection without TLS');
+      const apps = new Set(c.map((x) => x.app));
+      assert.ok(apps.has('psql'), `the libpq restore stage (psql) used TLS: ${[...apps]}`);
+      assert.ok(apps.has('forge-backup-verify'), `the Node connections used TLS: ${[...apps]}`);
+    } finally {
+      await proxy.close();
+    }
+  });
+
+  test('R4: with TLS required, restore and verify-restore refuse a server without TLS, and the target stays untouched', { skip: pgSkip }, async () => {
+    const { offsite, cfg, m, key, dst } = await tlsBackup();
+    const plain = dst.url.replace(/[?&]sslmode=disable/, ''); // the local test server has ssl = off
+    for (const vars of [TLS_REQUIRED, { DATABASE_SSLMODE: undefined, DATABASE_SSL_REJECT_UNAUTHORIZED: undefined, NODE_ENV: 'production' }]) {
+      await withEnv(vars, async () => {
+        await assert.rejects(offsite.restoreBackup(cfg, m.name, plain, key.file), /SSL|TLS/i, `restore under ${JSON.stringify(vars)}`);
+        await assert.rejects(offsite.verifyRestoredDatabase(cfg, m.name, plain), /SSL|TLS/i, `verify-restore under ${JSON.stringify(vars)}`);
+      });
+    }
+    assert.equal(await tablesIn(dst), 0, 'nothing was restored over a plaintext connection');
+  });
+
+  test('R4: a TLS downgrade at the libpq stage (the server refuses TLS only for the psql connection) aborts the restore; nothing is written', { skip: pgSkip }, async () => {
+    const { startPgTlsProxy } = await import('./helpers/pgTlsProxy.ts');
+    const { offsite, cfg, m, key, dst } = await tlsBackup();
+    // restore connects in this order: target check (Node), server version (Node), psql. TLS is stripped on the 3rd
+    // connection, and a plaintext client would be forwarded (an attacker accepting a downgrade).
+    const proxy = await startPgTlsProxy(dst.url, { stripTlsOn: [3], forwardPlaintext: true });
+    try {
+      await withEnv(TLS_REQUIRED, async () => {
+        await assert.rejects(offsite.restoreBackup(cfg, m.name, proxy.url, key.file), /SSL|TLS/i);
+      });
+      assert.equal(proxy.connections[2]?.tls, false, `the 3rd connection had TLS stripped: ${JSON.stringify(proxy.connections)}`);
+      assert.deepEqual(proxy.connections.filter((x) => x.plaintext), [], 'psql did not fall back to plaintext');
+      assert.equal(await tablesIn(dst), 0, 'the target is untouched');
+    } finally {
+      await proxy.close();
+    }
+  });
 });
 
 // ---------------------------------------------------------------- D6: one accepted representation per guest token
