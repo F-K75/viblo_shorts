@@ -4,11 +4,12 @@ import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 
 /**
- * 'ok': valid output with usage (30 tokens). 'fail': HTTP 500 error from the provider. Review R2 additions:
+ * 'ok': valid output with usage (30 tokens). 'fail': HTTP 500 error from the provider. 'fail4xx': HTTP 400 error
+ * (INVALID_ARGUMENT). Review R2 additions:
  * 'garbage': HTTP 200 with usage (30 tokens) but unparseable output; 'zero': valid output reporting 0 tokens;
  * 'nousage': valid output without usage metadata.
  */
-export type GeminiStubMode = 'ok' | 'fail' | 'garbage' | 'zero' | 'nousage';
+export type GeminiStubMode = 'ok' | 'fail' | 'fail4xx' | 'garbage' | 'zero' | 'nousage';
 export interface GeminiStub {
   baseUrl: string;
   mode: GeminiStubMode;
@@ -52,6 +53,10 @@ export async function startGeminiStub(): Promise<GeminiStub> {
       if (mode === 'fail') {
         res.statusCode = 500;
         return res.end(JSON.stringify({ error: { code: 500, message: 'stub internal error', status: 'INTERNAL' } }));
+      }
+      if (mode === 'fail4xx') {
+        res.statusCode = 400;
+        return res.end(JSON.stringify({ error: { code: 400, message: 'stub invalid argument', status: 'INVALID_ARGUMENT' } }));
       }
       const text = mode === 'garbage' ? 'this is not json {' : JSON.stringify(UNIVERSAL);
       const usage =

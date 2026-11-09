@@ -306,26 +306,28 @@ describe('FS-007 AI quota', () => {
     fs.rmSync(dataDir, { recursive: true, force: true });
   });
 
-  test('failed AI calls, template fallbacks and invalid requests do not consume quota', async () => {
+  test('invalid requests do not consume quota; provider error responses do (conservative policy, owner decision 2026-11-09)', async () => {
     const stub = await startGeminiStub();
     cleanups.push(() => stub.close());
     stub.mode = 'fail';
     const s = await boot({ GEMINI_API_KEY: 'stub-key-0123456789', GEMINI_BASE_URL: stub.baseUrl, GEMINI_MODELS: 'stub-model', FREE_DAILY_AI_QUOTA: '2' });
     const u = s.signFirebaseToken({ sub: 'refund-user' });
-    for (let i = 0; i < 4; i++) {
+    // invalid requests never reach the provider: nothing charged
+    const bad = await call(s, '/api/generate-script', u, { method: 'POST', body: JSON.stringify({}) });
+    assert.equal(bad.status, 400);
+    assert.equal((await (await call(s, '/api/quota', u)).json()).dailyQuotaUsed, 0, 'invalid request: nothing charged');
+    // the provider was really called and answered with an error: an uncertain billing outcome, charged; the user
+    // still gets the template fallback
+    for (let i = 0; i < 2; i++) {
       const r = await call(s, '/api/gemini/suggest-hooks', u, { method: 'POST', body: JSON.stringify({ topic: 'sleep' }) });
       assert.equal(r.status, 200);
       assert.equal((await r.json()).isFallback, true);
     }
-    assert.ok(stub.calls >= 4, 'the provider was really called and failed');
-    const bad = await call(s, '/api/generate-script', u, { method: 'POST', body: JSON.stringify({}) });
-    assert.equal(bad.status, 400);
-    assert.equal((await (await call(s, '/api/quota', u)).json()).dailyQuotaUsed, 0, 'nothing charged');
-    // and once the provider recovers, the full quota is available
-    stub.mode = 'ok';
-    const ok = await call(s, '/api/gemini/suggest-hooks', u, { method: 'POST', body: JSON.stringify({ topic: 'sleep' }) });
-    assert.equal((await ok.json()).isFallback, false);
-    assert.equal((await (await call(s, '/api/quota', u)).json()).dailyQuotaUsed, 1);
+    assert.ok(stub.calls >= 2, 'the provider was really called and failed');
+    await new Promise((r) => setTimeout(r, 300));
+    assert.equal((await (await call(s, '/api/quota', u)).json()).dailyQuotaUsed, 2, 'provider errors: charged');
+    // the quota is then used up
+    assert.equal((await call(s, '/api/gemini/suggest-hooks', u, { method: 'POST', body: JSON.stringify({ topic: 'sleep' }) })).status, 429);
   });
 });
 

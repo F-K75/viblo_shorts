@@ -306,12 +306,13 @@ describe('F10 (server, verification after the fix): settlement through the real 
       await pending;
       await new Promise((r) => setTimeout(r, 2500));
       assert.equal(await used(), 2, 'abort after the start: charged');
-      // provider failure with a complete fallback response: refunded (unchanged)
+      // provider error response (HTTP 500) with a complete fallback response: charged (owner decision 2026-11-09:
+      // a provider error is an uncertain outcome; no refund on an unverified assumption about provider billing)
       stub.delayMs = 0;
       stub.mode = 'fail';
       assert.equal((await call()).status, 200);
       await new Promise((r) => setTimeout(r, 300));
-      assert.equal(await used(), 2, 'failed call: refunded');
+      assert.equal(await used(), 3, 'provider error: charged (conservative)');
     } finally {
       await s.stop();
       await stub.close();
@@ -610,7 +611,9 @@ describe('Review R1 (json): the model-call start is durable before the provider 
 
 // R2: F10 billing follows actual provider usage (owner decision 2026-11-09). A recorded start alone no longer charges:
 //  * never started -> refund; a provider response with usage > 0 -> charge (also when its output is unusable);
-//  * a provider error response (HTTP 4xx/5xx) -> not billable; a response reporting 0 tokens -> not billable;
+//  * a response reporting 0 tokens -> not billable;
+//  * a provider error response (HTTP 4xx/5xx) -> uncertain, charged (owner decision 2026-11-09: no refund on an
+//    unverified assumption about provider billing);
 //  * an attempt whose outcome is unknown (timeout, network error, crash, no usage metadata) -> charged (uncertain);
 //  * failover: every attempt is tracked; the reservation's single unit is charged if any attempt was billable or uncertain.
 describe('Review R2 (server): settlement by actual provider usage', () => {
@@ -645,10 +648,13 @@ describe('Review R2 (server): settlement by actual provider usage', () => {
       stub.mode = 'nousage';
       assert.equal((await call()).status, 200);
       await expectCharge(true, 'no usage metadata: uncertain, charged');
-      // provider error responses on every attempt: not billable, refunded
+      // provider error responses on every attempt: uncertain, charged once (conservative policy)
       stub.mode = 'fail';
       assert.equal((await call()).status, 200);
-      await expectCharge(false, 'HTTP 500 on every attempt: refunded');
+      await expectCharge(true, 'HTTP 500 on every attempt: charged once (conservative)');
+      stub.mode = 'fail4xx';
+      assert.equal((await call()).status, 200);
+      await expectCharge(true, 'HTTP 400 from the provider: charged (conservative)');
       // failover: the first attempt fails (500), the retry succeeds: one unit, both attempts tracked
       stub.mode = 'ok';
       stub.queue = ['fail', 'ok'];
@@ -668,7 +674,7 @@ describe('Review R2 (server): settlement by actual provider usage', () => {
       assert.equal((await call()).status, 200);
       await expectCharge(true, 'attempts timed out: uncertain, charged');
       // the client disconnects while an attempt is in flight; the provider then answers with an error.
-      // Settlement waits for the attempt's outcome: not billable, refunded; no further attempt after the disconnect.
+      // Settlement waits for the attempt's outcome (an error: uncertain, charged); no further attempt after the disconnect.
       await new Promise((r) => setTimeout(r, 1200)); // let the timed-out stub requests drain
       stub.mode = 'fail';
       stub.delayMs = 400;
@@ -680,7 +686,7 @@ describe('Review R2 (server): settlement by actual provider usage', () => {
       await pending;
       await new Promise((r) => setTimeout(r, 1500));
       assert.equal(stub.calls, before + 1, 'no provider call after the client left');
-      await expectCharge(false, 'disconnect during an attempt that then failed with HTTP 500: refunded');
+      await expectCharge(true, 'disconnect during an attempt that then failed with HTTP 500: charged (conservative)');
     } finally {
       await pgc?.end().catch(() => {});
       await s.stop();
