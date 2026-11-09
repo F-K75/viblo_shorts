@@ -98,6 +98,11 @@ describe('F1: backup manifest is consistent with the dump under concurrent write
     for (let run = 0; run < 3; run++) {
       const src = await db();
       await seed(src);
+      // A backup of the tiny seed takes milliseconds; on a slow CI disk a single write can take longer than that, so
+      // writes did not overlap the backup at all (CI: 0 writes during it). ~25 MB of incompressible padding makes
+      // pg_dump + encryption take long enough for genuine concurrent writes on any machine. The padding table is not
+      // an application table: verification (BACKUP_TABLES) is unaffected.
+      await q(src, 'CREATE TABLE f1_padding AS SELECT g AS id, md5(g::text) || md5((g * 7)::text) || md5((g * 13)::text) || md5((g * 31)::text) AS filler FROM generate_series(1, 200000) g');
       const cfg = fileTarget();
       const w = await client(src);
       let stop = false;
