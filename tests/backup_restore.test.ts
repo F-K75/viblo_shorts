@@ -108,14 +108,20 @@ describe('F1: backup manifest is consistent with the dump under concurrent write
           writes++;
         }
       })();
-      await new Promise((r) => setTimeout(r, 150));
+      // The writer must be running BEFORE the backup starts and must commit DURING it. (Previously: a fixed 150 ms
+      // wait and "> 20 writes in total", which a slow CI disk failed with 2 writes, and which could also pass with no
+      // write overlapping the backup at all.)
+      for (let i = 0; i < 300 && writes < 20; i++) await new Promise((r) => setTimeout(r, 50));
+      assert.ok(writes >= 20, `the writer is running before the backup starts (${writes} writes after up to 15 s)`);
+      const before = writes;
       const manifest = await createBackup(src.url, cfg, [key.pub]);
+      const during = writes - before;
       stop = true;
       await writer;
       await w.end();
       const dst = await db(false);
       const report = await restoreBackup(cfg, manifest.name, dst.url, key.file);
-      assert.ok(writes > 20, `the writer really ran during the backup (${writes} writes)`);
+      assert.ok(during >= 1, `writes committed while the backup ran (${during}; ${writes} in total)`);
       assert.equal(report.verified, true, `manifest ${JSON.stringify(manifest.rowCounts)} vs restored ${JSON.stringify(report.rowCounts)}`);
       assert.equal(report.rowCounts.projects, manifest.rowCounts.projects);
     }
