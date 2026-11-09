@@ -64,7 +64,7 @@ async function phase(name: string) {
       }
       void st;
     } catch {}
-  }, 250);
+  }, 1100); // /api/health/details is rate-limited (probeLimit 60 per minute)
   const refusers = Array.from({ length: 15 }, async () => { while (Date.now() < end) await post('refusal_no_token', {}, ip(), out); });
   const ipLimited = Array.from({ length: 5 }, async () => { while (Date.now() < end) { const a = ip(); await post('mint_before_ip_refusal', ok(), a, out); await post('refusal_ip_limited', ok(), a, out); } });
   const minters = Array.from({ length: 5 }, async () => { while (Date.now() < end) await post('successful_mint', ok(), ip(), out); });
