@@ -1,6 +1,6 @@
 # Phase 2.5 Track D-1: security and data hardening (F8, F9, F10, F11, D6, D2, D7)
 
-**Status: ready for review. Not merged.** D-2 has not been started; per the owner's instruction it waits for D-1 to be
+**Status: second review pass complete (§13); PR on HOLD pending the owner's review. Not merged.** D-2 has not been started; per the owner's instruction it waits for D-1 to be
 reviewed and merged. Passing CI is not merge approval and not production-release approval.
 
 * **Base:** `main` @ `6ee9c11` (Track A merge) plus the docs-only re-audit commit `14c1438` (incorporated as the first
@@ -340,3 +340,301 @@ None introduced by D-1. Still open and tracked for D-2 (not in D-1's scope):
 * D8: intermittent `write EPIPE` in the Track C upload test (seen on `3aa217c`, not on `419351d`).
 * D9: the Playwright throwaway install reports 5 vulnerabilities (1 moderate, 4 high).
 * The CI database connection headroom from Track A is unchanged, and not re-measured in D-1.
+
+---
+
+## 13. Second review pass (owner decisions and requests of 2026-11-09)
+PR #7 was on HOLD after the first review of `614c56b`. The owner decided:
+* accept the Track A fix;
+* add the F9 runbook steps;
+* make the F10 JSON start durable and settle F10 by actual provider usage;
+* add the F11 TLS restore tests;
+* keep the D2/D7 checksum evidence.
+
+The owner then asked for:
+* the F10 outcome matrix and concurrency evidence;
+* migration `0006` upgrade and recovery evidence;
+* sustained load results for Track A.
+
+Merge, D-2 and deployment are **not** authorized.
+
+### 13.1 Commits since `614c56b`
+| Commit | Kind | Item |
+|---|---|---|
+| `9975e26` | red test | R1: a crash within the 1 s flush loses the model-call start (`0 !== 1`) |
+| `4a93567` | fix | R1: the JSON ledger persists the start synchronously before the provider is called |
+| `f4d2685` | red tests | R2: billing must follow provider usage (both backends) |
+| `4e87cc0` | fix | R2: per-attempt records, settlement by usage, migration `0006` |
+| `4fc90a4` | tests (mutation-checked) | R4: F11 TLS-required restore and verify-restore, TLS downgrade |
+| `20e870c` | docs | R3: F9 runbook, write freeze for every `migrate` run |
+| `c776e33` | measurement script | R5: concurrent load, Track A refusals |
+| `fa88a9e` | docs | F8 exposure correction; F10 §3 marked superseded in part |
+| `b9a610c` | test helper | Gemini stub arrival hook (R1 evidence) |
+| `2c7b74a`, `fa9b618` | measurement script | R5: pool and throughput sampling, below the probe rate limit |
+| `6db5dbd` | test | F1 write-storm precondition (CI finding, §13.8) |
+| `378d028` | tests (mutation-checked) | R1, R2 and R6 evidence |
+| this commit | docs | this section and the re-audit |
+
+Application code changed only in `4a93567` and `4e87cc0`:
+* `server.ts`;
+* `server/lib/{usage,jsonRepo,repo}.ts`;
+* `server/db/pgRepo.ts`;
+* `server/db/migrations/0006_ai_reservation_attempts.sql`.
+
+Everything else is tests, test helpers, a measurement script and docs.
+
+### 13.2 R1: F10 durability before the provider call (JSON)
+**Red (`9975e26`, on `614c56b`).** With the production 1 s debounce, a crash right after the start left the reservation
+on disk without `started`. Recovery refunded it (`0 !== 1`).
+
+**Fix (`4a93567`, superseded by R2's `beginAttempt`, which keeps it).** The attempt record is written synchronously
+(atomic rename) before the method returns. If the write fails, the attempt is undone and refused, so the provider is not
+called.
+
+**Evidence (`378d028`):**
+* **No provider call before persistence.** The stub inspects durable state at the instant each request arrives: the
+  file on disk for JSON, a committed row seen from another connection for PostgreSQL. Two attempts (500, then success)
+  showed `[{open:1,total:1},{open:1,total:2}]` on both suite backends.
+* **Failed disk write.** `usage.json` was replaced by a directory, so the atomic rename fails, also as root. The
+  provider received **0** calls, the user got the template fallback, the quota was unchanged (refunded), and the server
+  logged `usage_attempt_not_persisted`.
+* **Crash recovery.** No flush and no close after the start, then a new process: the reservation is charged (R1 test),
+  and an in-flight attempt at the crash is charged (R2 repository tests).
+* **Mutations caught:** a debounced attempt write (2 tests fail); the provider called before the attempt is recorded
+  (1 test fails).
+
+### 13.3 R2: F10 billing by actual provider usage
+#### F10 billing outcome matrix (as implemented)
+**Terms used below:**
+* **Invocation:** the server sends a provider request. Every invocation is preceded by a durable `beginAiAttempt`.
+* **Execution:** the provider processed the request. The server cannot observe this directly; it infers it from the
+  response.
+* **Billable usage:** the provider reported usage greater than 0 (`usageMetadata.totalTokenCount`, or prompt plus
+  candidate tokens).
+
+**One reservation is one daily-quota unit:**
+* It is settled exactly once, by a conditional `status = 'reserved'` transition.
+* The charge is 0 or 1 unit, never more, however many attempts were made.
+* Tokens are recorded for audit; they are not priced.
+
+**Settlement rule `usage`:**
+* **Charge** if any attempt is `billable`, any attempt is `uncertain`, or an attempt is still open.
+* **Charge** a legacy row (`started_at` set, no attempt records).
+* **Refund** otherwise.
+
+**Per-attempt outcomes:**
+
+| # | What happened on an attempt | Invocation | Execution known? | Classified as | Effect on the reservation |
+|---|---|---|---|---|---|
+| 1 | Not attempted: no API key, validation error before the call, template only | no | n/a | (no attempt) | refund, unless another attempt decides otherwise |
+| 2 | Client already gone, or reservation already settled, when an attempt would begin | **no** (refused before the call) | n/a | (no attempt) | as 1 |
+| 3 | The durable attempt record cannot be written (JSON disk error, PostgreSQL error) | **no** | n/a | (no attempt) | as 1 |
+| 4 | HTTP 200, usage > 0, output valid | yes | yes | billable | **charge** |
+| 5 | HTTP 200, usage > 0, output unusable (unparseable or empty; the user gets the template) | yes | yes | billable | **charge** |
+| 6 | HTTP 200, usage reported as 0 | yes | yes | not billable | refund (unless another attempt charges) |
+| 7 | HTTP 200 without usage metadata | yes | yes, usage unknown | uncertain | **charge** |
+| 8 | HTTP 4xx/5xx error response (`ApiError` with a numeric status): 400, 401/403 (credentials), 429, 500, 503 | yes | provider answered with an error | not billable **(see note A)** | refund (unless another attempt charges) |
+| 9 | Timeout (our `AbortSignal.timeout`), network reset or other error without an HTTP status | yes | **unknown** | uncertain | **charge** |
+| 10 | Client disconnects while an attempt is in flight | yes | resolved by the attempt's own outcome | 4 to 9 | settlement **waits** for the attempt's outcome; no new attempt starts after the disconnect |
+| 11 | The process crashes while an attempt is in flight | yes | unknown | attempt left open | recovery (expiry) **charges**, never an automatic refund |
+| 12 | The process crashes after attempts ended, before settlement | as recorded | as recorded | as recorded | recovery settles by the recorded outcomes |
+| 13 | Recording an attempt's outcome fails | yes | unknown to the ledger | attempt left open | **charge** (never an unrecorded refund) |
+
+**Retries and failover:** each retry or failover model is its own attempt (rows 4 to 9), and the rule applies across all
+of them:
+* 500 then success: charged once.
+* 500 then 500: refunded.
+* Timeout then success: charged once.
+* Timeout then 500: charged (the timeout was uncertain).
+
+**Parallel calls:**
+* No route issues parallel provider calls for one reservation. Each request makes one provider call chain, attempts in
+  sequence.
+* The ledger still supports parallel attempts on one reservation:
+  * the in-process `openAttempts` counter, and `attempts_open` in the database, are atomic counters;
+  * settlement is a single conditional statement that reads them.
+* Tested: 8 parallel attempts racing 3 settlements, 20 rounds, both backends. Result: exactly one settlement, a charge of
+  0 or 1, and always charged when any attempt was billable or uncertain.
+
+**Note A (needs the owner's decision):** row 8 assumes that a provider error response is not billed.
+* I could not confirm this against Google's documentation. This session's network blocks `ai.google.dev`, and the
+  Google Cloud pricing page returned no readable text.
+* **Conservative alternative:** classify 4xx/5xx as `uncertain` (charged). The change is one line in
+  `attemptResultOfError`, plus test expectations.
+* **Middle option:** 429 and 401/403 not billable (request rejected before processing); every other 4xx/5xx uncertain.
+
+
+**Evidence:**
+* **Server-level (`f4d2685`, red then green).** One request each for:
+  * unusable output with usage → charged;
+  * 0 usage → refunded;
+  * no usage metadata → charged;
+  * 500 on every attempt → refunded;
+  * 500 then success → charged once, and on PostgreSQL `attempts_total=2, attempts_open=0, billable_attempts=1,
+    billable_tokens=30`;
+  * timeouts → charged;
+  * a disconnect during an attempt that then returns 500 → refunded, with no provider call after the disconnect.
+* **Repository level (both backends).** Lifecycle, idempotency, crash in flight → charged, crash after a failed attempt
+  → refunded.
+* **PostgreSQL.** 40 rounds of begin racing settlement: an attempt that began is never refunded while open, and a
+  refunded reservation never began.
+* **Concurrency (`378d028`, both backends).** 20 rounds × 8 parallel attempts on **one** reservation, their outcomes
+  racing 3 settlements:
+  * exactly 1 settlement each time;
+  * charge delta 0 or 1;
+  * always 1 when an attempt was billable or uncertain;
+  * the status matches the charge;
+  * every attempt end is recorded, also after settlement.
+
+  Mutations caught: open attempts ignored at settlement; settlement without the `status = 'reserved'` condition.
+* **Earlier D-1 F10 tests** were migrated to the attempt API (`startAi` → `beginAiAttempt`, `'abort'` → `'usage'`). One
+  assertion changed meaning: several attempts per reservation are now allowed and recorded.
+
+### 13.4 Migration `0006` upgrade and recovery evidence (R6, `378d028`)
+`0006` adds five `NOT NULL DEFAULT 0` columns to `ai_reservations` and is marked backward-compatible. On PostgreSQL 11+
+this is a metadata-only change with no table rewrite.
+
+On a real version-5 database (migrations `0001`–`0005` only), with rows in every state the previous release writes
+(open, started, committed, refunded, plus their usage counts):
+
+| Check | Result |
+|---|---|
+| Interruption 1: the table is busy (`ACCESS SHARE` held by another session); migration lock timeout | fails with "0006_ai_reservation_attempts.sql failed (lock timeout …)"; still version 5; no new column |
+| Interruption 2: the migrating **process is SIGKILLed** while its `ALTER` waits for the lock; the lock is then released | the orphaned session ends without committing; still version 5; no new column |
+| Recovery: normal re-run | applies `0006` exactly once (version 6); a second run applies nothing |
+| Existing rows | byte-identical in all existing columns (md5 over the legacy rows); new columns 0 |
+| The previous release against version 6 | its migrator (`migrate.ts`, unchanged since `6ee9c11`, with only `0001`–`0005`) applies nothing and reports `newerCompatible: ['0006_…']`; its settle statement (verbatim from `614c56b`) charges an in-flight attempt begun by this release |
+| This release on legacy rows | recovery charges the legacy *started* row, refunds the never-started one, and leaves settled rows unchanged; the usage count follows (3) |
+| JSON: a `usage.json` written by the previous release | loads; a started reservation is charged by recovery, a never-started one refunded |
+
+Mutations caught: the legacy clause removed (PostgreSQL), and legacy JSON rows treated as never started.
+
+**Deploy order:**
+* **Rolling upgrade:** apply `0006`, which the new release does at startup under its advisory lock. Old instances keep
+  running against version 6.
+* **Rollback:** the previous image runs against version 6 unchanged. Rows begun by the new release keep `started_at`,
+  so the old rule charges them, which is conservative.
+
+### 13.5 R3: F9 runbook
+`docs/BACKUP_AND_RECOVERY.md` §6 (`20e870c`) has these steps:
+* 0: rehearse.
+* 1: enter the freeze by stopping every instance (there is no maintenance mode).
+* 2: verify that writers have stopped: no `forge-studio:<instance>` session in `pg_stat_activity`, and the JSON lock
+  refuses `migrate` (never `--force`).
+* 3: confirm that no write is outstanding: no active statement or open transaction.
+* 4: migrate or re-run.
+* 5: verify integrity: report fields, plus recount queries for the user counters and `storage_totals`.
+* 6: resume writers.
+* 7: verify normal operation.
+
+A write freeze is required for **every** run, including re-runs while PostgreSQL is live.
+
+**Rollback** keeps the tested export procedure.
+
+**Interruption:** `migrate` is one transaction. A failure or a killed process commits nothing (§13.4 shows this for
+schema migrations; the data migration's own rollback is in §2). Re-run after fixing the cause; it is idempotent.
+
+**SQL verification on a real database:**
+
+| Query | Healthy | After corruption | Live session |
+|---|---|---|---|
+| Recount, user counters | 0 | 1 (a user counter corrupted) | |
+| Recount, `storage_totals` | 0 | 1 (the guest total corrupted) | |
+| Writer check (step 2) | | | lists a connected `forge-studio:inst-1` session |
+| Outstanding writes (step 3) | | | lists its open transaction, and nothing once it ended |
+
+### 13.6 R4: F11 TLS-required restore and verify-restore (`4fc90a4`)
+* **TLS proxy.** A TLS-terminating proxy in front of the local PostgreSQL (which has TLS off) records, per connection,
+  whether TLS was negotiated and the `application_name`.
+* **Positive.** Restore and verify-restore with TLS required both succeed. **Every** connection negotiated TLS: the Node
+  `forge-backup-verify` connections and the libpq `psql` stage. None was plaintext.
+* **Refusal.** With `DATABASE_SSLMODE=require`, and with the production default, restore and verify-restore against a
+  server without TLS are refused (`SSL`/`TLS` error). The target has no tables afterwards.
+* **Downgrade.** TLS is stripped only on the third connection (`psql`), while a plaintext client would be accepted.
+  The restore aborts, `psql` does not fall back, and nothing is written.
+* **Mutations:**
+  * libpq `prefer` → caught by the downgrade test;
+  * libpq `disable` → caught by 2 tests;
+  * the Node client without the TLS policy → caught by all 3.
+
+### 13.7 R5: Track A under sustained refusal floods (`scripts/load/guest-refusal-concurrency.mts`)
+**Setup:**
+* 25 concurrent clients for 60 s per phase: 15 refusal clients (no CAPTCHA token), 5 doing a mint then an IP-limited
+  refusal, and 5 legitimate signups.
+* Pool size: the **production default of 10, not changed**.
+* Pool samples come from `/api/health/details`: the waiting count, and `latencyMs` of a `SELECT 1` through the
+  application pool, which measures connection acquisition.
+* Slow phase: an INSERT-only trigger adds 300 ms to each refusal-stat write. It runs without holding the counter row's
+  lock, so it models a slow database rather than lock serialization.
+
+| 60 s phase | Pre-fix `3aa217c` | Current `378d028` |
+|---|---|---|
+| Healthy: legitimate signups/s | 88.1 | **137.9** |
+| Healthy: signup p50 / p95 / p99 | 54 / 84 / 98 ms | **35 / 54 / 66 ms** |
+| Healthy: refusals/s (no token); p50 | 1 028; 13.6 ms | 925; 15.4 ms |
+| Healthy: pool waiting p50 / max; acquire p50 / p95 | 21 / 29; 8 / 14 ms | 12 / 17; 5 / 8 ms |
+| Slow writes: legitimate signups/s | 2.2 | **7.0** |
+| Slow writes: signup p50 / p95 / p99 | 2 433 / 2 711 / 2 717 ms | **669 / 925 / 982 ms** |
+| Slow writes: refusals/s (no token); p50 | 31.3; 585 ms | 26.8; 578 ms |
+| Slow writes: pool waiting p50 / max; acquire p50 / p95 | 38 / 48; 464 / 817 ms | 15 / 20; 151 / 436 ms |
+| 5xx or network errors | 0 | 0 |
+| Refusal stats recorded vs. refusals sent | equal | equal |
+
+**Residual risk (not removed by the fix):**
+* Refusals and legitimate signups share one pool of 10. Under a refusal flood while the database is slow, the pool is
+  saturated (10 connections, 15–20 waiting) and legitimate signups take 0.7–1 s at p50–p99.
+* That is 3.6× faster than before the fix, at 3× the throughput, with no errors, but it is not isolated.
+* **Options, not implemented, for the owner to decide:**
+  * a separate small pool or a bounded queue for stat writes;
+  * sampling or aggregating refusal stats in memory.
+
+### 13.8 CI finding: F1 write-storm precondition (`6db5dbd`)
+**What failed.** CI run `42614874907` on `fa88a9e` (`test` job, JSON-suite step: 281 tests, 278 pass, 1 fail) failed
+only the **precondition** of the F1 test: "the writer really ran during the backup (2 writes)", where more than 20 were
+expected. The backup and restore assertions never failed.
+
+**Locally:**
+* 9 instrumented runs: 177–268 writes before the backup and 55–135 during it.
+* 5 runs alongside the D-1 suite: all pass.
+
+**Cause.** The CI writer was about 100× slower, likely from disk contention with the parallel test files. That is not
+confirmed from the log.
+
+**Fix.** The old precondition could also pass with no write overlapping the backup. It now waits for 20 committed
+writes (up to 15 s), then requires at least 1 write committed **during** `createBackup`. The restore assertions are
+unchanged. The file passed 3 of 3 runs.
+
+### 13.9 Local gate
+| Check | Result |
+|---|---|
+| `tests/track_d1.test.ts` (27 tests) ×3 on `c776e33` | JSON 27/27, 27/27, 27/27; PostgreSQL 27/27, 27/27, 27/27 |
+| `tests/track_d1_review.test.ts` (6 tests) ×3 on `378d028` | JSON 6/6 ×3; PostgreSQL 6/6 ×3 |
+| Full JSON suite, `c776e33` | 281 tests, 279 pass, **0 fail**, 0 cancelled, 2 skipped |
+| Full PostgreSQL suite, `c776e33` | 281 tests, 272 pass, **0 fail**, 0 cancelled, 9 skipped |
+| Build, `c776e33` | passes |
+| Browser E2E, `c776e33` | JSON 2/2; PostgreSQL 2/2 |
+| Full suites on the final head (`fa9b618`) | _pending (running)_ |
+
+Skips are unchanged from §11: 2 live Gemini tests (no `GEMINI_API_KEY`, **not passed**), and 7 JSON-only tests on
+PostgreSQL.
+
+### 13.10 CI on the final head
+_Pending: CI run 51 on `fa9b618` (code head) and the run on the final docs head; every job log will be read._
+
+### 13.11 Risks after the second pass
+* **Accepted (owner):**
+  * an uncertain attempt is charged;
+  * a crash with an attempt in flight is charged.
+* **Needs the owner's decision:**
+  1. F10 row 8: whether HTTP 4xx/5xx is not billable (unverified against Google's documentation).
+  2. Track A: the shared pool under refusal floods (§13.7).
+* **Residual:**
+  * F9: live writes wait during `migrate`; the runbook freeze prevents this.
+  * F11: `PGSSLROOTCERT=system` needs libpq 16 or later.
+  * Test proxy: TLS in the positive test runs with `rejectUnauthorized=false` (self-signed certificate). Certificate
+    verification itself is covered by the `libpqEnv` policy unit test, not end to end.
+* **Unresolved, D-2 scope:**
+  * D8: EPIPE flake;
+  * D9: Playwright throwaway-install vulnerabilities;
+  * CI database and disk headroom (the F1 finding is one symptom).
+* **Release blocker:** R-01 live Gemini validation (Track E).
