@@ -16,6 +16,8 @@ export interface GeminiStub {
   queue: GeminiStubMode[];
   delayMs: number;
   calls: number;
+  /** Review R1 evidence: runs when a request ARRIVES at the provider, before it answers (state checks at that instant). */
+  onRequest?: () => Promise<void> | void;
   close: () => Promise<void>;
 }
 
@@ -43,6 +45,7 @@ export async function startGeminiStub(): Promise<GeminiStub> {
     req.on('end', async () => {
       stub.calls++;
       const mode = stub.queue.length ? stub.queue.shift()! : stub.mode;
+      if (stub.onRequest) await stub.onRequest();
       if (stub.delayMs) await new Promise((r) => setTimeout(r, stub.delayMs));
       if (res.destroyed) return;
       res.setHeader('content-type', 'application/json');
