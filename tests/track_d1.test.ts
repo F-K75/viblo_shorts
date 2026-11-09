@@ -664,8 +664,8 @@ describe('Review R2 (server): settlement by actual provider usage', () => {
         const row = (await pgc.query("SELECT status, attempts_total, attempts_open, billable_attempts, uncertain_attempts, billable_tokens FROM ai_reservations WHERE status <> 'reserved' ORDER BY created_at DESC LIMIT 1")).rows[0];
         assert.deepEqual(
           { ...row, billable_tokens: Number(row.billable_tokens) },
-          { status: 'committed', attempts_total: 2, attempts_open: 0, billable_attempts: 1, uncertain_attempts: 0, billable_tokens: 30 },
-          'both attempts and the billable tokens are recorded',
+          { status: 'committed', attempts_total: 2, attempts_open: 0, billable_attempts: 1, uncertain_attempts: 1, billable_tokens: 30 },
+          'both attempts are recorded (the HTTP 500 as uncertain, the success as billable) with the billable tokens',
         );
       }
       // timeouts (the provider may have processed the request): uncertain, charged

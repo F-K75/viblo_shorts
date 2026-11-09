@@ -48,9 +48,9 @@ export interface ServerJob {
  */
 export type AiSettlement = 'commit' | 'refund' | 'usage';
 /**
- * Outcome of one provider attempt: 'yes' = the provider reported usage > 0 (billable even if the output was unusable);
- * 'no' = the provider answered with an error, or reported 0 usage; 'uncertain' = unknown (timeout, network error, no
- * usage metadata), charged.
+ * Outcome of one provider attempt: 'yes' = a response with usage > 0 (billable even if the output was unusable);
+ * 'no' = a successful response that reported 0 usage; 'uncertain' = everything else after invocation (HTTP 4xx/5xx,
+ * timeout, network error, no usage metadata), charged (owner decision 2026-11-09).
  */
 export interface AiAttemptResult {
   billable: 'yes' | 'no' | 'uncertain';

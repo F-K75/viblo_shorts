@@ -604,12 +604,13 @@ function attemptResultOfResponse(response: any): AiAttemptResult {
   return total > 0 ? { billable: 'yes', tokens: total } : { billable: 'no', tokens: 0 };
 }
 /**
- * Review R2: a provider error RESPONSE (HTTP 4xx/5xx from the API) is not billable. Anything else (timeout, network
- * error, unknown) may have reached and been processed by the provider: uncertain (charged).
+ * Any provider error after invocation: HTTP 4xx/5xx response, timeout, network error or anything unclassifiable.
+ * Uncertain, so charged (owner decision 2026-11-09): whether the provider bills an error response is not verified,
+ * and an unknown billing outcome must never become an automatic refund. This is our conservative settlement policy,
+ * not a statement that the provider billed the request.
  */
-function attemptResultOfError(err: any): AiAttemptResult {
-  const st = err?.status;
-  return typeof st === 'number' && st >= 400 && st < 600 ? { billable: 'no', tokens: 0 } : { billable: 'uncertain', tokens: 0 };
+function attemptResultOfError(_err: unknown): AiAttemptResult {
+  return { billable: 'uncertain', tokens: 0 };
 }
 /**
  * Every provider invocation goes through here (review R1/R2). Before the call, the attempt is recorded durably on

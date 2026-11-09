@@ -2,7 +2,8 @@
 -- Every provider attempt of a reservation is recorded:
 --  * attempts_total / attempts_open: begun and not yet ended (an open attempt at settlement = outcome unknown);
 --  * billable_attempts: the provider answered with usage > 0 (charged, even if the output was unusable);
---  * uncertain_attempts: the outcome is unknown (timeout, network error, no usage metadata) -> charged;
+--  * uncertain_attempts: any other outcome after invocation (HTTP 4xx/5xx error response, timeout, network error, no
+--    usage metadata) -> charged (owner decision 2026-11-09; a response reporting 0 usage is the only non-billable one);
 --  * billable_tokens: the provider-reported token total of the billable attempts (audit).
 -- Settlement charges the reservation's unit iff any attempt was billable, uncertain or still open, or the row was
 -- started by the previous release (started_at set, no attempt records); otherwise it refunds.
