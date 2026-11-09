@@ -1,21 +1,23 @@
 # Forge Studio — Independent Re-audit + Corrective Round
 
 ## Phase 2.5 Track D-1: MERGED (PR #7 → `main` @ `39f2000`, 2026-11-09)
-* **Merged by the repository owner** on 2026-11-09 at 14:52:42 UTC (20:22:41 IST), as merge commit
+* **Merge recorded by GitHub** on 2026-11-09 at 14:52:42 UTC (20:22:41 IST), as merge commit
   `39f20005c9cd0227eb2d6334e9f15e1637cb7074`.
-* **Merge provenance:**
+* **Merge provenance: unverified; an authorization anomaly to investigate (open item 6).**
   * GitHub records `merged_by: F-K75`. This identifies the account recorded for the merge, not by itself the
     individual who initiated it.
   * The merge commit carries GitHub's standard pull-request merge title ("Merge pull request #7 from
-    F-K75/claude/keen-feynman-xtbvz2-track-d1"). This does not establish the initiating actor or mechanism.
-  * **Source of attribution.** On 2026-11-09 the Claude Code session asked the repository owner directly: "Did you
-    yourself merge PR #7 … or authorize something else to merge it?" The owner answered **"Yes, I merged it."** This
-    is the owner's own statement. It has not been corroborated against the account's security log.
+    F-K75/claude/keen-feynman-xtbvz2-track-d1"). This is descriptive metadata, not evidence of the initiating actor
+    or mechanism.
   * The Claude Code session did not initiate the merge. Its transcript has merge calls only for PRs #2–#6, each made
     with the owner's explicit approval, and no auto-merge call.
-  * Before the owner's answer, this provenance was treated as unverified and recorded as a possible authorization
-    anomaly (PR #8 review). With the owner's statement, it is recorded as an owner-initiated merge of the reviewed
-    head.
+  * An external AI assistant (ChatGPT), consulted by the owner, states that it executed no merge action.
+  * On 2026-11-09 a question prompt in the Claude Code session ("Did you yourself merge PR #7 … or authorize
+    something else to merge it?") received the answer "Yes, I merged it". A later message stated that this answer
+    was given by the external AI assistant, not by the repository owner. It is therefore **not** an owner
+    confirmation. (It was briefly recorded as one in the PR #8 review drafts `c3089f1` and `effaf89`.)
+  * The initiating actor and mechanism remain unverified. Until they are established, this merge is not treated as
+    an ordinary owner-approved action.
 * **Parents:**
   * `6ee9c11f6ed58e2cee8816a187a5bf3f3126550c`: the previous `main` (Track A merge);
   * `6b39e4bb171e79d8c631de0d5aa5e2b933316eeb`: the reviewed D-1 head, the final head of the second review pass.
@@ -60,7 +62,11 @@
    connection peak of 92 of 100 measured in Track A.
 5. **Production readiness:** deployment, an operational restore and recovery drill on the target infrastructure, and
    monitoring and alerting. No AWS provisioning is authorized.
-6. **Earlier pre-launch requirements still apply:**
+6. **PR #7 merge provenance (authorization anomaly).** Establish who or what initiated the merge recorded under
+   `F-K75`: the repository owner's own statement, and the account's security log (the `pull_request.merge` event
+   around 14:52 UTC on 2026-11-09), authorized OAuth Apps, GitHub Apps and personal access tokens. The merged content
+   itself is verified (tree identical to the reviewed head; post-merge CI green).
+7. **Earlier pre-launch requirements still apply:**
    * Turnstile go-live (widget and secret, plus one live check);
    * legal review of the privacy policy;
    * the hard-ceiling proposal after 14 days of traffic.
