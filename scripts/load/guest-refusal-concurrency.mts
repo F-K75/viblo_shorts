@@ -82,7 +82,7 @@ async function phase(name: string) {
   }
   console.log(`${label} ${name} total=${out.length} req/s=${(out.length / (PHASE_MS / 1000)).toFixed(0)} 5xx_or_network=${out.filter((x) => x.status >= 500 || x.status < 0).length} peak_app_db_connections=${peakConn}`);
   const q = (xs: number[], p: number) => (xs.length ? [...xs].sort((a, b) => a - b)[Math.min(xs.length - 1, Math.floor(xs.length * p))] : NaN);
-  console.log(`${label} ${name} pool samples=${poolWaiting.length} waiting p50=${q(poolWaiting, 0.5)} p95=${q(poolWaiting, 0.95)} max=${Math.max(...poolWaiting)}; connection-acquire (SELECT 1 via the app pool) p50=${q(acquireMs, 0.5)}ms p95=${q(acquireMs, 0.95)}ms max=${Math.max(...acquireMs)}ms`);
+  console.log(`${label} ${name} pool samples=${poolWaiting.length} waiting p50=${q(poolWaiting, 0.5)} p95=${q(poolWaiting, 0.95)} p99=${q(poolWaiting, 0.99)} max=${Math.max(...poolWaiting)}; connection-acquire (SELECT 1 via the app pool) p50=${q(acquireMs, 0.5)}ms p95=${q(acquireMs, 0.95)}ms p99=${q(acquireMs, 0.99)}ms max=${Math.max(...acquireMs)}ms`);
 }
 try {
   await phase('healthy');
