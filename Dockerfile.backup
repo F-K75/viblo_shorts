@@ -26,4 +26,7 @@ COPY package.json ./
 COPY server ./server
 COPY scripts/db-backup.ts ./scripts/db-backup.ts
 USER node
+# F11: the backup tool applies the application's TLS policy (verified TLS by default in production) to every database
+# connection, including pg_dump / pg_restore / psql. Without NODE_ENV=production it would default to no TLS.
+ENV NODE_ENV=production
 ENTRYPOINT ["/usr/bin/tini", "--", "node", "--import", "tsx", "scripts/db-backup.ts"]

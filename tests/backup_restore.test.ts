@@ -98,6 +98,11 @@ describe('F1: backup manifest is consistent with the dump under concurrent write
     for (let run = 0; run < 3; run++) {
       const src = await db();
       await seed(src);
+      // A backup of the tiny seed takes milliseconds; on a slow CI disk a single write can take longer than that, so
+      // writes did not overlap the backup at all (CI: 0 writes during it). ~25 MB of incompressible padding makes
+      // pg_dump + encryption take long enough for genuine concurrent writes on any machine. The padding table is not
+      // an application table: verification (BACKUP_TABLES) is unaffected.
+      await q(src, 'CREATE TABLE f1_padding AS SELECT g AS id, md5(g::text) || md5((g * 7)::text) || md5((g * 13)::text) || md5((g * 31)::text) AS filler FROM generate_series(1, 200000) g');
       const cfg = fileTarget();
       const w = await client(src);
       let stop = false;
@@ -108,14 +113,22 @@ describe('F1: backup manifest is consistent with the dump under concurrent write
           writes++;
         }
       })();
-      await new Promise((r) => setTimeout(r, 150));
+      // The writer must be running BEFORE the backup starts and must commit DURING it. (Previously: a fixed 150 ms
+      // wait and "> 20 writes in total", which a slow CI disk failed with 2 writes, and which could also pass with no
+      // write overlapping the backup at all.)
+      for (let i = 0; i < 300 && writes < 20; i++) await new Promise((r) => setTimeout(r, 50));
+      assert.ok(writes >= 20, `the writer is running before the backup starts (${writes} writes after up to 15 s)`);
+      const before = writes;
       const manifest = await createBackup(src.url, cfg, [key.pub]);
+      const during = writes - before;
       stop = true;
       await writer;
       await w.end();
       const dst = await db(false);
       const report = await restoreBackup(cfg, manifest.name, dst.url, key.file);
-      assert.ok(writes > 20, `the writer really ran during the backup (${writes} writes)`);
+      // 'writes' is incremented after a write's commit returned, so one counted write may have committed just before
+      // createBackup started; >= 2 guarantees at least one write committed entirely within the backup.
+      assert.ok(during >= 2, `writes committed while the backup ran (${during} counted; ${writes} in total)`);
       assert.equal(report.verified, true, `manifest ${JSON.stringify(manifest.rowCounts)} vs restored ${JSON.stringify(report.rowCounts)}`);
       assert.equal(report.rowCounts.projects, manifest.rowCounts.projects);
     }

@@ -79,6 +79,59 @@ class DryRunRollback extends Error {
   }
 }
 
+const REBUILD_PAGE = 1000;
+
+/**
+ * F9: recompute users.storage_bytes / project_count and storage_totals from the stored rows, correctly even while the
+ * server keeps writing, and with every statement small (it runs under the request pool's statement timeout, which is
+ * NOT raised: one statement over all users timed out on large data).
+ *
+ * Live writes lock their users row first and storage_totals last, so this takes locks in the same order:
+ *  1. lock every users row (keyset pages, id order): in-flight saves of existing users finish first, later ones wait;
+ *  2. lock the storage_totals rows;
+ *  3. lock the users rows again: this also catches users created AND committed between 1 and 2. A save that has not
+ *     committed by then cannot commit its storage_totals change before this transaction commits, so it adds its delta
+ *     to the rebuilt value afterwards;
+ *  4. per page, recompute from the rows with a FRESH statement (after the locks are held, so no stale snapshot) and
+ *     write; the totals are the sum of the pages.
+ * Previously a single UPDATE … FROM (sum …) computed its sums from the snapshot taken when it started, then waited for
+ * a live save's row lock and overwrote that save's increment (lost update).
+ */
+async function rebuildCounters(tx: import('./pool.ts').Tx) {
+  const lockAllUsers = async () => {
+    const ids: string[] = [];
+    let after = '';
+    for (;;) {
+      const { rows } = await tx.query('SELECT id FROM users WHERE id > $1 ORDER BY id LIMIT $2 FOR UPDATE', [after, REBUILD_PAGE]);
+      if (!rows.length) return ids;
+      for (const r of rows) ids.push(r.id);
+      after = rows[rows.length - 1].id;
+    }
+  };
+  await lockAllUsers();
+  await tx.query("SELECT scope FROM storage_totals WHERE scope IN ('all', 'guest') ORDER BY scope FOR UPDATE");
+  const ids = await lockAllUsers();
+  let all = 0n;
+  let guest = 0n;
+  for (let i = 0; i < ids.length; i += REBUILD_PAGE) {
+    const { rows } = await tx.query(
+      `WITH s AS (
+         SELECT u.id, u.kind, coalesce(sum(p.size_bytes), 0)::bigint AS bytes, count(p.id)::int AS n
+           FROM users u LEFT JOIN projects p ON p.user_id = u.id
+          WHERE u.id = ANY($1::text[]) GROUP BY u.id, u.kind)
+       UPDATE users u SET storage_bytes = s.bytes, project_count = s.n FROM s WHERE u.id = s.id
+       RETURNING s.kind, s.bytes`,
+      [ids.slice(i, i + REBUILD_PAGE)],
+    );
+    for (const r of rows) {
+      all += BigInt(r.bytes);
+      if (r.kind === 'guest') guest += BigInt(r.bytes);
+    }
+  }
+  await tx.query("UPDATE storage_totals SET bytes = $1 WHERE scope = 'all'", [all.toString()]);
+  await tx.query("UPDATE storage_totals SET bytes = $1 WHERE scope = 'guest'", [guest.toString()]);
+}
+
 export async function migrateJsonToPostgres(db: Db, src: JsonSource, opts: { dryRun?: boolean; snapshot?: string } = {}): Promise<MigrationReport> {
   const dryRun = Boolean(opts.dryRun);
   const users = new Set<string>([...src.projects.map((p) => p.ownerId), ...src.jobs.map((j) => j.userId).filter(Boolean), ...Object.keys(src.subscriptions)]);
@@ -163,12 +216,9 @@ export async function migrateJsonToPostgres(db: Db, src: JsonSource, opts: { dry
         }
       }
 
-      // Rebuild quota counters from the rows themselves (exact, whatever was there before).
-      await tx.query(`UPDATE users u SET storage_bytes = coalesce(p.bytes, 0), project_count = coalesce(p.n, 0)
-        FROM (SELECT u2.id, sum(pr.size_bytes) AS bytes, count(pr.id) AS n FROM users u2 LEFT JOIN projects pr ON pr.user_id = u2.id GROUP BY u2.id) p
-        WHERE p.id = u.id`);
-      await tx.query("UPDATE storage_totals SET bytes = (SELECT coalesce(sum(size_bytes), 0) FROM projects) WHERE scope = 'all'");
-      await tx.query("UPDATE storage_totals SET bytes = (SELECT coalesce(sum(p.size_bytes), 0) FROM projects p JOIN users u ON u.id = p.user_id WHERE u.kind = 'guest') WHERE scope = 'guest'");
+      // Rebuild quota counters from the rows themselves (exact, whatever was there before). F9: safe under live writes
+      // and bounded per statement; see rebuildCounters.
+      await rebuildCounters(tx);
 
       // ---- verification (inside the transaction: a failure rolls everything back) ----
       const ids = src.projects.map((p) => p.project.id);

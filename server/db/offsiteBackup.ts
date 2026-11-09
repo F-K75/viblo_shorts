@@ -17,9 +17,11 @@ import { pipeline } from 'stream/promises';
 import { PassThrough, Transform } from 'stream';
 import { DeleteObjectCommand, GetObjectCommand, ListObjectsV2Command, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import pg from 'pg';
+import { tlsConfig } from './pool.ts';
 
-/** Tables whose row counts are recorded and verified (application data). */
-export const BACKUP_TABLES = ['users', 'projects', 'subscriptions', 'jobs', 'ai_usage_daily', 'storage_totals', 'data_migrations', 'schema_migrations'] as const;
+/** Tables whose row counts and content checksums are recorded and verified (application data). F11: ai_reservations
+ *  (dumped but never verified before) and Track A's captcha_redemptions are included. */
+export const BACKUP_TABLES = ['users', 'projects', 'subscriptions', 'jobs', 'ai_usage_daily', 'ai_reservations', 'storage_totals', 'data_migrations', 'schema_migrations', 'captcha_redemptions'] as const;
 
 export interface BackupManifest {
   format: 1;
@@ -33,6 +35,8 @@ export interface BackupManifest {
   schemaVersion: number | null;
   serverVersion: string;
   rowCounts: Record<string, number>;
+  /** F11: md5 over every row's text form (order-independent), per table; absent in manifests written before F11. */
+  checksums?: Record<string, string>;
   durationMs: number;
 }
 
@@ -203,28 +207,46 @@ export function libpqEnv(url: string): NodeJS.ProcessEnv {
   for (const [k, v] of u.searchParams) {
     const name = LIBPQ_PARAM_ENV[k];
     if (!name) throw new Error(`unsupported DATABASE_URL parameter "${k}" for backup tools`);
-    env[name] = v;
+    if (k !== 'sslmode') env[name] = v;
+  }
+  // F11: the application's TLS policy (tlsConfig), never libpq's default 'prefer', which silently allows plaintext.
+  const policy = tlsConfig(url).ssl;
+  if (!policy) env.PGSSLMODE = 'disable';
+  else if (typeof policy === 'object' && policy.rejectUnauthorized === false) env.PGSSLMODE = 'require';
+  else {
+    env.PGSSLMODE = (u.searchParams.get('sslmode') || '').toLowerCase() === 'verify-ca' ? 'verify-ca' : 'verify-full';
+    if (!env.PGSSLROOTCERT) env.PGSSLROOTCERT = 'system'; // the system CA store (libpq 16+), as Node verifies against
   }
   return env;
 }
 
 async function connect(url: string, applicationName: string) {
-  const c = new pg.Client({ connectionString: url.replace(/[?&]sslmode=disable/, ''), application_name: applicationName });
+  // F11: the same TLS policy as the application (tlsConfig): previously the URL went to pg as is, so production's
+  // verified-TLS default and DATABASE_SSLMODE were ignored and the connection could be plaintext.
+  const t = tlsConfig(url);
+  const c = new pg.Client({ connectionString: t.url, ssl: t.ssl, application_name: applicationName });
   c.on('error', () => {}); // a dropped connection surfaces as a rejected query, never as an uncaught exception
   await c.connect();
+  // Fixed text forms, so content checksums are comparable between the source and a restored database.
+  await c.query("SET TIME ZONE 'UTC'; SET DateStyle TO 'ISO, MDY'; SET IntervalStyle TO 'postgres'; SET extra_float_digits TO 1; SET bytea_output TO 'hex'");
   return c;
 }
 
-/** Row counts, schema version and server version, all read by `c` (inside whatever snapshot `c` holds). */
-async function countRows(c: pg.Client): Promise<{ counts: Record<string, number>; schemaVersion: number | null; serverVersion: string }> {
+/** Row counts, content checksums, schema version and server version, all read by `c` (inside whatever snapshot `c` holds). */
+async function countRows(c: pg.Client): Promise<{ counts: Record<string, number>; checksums: Record<string, string>; schemaVersion: number | null; serverVersion: string }> {
   const counts: Record<string, number> = {};
+  const checksums: Record<string, string> = {};
   for (const t of BACKUP_TABLES) {
     const exists = (await c.query('SELECT to_regclass($1) AS r', [`public.${t}`])).rows[0].r;
-    if (exists) counts[t] = Number((await c.query(`SELECT count(*) AS n FROM ${t}`)).rows[0].n);
+    if (!exists) continue;
+    // Order-independent content checksum: md5 of the sorted per-row md5s of each row's text form.
+    const r = (await c.query(`SELECT count(*) AS n, md5(coalesce(string_agg(h, '' ORDER BY h), '')) AS sum FROM (SELECT md5(x::text) AS h FROM ${t} x) s`)).rows[0];
+    counts[t] = Number(r.n);
+    checksums[t] = r.sum;
   }
   const sv = counts.schema_migrations !== undefined ? (await c.query('SELECT max(version) AS v FROM schema_migrations')).rows[0].v : null;
   const ver = (await c.query('SHOW server_version')).rows[0].server_version;
-  return { counts, schemaVersion: sv === null ? null : Number(sv), serverVersion: ver };
+  return { counts, checksums, schemaVersion: sv === null ? null : Number(sv), serverVersion: ver };
 }
 
 export async function rowCounts(url: string) {
@@ -334,6 +356,7 @@ export async function createBackup(databaseUrl: string, cfg: OffsiteConfig, reci
       schemaVersion: before.schemaVersion,
       serverVersion: before.serverVersion,
       rowCounts: before.counts,
+      checksums: before.checksums,
       durationMs: 0,
     };
     await target.put(objectKey, cipherFile, bytes, { sha256 });
@@ -461,7 +484,9 @@ export async function restoreBackup(cfg: OffsiteConfig, name: string, targetUrl:
     }
     const t2 = Date.now();
     const after = await rowCounts(targetUrl);
-    const verified = Object.entries(manifest.rowCounts).every(([t, n]) => after.counts[t] === n);
+    const verified =
+      Object.entries(manifest.rowCounts).every(([t, n]) => after.counts[t] === n) &&
+      Object.entries(manifest.checksums ?? {}).every(([t, sum]) => after.checksums[t] === sum);
     return { name, targetDatabase: new URL(targetUrl).pathname.slice(1), rowCounts: after.counts, expected: manifest.rowCounts, verified, timingsMs: { download: t1 - t0, restore: t2 - t1, total: t2 - t0 } };
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -473,7 +498,8 @@ export interface RestoredDatabaseCheck {
   /** empty: no application tables (safe to restore into). complete: every manifest count matches. mismatch: anything else. */
   state: 'empty' | 'complete' | 'mismatch';
   verified: boolean;
-  differences: Array<{ table: string; expected: number; actual: number | null }>;
+  /** Count differences; contentChanged: equal count but different content checksum (F11). */
+  differences: Array<{ table: string; expected: number; actual: number | null; contentChanged?: true }>;
 }
 
 /**
@@ -487,9 +513,14 @@ export async function verifyRestoredDatabase(cfg: OffsiteConfig, name: string, t
     return { name, state: 'empty', verified: false, differences: Object.entries(manifest.rowCounts).map(([table, expected]) => ({ table, expected, actual: null })) };
   }
   const tables = [...new Set([...Object.keys(manifest.rowCounts), ...Object.keys(now.counts)])].sort();
-  const differences = tables
+  const differences: RestoredDatabaseCheck['differences'] = tables
     .filter((t) => manifest.rowCounts[t] !== now.counts[t])
     .map((table) => ({ table, expected: manifest.rowCounts[table] ?? 0, actual: now.counts[table] ?? null }));
+  for (const [table, sum] of Object.entries(manifest.checksums ?? {})) {
+    if (manifest.rowCounts[table] === now.counts[table] && now.checksums[table] !== sum) {
+      differences.push({ table, expected: manifest.rowCounts[table], actual: now.counts[table], contentChanged: true });
+    }
+  }
   return { name, state: differences.length ? 'mismatch' : 'complete', verified: differences.length === 0, differences };
 }
 

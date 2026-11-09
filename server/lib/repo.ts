@@ -40,7 +40,23 @@ export interface ServerJob {
   billingDefaults?: StoredSubscription;
 }
 
-export type AiSettlement = 'commit' | 'refund';
+/**
+ * How a reservation is settled (review R2, owner decision 2026-11-09):
+ *  * usage:  what the server always uses. Charged iff an attempt was billable, uncertain or is still open (or the row
+ *            was started by the previous release); otherwise refunded. A recorded start alone does not decide it.
+ *  * commit / refund: explicit outcomes for repository callers and maintenance; the request path does not use them.
+ */
+export type AiSettlement = 'commit' | 'refund' | 'usage';
+/**
+ * Outcome of one provider attempt: 'yes' = a response with usage > 0 (billable even if the output was unusable);
+ * 'no' = a successful response that reported 0 usage; 'uncertain' = everything else after invocation (HTTP 4xx/5xx,
+ * timeout, network error, no usage metadata), charged (owner decision 2026-11-09).
+ */
+export interface AiAttemptResult {
+  billable: 'yes' | 'no' | 'uncertain';
+  /** Provider-reported total tokens of this attempt (0 when unknown or not billable). */
+  tokens: number;
+}
 
 export interface QuotaEntry {
   key: string;
@@ -78,6 +94,19 @@ export class ProjectOwnershipError extends Error {
   }
 }
 
+/** Thrown by saveProject({ mustExist: true }) when the project no longer exists (callers answer 404, as for ownership). */
+export class ProjectNotFoundError extends Error {
+  constructor() {
+    super('Project not found');
+    this.name = 'ProjectNotFoundError';
+  }
+}
+export interface SaveProjectOptions {
+  /** The caller is updating a project it read before: refuse (ProjectNotFoundError) instead of re-creating it if it
+   *  was deleted in the meantime (F8). */
+  mustExist?: boolean;
+}
+
 export type UserKind = 'firebase' | 'guest' | 'legacy';
 export function userKindOf(userId: string): UserKind {
   if (userId.startsWith('guest_')) return 'guest';
@@ -94,8 +123,11 @@ export interface Repo {
   listProjects(userId: string): Promise<any[]>;
   listAllProjects(limit: number): Promise<{ projects: any[]; unreadable: number }>;
   getProject(id: string): Promise<{ project: any; ownerId: string } | null>;
-  /** Insert or replace. Throws ProjectOwnershipError if the id belongs to another user, StoreLimitError on quota. */
-  saveProject(userId: string, project: any): Promise<void>;
+  /**
+   * Insert or replace. Throws ProjectOwnershipError if the id belongs to another user (enforced inside the write itself,
+   * also under concurrency), ProjectNotFoundError if opts.mustExist and the project is gone, StoreLimitError on quota.
+   */
+  saveProject(userId: string, project: any, opts?: SaveProjectOptions): Promise<void>;
   deleteProject(ownerId: string, id: string): Promise<boolean>;
 
   // ---- subscriptions ----
@@ -110,11 +142,22 @@ export interface Repo {
    */
   reserveAi(entries: QuotaEntry[], day: number, reservationId: string): Promise<{ ok: true } | { ok: false; key: string }>;
   /**
-   * Settles a reservation exactly once: 'commit' keeps the charge, 'refund' returns it. Settling an already
-   * settled (or unknown) reservation is a no-op, so retries can never double-refund.
+   * Settles a reservation exactly once ('usage', or explicit 'commit' / 'refund'; see AiSettlement). Settling an
+   * already settled (or unknown) reservation is a no-op, so retries can never double-refund.
    */
   settleAi(reservationId: string, outcome: AiSettlement): Promise<'settled' | 'already_settled'>;
-  /** Refunds reservations left open longer than ttlMs (crashed request, failed settle). Returns how many. */
+  /**
+   * Durably records that a provider attempt begins (review R1/R2), BEFORE the provider is called. Only while the
+   * reservation is open; false means the attempt must NOT be made (already settled).
+   */
+  beginAiAttempt(reservationId: string): Promise<boolean>;
+  /** Records the outcome of an attempt begun with beginAiAttempt. Accounting only; never changes a settled charge. */
+  endAiAttempt(reservationId: string, result: AiAttemptResult): Promise<void>;
+  /**
+   * Settles reservations left open longer than ttlMs (crashed request, failed settle) by usage: an attempt still open
+   * at the crash, or one with an unknown outcome, is charged; no attempt or only non-billable ones are refunded.
+   * Returns how many were settled.
+   */
   expireAiReservations(ttlMs: number): Promise<number>;
   peekAi(key: string, day: number): Promise<number>;
 

@@ -122,6 +122,12 @@ jobs:
           echo "no TRUST_PROXY -> $c1 ; no DATABASE_URL/STORAGE_BACKEND -> $c2 ; no TURNSTILE_SECRET -> $c3"
           test "$c1" = 1 && test "$c2" = 1 && test "$c3" = 1
           grep -q 'TURNSTILE_SECRET is required' captcha.log
+      - name: Restore guard in the container (D2)
+        run: bash scripts/ci/docker-restore-guard.sh
+      - name: Stopping Node also stops its ffmpeg renders (D7)
+        # independent of D2: runs even if the restore-guard step failed (the job still fails)
+        if: ${{ !cancelled() }}
+        run: bash scripts/ci/docker-ffmpeg-termination.sh
       - name: Backup image has the required tools
         run: |
           docker run --rm --entrypoint sh forge-backup:ci -c 'pg_dump --version && pg_restore --version && psql --version && age --version && node --version'

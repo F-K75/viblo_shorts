@@ -2,9 +2,11 @@
 // PostgreSQL backend (R-02):
 //  * reserve(entries, id) is a synchronous all-or-nothing check-and-increment, so concurrent requests in this
 //    process cannot exceed a limit (no await between check and increment). Idempotent per id.
-//  * settle(id, 'commit' | 'refund') happens exactly once; a repeated settle is a no-op (no double refund).
-//  * open reservations are persisted, and expire() refunds those never settled (crash, failed settle), so a
-//    failed request cannot consume quota permanently.
+//  * settle(id, 'usage' | 'commit' | 'refund') happens exactly once; a repeated settle is a no-op (no double refund).
+//  * beginAttempt(id) / endAttempt(id, result) record every provider attempt (review R2); beginAttempt is written to
+//    disk synchronously before the provider is called (review R1). 'usage' charges iff an attempt was billable,
+//    uncertain or is still open (or the reservation was started by the previous release); otherwise it refunds.
+//  * open reservations are persisted, and expire() settles those never settled (crash, failed settle) by usage.
 // Counts and open reservations are flushed to usage.json (debounced, and on shutdown) and reloaded at boot.
 // A corrupt usage.json is never overwritten: the ledger fails closed (AI endpoints answer 503).
 import { readJsonFile, writeJsonFileAtomic, StoreUnavailableError } from './storage.ts';
@@ -13,6 +15,10 @@ interface OpenReservation {
   keys: string[];
   day: number;
   at: number;
+  /** F10: when the first provider attempt began (persisted, so crash recovery knows a call may have run). */
+  started?: number;
+  /** Review R2: provider attempts (absent on reservations written by the previous release). */
+  attempts?: { total: number; open: number; billable: number; uncertain: number; tokens: number };
 }
 interface UsageFile {
   v: 1 | 2;
@@ -86,15 +92,62 @@ export class UsageLedger {
     return { ok: true };
   }
 
-  /** Settles a reservation exactly once. Unknown or already-settled ids are a no-op. */
-  settle(id: string, outcome: 'commit' | 'refund'): 'settled' | 'already_settled' {
+  /**
+   * Review R1/R2: records that a provider attempt begins, only while the reservation is open. Written to disk NOW,
+   * before the caller invokes the provider: with the debounced flush a crash in the next second lost the start and
+   * recovery refunded a call that may have run. If the write fails, the attempt is undone and refused (no provider
+   * call without a durable record).
+   */
+  beginAttempt(id: string): boolean {
+    this.assertAvailable();
+    const r = this.open.get(id);
+    if (!r) return false;
+    const prev = { started: r.started, attempts: r.attempts ? { ...r.attempts } : undefined };
+    r.started ??= Date.now();
+    const a = (r.attempts ??= { total: 0, open: 0, billable: 0, uncertain: 0, tokens: 0 });
+    a.total++;
+    a.open++;
+    this.dirty = true;
+    try {
+      this.writeNow();
+    } catch (err: any) {
+      if (prev.started === undefined) delete r.started;
+      if (prev.attempts) r.attempts = prev.attempts;
+      else delete r.attempts;
+      console.error(JSON.stringify({ level: 'error', event: 'usage_attempt_not_persisted', error: String(err?.message || err) }));
+      return false;
+    }
+    return true;
+  }
+
+  /** Review R2: the outcome of an attempt. Accounting only; a settled reservation is already decided (no-op). */
+  endAttempt(id: string, result: { billable: 'yes' | 'no' | 'uncertain'; tokens: number }) {
+    const a = this.open.get(id)?.attempts;
+    if (!a) return;
+    a.open = Math.max(0, a.open - 1);
+    if (result.billable === 'yes') {
+      a.billable++;
+      a.tokens += Math.max(0, Math.floor(result.tokens) || 0);
+    } else if (result.billable === 'uncertain') a.uncertain++;
+    this.markDirty();
+  }
+
+  /**
+   * Settles a reservation exactly once. Unknown or already-settled ids are a no-op. 'usage' (review R2): charged iff an
+   * attempt was billable, uncertain or is still open, or the reservation was started without attempt records (the
+   * previous release); otherwise refunded.
+   */
+  settle(id: string, outcome: 'commit' | 'refund' | 'usage'): 'settled' | 'already_settled' {
     this.assertAvailable();
     const r = this.open.get(id);
     if (!r) return 'already_settled';
     this.open.delete(id);
     this.settled.add(id);
     if (this.settled.size > 50000) this.settled.clear(); // bounded; ids are random, re-use is not expected
-    if (outcome === 'refund' && r.day === utcDay()) {
+    const a = r.attempts;
+    const chargedByUsage = a ? a.billable > 0 || a.uncertain > 0 || a.open > 0 : r.started !== undefined;
+    const refund = outcome === 'refund' || (outcome === 'usage' && !chargedByUsage);
+    if (refund && r.day === utcDay()) {
       // a reservation from a previous day was never counted in today's totals
       for (const k of r.keys) {
         const v = (this.counts.get(k) || 0) - 1;
@@ -106,14 +159,14 @@ export class UsageLedger {
     return 'settled';
   }
 
-  /** Refunds reservations left open longer than ttlMs. */
+  /** Settles reservations left open longer than ttlMs by usage (review R2). */
   expire(ttlMs: number): number {
     if (this.unavailableReason) return 0;
     const cutoff = Date.now() - ttlMs;
     let n = 0;
     for (const [id, r] of [...this.open]) {
       if (r.at < cutoff) {
-        this.settle(id, 'refund');
+        this.settle(id, 'usage');
         n++;
       }
     }
@@ -133,16 +186,21 @@ export class UsageLedger {
     }
   }
 
+  /** Writes the whole ledger synchronously (atomic rename); throws on failure. */
+  private writeNow() {
+    writeJsonFileAtomic(
+      this.file,
+      { v: 2, day: this.day, counts: Object.fromEntries(this.counts), reservations: Object.fromEntries(this.open) } satisfies UsageFile,
+      0,
+    );
+    this.dirty = false;
+  }
+
   /** Writes the ledger now. Never writes over a file that failed to load. */
   flush() {
     if (!this.dirty || this.unavailableReason) return;
     try {
-      writeJsonFileAtomic(
-        this.file,
-        { v: 2, day: this.day, counts: Object.fromEntries(this.counts), reservations: Object.fromEntries(this.open) } satisfies UsageFile,
-        0,
-      );
-      this.dirty = false;
+      this.writeNow();
     } catch (err: any) {
       console.error(JSON.stringify({ level: 'error', event: 'usage_flush_failed', error: String(err?.message || err) }));
     }

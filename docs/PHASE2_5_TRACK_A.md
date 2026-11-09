@@ -1,6 +1,6 @@
 # Phase 2.5 Track A: guest registration protection (R-03)
 
-Status: **implemented on branch `claude/keen-feynman-xtbvz2-track-a`; awaiting the owner's review. Not merged.**
+Status: **MERGED** with owner approval (PR #6 → `main` @ `6ee9c11`, 2026-11-03); post-merge CI run 38 green; **Track A closed.**
 This is evidence for review, not a release claim. Forge Studio remains **not release-ready** (R-01 open).
 
 Approved scope: signup baseline, server-side Turnstile, one-time replay-resistant tokens across instances,

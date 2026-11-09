@@ -5,9 +5,11 @@
 //  * rate limits: token buckets computed with the database clock (consistent across instances)
 //  * jobs: FOR UPDATE SKIP LOCKED claim, worker heartbeats, reaper for dead workers
 import { StoreLimitError, type StoreLimits } from '../lib/projectStore.ts';
-import { ProjectOwnershipError, userKindOf, type AdmissionContext, type AiSettlement, type HeartbeatResult, type JobAdmission, type JobDenial, type QuotaEntry, type ReapResult, type Repo, type WindowEntry, STATS_RETENTION_WINDOWS, type ServerJob, type StoredSubscription } from '../lib/repo.ts';
+import { ProjectNotFoundError, ProjectOwnershipError, userKindOf, type SaveProjectOptions, type AdmissionContext, type AiSettlement, type AiAttemptResult, type HeartbeatResult, type JobAdmission, type JobDenial, type QuotaEntry, type ReapResult, type Repo, type WindowEntry, STATS_RETENTION_WINDOWS, type ServerJob, type StoredSubscription } from '../lib/repo.ts';
 import { LOCKS, withTx, type Db, type Tx } from './pool.ts';
 
+/** Advisory-lock class for per-project-id locks (two-key form; distinct from the single-key LOCKS in pool.ts). */
+const PROJECT_ID_LOCK_CLASS = 7311;
 const dayDate = (day: number) => new Date(day * 86400000).toISOString().slice(0, 10);
 const iso = (v: any) => (v instanceof Date ? v.toISOString() : v ?? undefined);
 
@@ -72,7 +74,7 @@ export class PostgresRepo implements Repo {
     return rows[0] ? { project: rows[0].doc, ownerId: rows[0].user_id } : null;
   }
 
-  async saveProject(userId: string, project: any) {
+  async saveProject(userId: string, project: any, opts: SaveProjectOptions = {}) {
     const L = this.limits;
     const body = JSON.stringify(project);
     const size = Buffer.byteLength(body);
@@ -85,8 +87,13 @@ export class PostgresRepo implements Repo {
     await withTx(this.db, async (tx) => {
       await ensureUser(tx, userId);
       const u = (await tx.query('SELECT storage_bytes, project_count FROM users WHERE id = $1 FOR UPDATE', [userId])).rows[0];
+      // F8: serialize every save of this project id, whichever user sends it. A row lock cannot do this for an id
+      // that does not exist yet, so two users (or two tabs) could both see "new" and race into the upsert. Lock order:
+      // users row -> this id lock (one per transaction), so it cannot deadlock.
+      await tx.query('SELECT pg_advisory_xact_lock($1, hashtext($2))', [PROJECT_ID_LOCK_CLASS, project.id]);
       const existing = (await tx.query('SELECT user_id, size_bytes FROM projects WHERE id = $1 FOR UPDATE', [project.id])).rows[0];
       if (existing && existing.user_id !== userId) throw new ProjectOwnershipError();
+      if (opts.mustExist && !existing) throw new ProjectNotFoundError();
       const delta = size - (existing?.size_bytes ?? 0);
       const countDelta = existing ? 0 : 1;
       const maxProjects = guest ? L.guestMaxProjects : L.userMaxProjects;
@@ -109,12 +116,16 @@ export class PostgresRepo implements Repo {
           if (delta > 0 && Number(g.bytes) > L.guestPoolMaxBytes) throw new StoreLimitError(507, 'guest_storage_full', 'Guest storage is temporarily full. Sign up for an account to keep saving projects.');
         }
       }
-      await tx.query(
+      // Defence in depth: the write itself only ever touches this user's row. Zero rows written means the id belongs
+      // to someone else; throwing rolls back every counter change above.
+      const written = await tx.query(
         `INSERT INTO projects (id, user_id, title, doc, size_bytes, created_at, updated_at)
          VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7)
-         ON CONFLICT (id) DO UPDATE SET title = EXCLUDED.title, doc = EXCLUDED.doc, size_bytes = EXCLUDED.size_bytes, updated_at = EXCLUDED.updated_at`,
+         ON CONFLICT (id) DO UPDATE SET title = EXCLUDED.title, doc = EXCLUDED.doc, size_bytes = EXCLUDED.size_bytes, updated_at = EXCLUDED.updated_at
+         WHERE projects.user_id = EXCLUDED.user_id`,
         [project.id, userId, String(project.title || ''), body, size, project.createdAt, project.updatedAt],
       );
+      if (!written.rowCount) throw new ProjectOwnershipError();
       await tx.query('UPDATE users SET storage_bytes = GREATEST(0, storage_bytes + $2), project_count = project_count + $3 WHERE id = $1', [userId, delta, countDelta]);
     });
   }
@@ -201,13 +212,21 @@ export class PostgresRepo implements Repo {
 
   async settleAi(reservationId: string, outcome: AiSettlement): Promise<'settled' | 'already_settled'> {
     return withTx(this.db, async (tx) => {
-      // Conditional transition: only an open reservation can be settled, so a duplicate/retried settle is a no-op.
+      // Conditional transition: only an open reservation can be settled, so a duplicate/retried settle is a no-op and
+      // there is exactly one final outcome. 'usage' (review R2) decides on the row itself, in the same statement, so it
+      // cannot race an attempt beginning or ending: charged iff an attempt was billable or uncertain, an attempt is
+      // still open (outcome unknown), or the row was started by the previous release (started_at, no attempt records).
       const r = await tx.query(
-        `UPDATE ai_reservations SET status = $2, settled_at = now() WHERE id = $1 AND status = 'reserved' RETURNING day, keys`,
-        [reservationId, outcome === 'commit' ? 'committed' : 'refunded'],
+        `UPDATE ai_reservations SET settled_at = now(),
+           status = CASE WHEN $2 = 'commit' THEN 'committed' WHEN $2 = 'refund' THEN 'refunded'
+                         WHEN billable_attempts > 0 OR uncertain_attempts > 0 OR attempts_open > 0
+                              OR (started_at IS NOT NULL AND attempts_total = 0) THEN 'committed'
+                         ELSE 'refunded' END
+         WHERE id = $1 AND status = 'reserved' RETURNING day, keys, status`,
+        [reservationId, outcome],
       );
       if (r.rowCount === 0) return 'already_settled' as const;
-      if (outcome === 'refund') {
+      if (r.rows[0].status === 'refunded') {
         const { day, keys } = r.rows[0];
         for (const key of [...(keys as string[])].sort()) {
           await tx.query('UPDATE ai_usage_daily SET count = GREATEST(0, count - 1) WHERE day = $1 AND key = $2', [day, key]);
@@ -217,15 +236,38 @@ export class PostgresRepo implements Repo {
     });
   }
 
+  async beginAiAttempt(reservationId: string) {
+    // Committed (autocommit) before the caller invokes the provider: a crash from here on finds an open attempt.
+    const r = await this.db.query(
+      `UPDATE ai_reservations SET started_at = coalesce(started_at, now()), attempts_total = attempts_total + 1, attempts_open = attempts_open + 1
+       WHERE id = $1 AND status = 'reserved' RETURNING 1`,
+      [reservationId],
+    );
+    return (r.rowCount ?? 0) > 0;
+  }
+
+  async endAiAttempt(reservationId: string, result: AiAttemptResult) {
+    // Accounting only (also after settlement, so the audit columns stay complete); the charge was decided at settlement.
+    await this.db.query(
+      `UPDATE ai_reservations SET attempts_open = GREATEST(0, attempts_open - 1),
+         billable_attempts = billable_attempts + $2, uncertain_attempts = uncertain_attempts + $3, billable_tokens = billable_tokens + $4
+       WHERE id = $1`,
+      [reservationId, result.billable === 'yes' ? 1 : 0, result.billable === 'uncertain' ? 1 : 0, result.billable === 'yes' ? Math.max(0, Math.floor(result.tokens) || 0) : 0],
+    );
+  }
+
   async expireAiReservations(ttlMs: number) {
-    // SKIP LOCKED: a reservation being settled right now by its request is left alone (no lock wait, no double settle).
+    // The SELECT runs in autocommit, so its row locks are released immediately. Correctness does not depend on them:
+    // settleAi is a conditional open -> settled transition, so a reservation that its request settles concurrently is
+    // settled exactly once. Stale reservations are settled by usage (review R2): an attempt open at the crash or with
+    // an unknown outcome is charged; no attempt, or only non-billable ones, are refunded.
     const { rows } = await this.db.query(
       `SELECT id FROM ai_reservations WHERE status = 'reserved' AND created_at < now() - ($1::int * interval '1 millisecond')
        ORDER BY created_at LIMIT 500 FOR UPDATE SKIP LOCKED`,
       [Math.max(1, Math.floor(ttlMs))],
     );
     let n = 0;
-    for (const { id } of rows) if ((await this.settleAi(id, 'refund')) === 'settled') n++;
+    for (const { id } of rows) if ((await this.settleAi(id, 'usage')) === 'settled') n++;
     return n;
   }
 
