@@ -179,6 +179,7 @@ describe('Review R6 (postgres): migration 0006 on a real version-5 database', { 
 
     // 2a. interruption: the table is busy; the migration's lock timeout fires -> nothing applied
     const blocker = new pg.Client({ connectionString: db.url });
+    blocker.on('error', () => {}); // ended by the test; never an uncaught error during cleanup
     await blocker.connect();
     await blocker.query('BEGIN');
     await blocker.query('LOCK TABLE ai_reservations IN ACCESS SHARE MODE');
@@ -189,13 +190,26 @@ describe('Review R6 (postgres): migration 0006 on a real version-5 database', { 
     // 2b. interruption: the migrating PROCESS is killed while its ALTER waits for the lock
     const runner = path.join(v5dir, '..', `d1r-mig-${process.pid}.mts`);
     fs.writeFileSync(runner, `import { createPool } from ${JSON.stringify(path.join(ROOT, 'server/db/pool.ts'))};\nimport { migrate } from ${JSON.stringify(path.join(ROOT, 'server/db/migrate.ts'))};\nawait migrate(createPool(process.env.MIG_URL!, { applicationName: 'r6-killed-migration' }), undefined, { lockTimeoutMs: 120000 });\n`);
-    const child = spawn(process.execPath, ['--import', 'tsx', runner], { cwd: ROOT, env: { ...process.env, MIG_URL: db.url }, stdio: 'ignore' });
+    const child = spawn(process.execPath, ['--import', 'tsx', runner], { cwd: ROOT, env: { ...process.env, MIG_URL: db.url }, stdio: ['ignore', 'ignore', 'pipe'] });
+    let childErr = '';
+    child.stderr!.on('data', (d) => (childErr += d));
     let waiting = false;
-    for (let i = 0; i < 200 && !waiting; i++) {
+    // up to 60 s: a fresh tsx process under a parallel test suite can take several seconds to start
+    for (let i = 0; i < 1200 && !waiting && child.exitCode === null; i++) {
       await new Promise((r) => setTimeout(r, 50));
-      waiting = Number((await q("SELECT count(*) AS n FROM pg_stat_activity WHERE application_name = 'r6-killed-migration' AND wait_event_type = 'Lock' AND query ILIKE '%ALTER TABLE ai_reservations%'")).rows[0].n) === 1;
+      // the killed-to-be session holds an UNGRANTED lock on ai_reservations (its ALTER waits for the blocker). Matched on
+      // pg_locks, not on the query text (pg_stat_activity.query is truncated to track_activity_query_size).
+      waiting =
+        Number(
+          (
+            await q(
+              "SELECT count(*) AS n FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid WHERE a.application_name = 'r6-killed-migration' AND NOT l.granted AND l.relation = 'ai_reservations'::regclass",
+            )
+          ).rows[0].n,
+        ) === 1;
     }
-    assert.ok(waiting, 'the migration is inside its transaction, waiting on the ALTER');
+    if (!waiting) child.kill('SIGKILL');
+    assert.ok(waiting, `the migration is inside its transaction, waiting on the ALTER (child exit ${child.exitCode}; stderr: ${childErr.slice(-500)})`);
     child.kill('SIGKILL');
     await new Promise((r) => child.once('exit', r));
     await blocker.query('COMMIT'); // the lock is released: the orphaned backend may now run the ALTER, but can never COMMIT
