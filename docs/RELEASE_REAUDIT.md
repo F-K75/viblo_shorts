@@ -1,6 +1,70 @@
 # Forge Studio — Independent Re-audit + Corrective Round
 
-## Phase 2.5 Track D-1, second review pass (2026-11-09): HOLD, awaiting the owner's final review (F-K75/viblo_shorts#7, NOT merged)
+## Phase 2.5 Track D-1: MERGED (PR #7 → `main` @ `39f2000`, 2026-11-09)
+* **Merged by the owner** (`F-K75`) on 2026-11-09 at 14:52:42 UTC, as merge commit
+  `39f20005c9cd0227eb2d6334e9f15e1637cb7074`.
+* **Parents:**
+  * `6ee9c11f6ed58e2cee8816a187a5bf3f3126550c`: the previous `main` (Track A merge);
+  * `6b39e4bb171e79d8c631de0d5aa5e2b933316eeb`: the reviewed D-1 head, the final head of the second review pass.
+* **Tree equivalence.** The merge commit's tree is identical to the reviewed head's tree (`bdfa72e1…`;
+  `git diff 6b39e4b 39f2000` is empty). No code beyond the reviewed head entered `main`.
+* **Pre-merge CI on the reviewed head:** run 59 (`6b39e4b`) and run 56 (`7e09960`, the final code commit). Both
+  green, every job's log read.
+* **Post-merge CI, run 60** (`42638978970`, `push` to `main` @ `39f2000`): **green, every job's log read.**
+
+| Job | Result (from the log) |
+|---|---|
+| `test`: JSON suite | 287 tests, 285 pass, **0 fail**, 0 cancelled, 2 skipped |
+| `test`: every server on PostgreSQL | 287 tests, 278 pass, **0 fail**, 0 cancelled, 9 skipped |
+| `test`: build, E2E, audit | build passes; E2E JSON 2/2, PostgreSQL 2/2; `bun audit --audit-level=high`: "No vulnerabilities found (checked 389 packages, 2 below --audit-level=high, 1 ignored)"; no failing test line in the fetched log, which is capped at 5 000 lines |
+| `test`: E2E step's throwaway Playwright install | npm prints "5 vulnerabilities (1 moderate, 4 high)" (D9) |
+| `docker` (2 264 lines, 0 `##[error]`) | migrations `0001`–`0006` applied (`"version":6`); production refuses unsafe configuration (exit 1 each). **D2:** restore exit 137, app exit 1, "volume unchanged by the refused start (11 files, sha256 identical)", `"state": "rolled-back"`, "D2 PASSED". **D7:** "ff-normal PASSED … no orphan", "ff-forced PASSED … no orphan", "D7 PASSED". |
+| `live-llm` | runs on `push` and is **green with 0 live tests**: both tests skipped, "GEMINI_API_KEY not set … (NOT passed)". **Not live validation.** |
+
+* **Skips:**
+  * 2 live Gemini tests per backend (no `GEMINI_API_KEY`);
+  * 7 JSON-only tests on PostgreSQL;
+  * no D-1 test.
+* **The merge is not authorization for further work.** D-2 and Track E each need separate approval. Production
+  deployment is not approved.
+
+### Release position after Tracks C, B, A and D-1 (production release NOT approved)
+| Track | State |
+|---|---|
+| C, memory protection (R-13) | merged (`53fc724`) |
+| B, render queue and billing (R-04, F7) | merged (`80e02b5`) |
+| A, guest registration protection (R-03) | merged (`6ee9c11`) |
+| D-1, security and data hardening (F8–F11, D6, D2, D7; review items R1–R6) | **merged (`39f2000`)** |
+| D-2 (D1, D3, D5, D8, D9, D10) | **not started; not authorized** |
+| E, live Gemini validation (R-01) | **not started; not authorized** |
+
+**Remaining release blockers and requirements:**
+1. **R-01, live Gemini validation.** CI's `live-llm` passes with 0 live tests; there is no real-model evidence
+   (Track E).
+2. **D8:** the intermittent `write EPIPE` in the Track C upload test (test stability).
+3. **D9:** the vulnerabilities reported by the throwaway Playwright install in CI (1 moderate, 4 high).
+4. **D10:** CI database and disk headroom. Symptoms: the F1 write-storm failures in runs 46 and 52 (test fixed); the
+   connection peak of 92 of 100 measured in Track A.
+5. **Production readiness:** deployment, an operational restore and recovery drill on the target infrastructure, and
+   monitoring and alerting. No AWS provisioning is authorized.
+6. **Earlier pre-launch requirements still apply:**
+   * Turnstile go-live (widget and secret, plus one live check);
+   * legal review of the privacy policy;
+   * the hard-ceiling proposal after 14 days of traffic.
+
+**Accepted risks carried into `main` (owner decisions of 2026-11-09):**
+* Uncertain provider outcomes, including HTTP 4xx/5xx, are charged. During a provider outage, failed calls consume
+  users' daily AI quota.
+* Track A refusal-stat writes share the database pool with signups. Accepted temporarily; isolation is a later
+  workstream.
+
+**Residual:**
+* F9: live writes wait during `migrate`, so the runbook write freeze is required.
+* `PGSSLROOTCERT=system` needs libpq 16 or later.
+
+---
+
+## Phase 2.5 Track D-1, second review pass (2026-11-09), recorded before the merge (merged afterwards; see above)
 * **Status.** The first review of `614c56b` was HOLD. The owner's decisions and evidence requests of 2026-11-09 are now
   implemented. Merge, D-2, deployment and production release are **not** authorized.
 * **Evidence:** `docs/PHASE2_5_TRACK_D1.md` §13.
@@ -52,7 +116,7 @@
 | D8 EPIPE flake; D9 Playwright install vulnerabilities | open | open (D-2) |
 | R-01 live Gemini validation | release blocker | release blocker (Track E) |
 
-## Phase 2.5 Track D-1 (F8, F9, F10, F11, D6, D2, D7): first review (superseded in part by the second pass above), NOT merged
+## Phase 2.5 Track D-1 (F8, F9, F10, F11, D6, D2, D7): first review, recorded before the merge (superseded in part by the second pass above)
 * **Evidence:** `docs/PHASE2_5_TRACK_D1.md`. Base: `main` @ `6ee9c11` plus `14c1438`. Head: the commit after `a5a4093` (docs
   only). D-2 has not been started. Passing CI is not merge approval and not release approval.
 * **Fixed, each red-first on `6ee9c11`:**
@@ -133,7 +197,7 @@
 | C, memory protection (R-13) | merged (`53fc724`) |
 | B, render queue and billing (R-04, F7) | merged (`80e02b5`) |
 | A, guest registration protection (R-03) | merged (`6ee9c11`), closed |
-| D, operational hardening | authorized; D-1 on HOLD after the second review pass (F-K75/viblo_shorts#7); D-2 not authorized |
+| D, operational hardening | D-1 merged (`39f2000`); D-2 not authorized |
 | E, live Gemini validation (R-01) | not started; needs authorization |
 
 **Open release blockers and pre-launch requirements:**
