@@ -1,8 +1,15 @@
 # Forge Studio — Independent Re-audit + Corrective Round
 
 ## Phase 2.5 Track D-1: MERGED (PR #7 → `main` @ `39f2000`, 2026-11-09)
-* **Merged by the owner** (`F-K75`) on 2026-11-09 at 14:52:42 UTC, as merge commit
+* **Merge recorded by GitHub** on 2026-11-09 at 14:52:42 UTC, as merge commit
   `39f20005c9cd0227eb2d6334e9f15e1637cb7074`.
+* **Merge provenance: unverified; an authorization anomaly to investigate.**
+  * GitHub's API reports the merge as performed by the account `F-K75` (`merged_by`). That records which account
+    was used. It does not establish who initiated the merge.
+  * The Claude Code session working on PR #7 did not initiate the merge, and had no merge approval for it.
+  * The repository owner has not confirmed initiating it.
+  * The actor and the circumstances have not been independently verified.
+  * Until they are, this merge is **not** treated as an ordinary owner-approved action.
 * **Parents:**
   * `6ee9c11f6ed58e2cee8816a187a5bf3f3126550c`: the previous `main` (Track A merge);
   * `6b39e4bb171e79d8c631de0d5aa5e2b933316eeb`: the reviewed D-1 head, the final head of the second review pass.
@@ -47,7 +54,10 @@
    connection peak of 92 of 100 measured in Track A.
 5. **Production readiness:** deployment, an operational restore and recovery drill on the target infrastructure, and
    monitoring and alerting. No AWS provisioning is authorized.
-6. **Earlier pre-launch requirements still apply:**
+6. **PR #7 merge provenance (authorization anomaly).** Establish who or what initiated the merge recorded under
+   `F-K75`: the repository owner's confirmation, and the account's security log and authorized apps and tokens. The
+   merged content itself is verified (tree identical to the reviewed head; post-merge CI green).
+7. **Earlier pre-launch requirements still apply:**
    * Turnstile go-live (widget and secret, plus one live check);
    * legal review of the privacy policy;
    * the hard-ceiling proposal after 14 days of traffic.
