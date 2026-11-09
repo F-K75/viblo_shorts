@@ -653,22 +653,54 @@ confirmed from the log.
    (outside `BACKUP_TABLES`, so verification is unaffected). `pg_dump` plus `age` now take long enough on any machine.
    Locally: 1 778–2 181 writes during the backup, and 3 of 3 runs of the file pass (17/17).
 
-### 13.9 Local gate
-| Check | Result |
+### 13.9 Final local gate (`7e09960`, the final code commit; every later commit is docs only)
+| Check | JSON | PostgreSQL |
+|---|---|---|
+| D-1 regression tests: `tests/track_d1.test.ts` + `tests/track_d1_review.test.ts` (33 tests), run 1 | 33/33 | 33/33 |
+| run 2 | 33/33 | 33/33 |
+| run 3 | 33/33 | 33/33 |
+| Full suite (287 tests) | 285 pass, **0 fail**, 0 cancelled, 2 skipped | 278 pass, **0 fail**, 0 cancelled, 9 skipped |
+| Build (`tsc` ×2, `vite build`) | passes | passes |
+| Browser E2E (Playwright) | 2/2 | 2/2 |
+| F1 backup test file (after `7e09960`), 3 runs | 17/17 ×3 (PostgreSQL); 1 778–2 181 writes during each backup | |
+
+**Skipped tests:**
+* Both backends: 2 live Gemini tests (`GEMINI_API_KEY` not set; reported as **not passed**). This is release blocker
+  R-01 (Track E).
+* PostgreSQL only: 7 JSON-backend-specific tests (file corruption, volume snapshots, legacy store). Their PostgreSQL
+  equivalents are in `tests/phase2.test.ts`.
+* No D-1 test is skipped.
+
+### 13.10 CI
+**Run 56** (`42619783126`) on `7e09960`, the final code commit: **green; every job's log was read.**
+
+| Job | Result (from the log) |
 |---|---|
-| `tests/track_d1.test.ts` (27 tests) ×3 on `c776e33` | JSON 27/27, 27/27, 27/27; PostgreSQL 27/27, 27/27, 27/27 |
-| `tests/track_d1_review.test.ts` (6 tests) ×3 on `378d028` | JSON 6/6 ×3; PostgreSQL 6/6 ×3 |
-| Full JSON suite, `c776e33` | 281 tests, 279 pass, **0 fail**, 0 cancelled, 2 skipped |
-| Full PostgreSQL suite, `c776e33` | 281 tests, 272 pass, **0 fail**, 0 cancelled, 9 skipped |
-| Build, `c776e33` | passes |
-| Browser E2E, `c776e33` | JSON 2/2; PostgreSQL 2/2 |
-| Full suites on the final head (`fa9b618`) | _pending (running)_ |
+| `test` | **JSON suite:** 287 tests, 285 pass, 0 fail, 0 cancelled, 2 skipped. **PostgreSQL suite:** 287 tests, 278 pass, 0 fail, 0 cancelled, 9 skipped. Every D-1 test passed (R1, R2 server and concurrency, R4 TLS downgrade, R6 migration), and so did F1 (write storm). Build passes. **E2E:** 2/2 and 2/2. **Audit:** "No vulnerabilities found (checked 389 packages, 2 below --audit-level=high, 1 ignored)". The throwaway Playwright install prints "5 vulnerabilities (1 moderate, 4 high)" (D9). The fetched log is capped at 5 000 lines; checkout, install and typecheck are evidenced by step status only. |
+| `docker` | 2 280 lines, 0 `##[error]`. Migrations `0001`–**`0006`** applied (`"version":6`). Production refuses unsafe configuration (exit 1 each). **D2 on schema 6:** restore exit 137, app exit 1, "volume unchanged by the refused start (11 files, sha256 identical)", `"state": "rolled-back"`, "D2 PASSED". **D7:** "ff-normal PASSED … no orphan", "ff-forced PASSED … no orphan", "D7 PASSED". Backup image: `pg_dump` 17.11. |
+| `live-llm` | skipped on pull requests: **0 live tests**, not live validation |
 
-Skips are unchanged from §11: 2 live Gemini tests (no `GEMINI_API_KEY`, **not passed**), and 7 JSON-only tests on
-PostgreSQL.
+**Earlier runs in this pass:**
 
-### 13.10 CI on the final head
-_Pending: CI run 51 on `fa9b618` (code head) and the run on the final docs head; every job log will be read._
+| Run | Head | Result |
+|---|---|---|
+| 46 | `fa88a9e` | **failed**: F1 precondition (2 writes); see §13.8 |
+| 47 | `b9a610c` | green |
+| 48 | `2c7b74a` | green |
+| 49 | `6db5dbd` | green |
+| 50 | `378d028` | green |
+| 51 | `fa9b618` | green |
+| 52 | `e4eb1e0` | **failed**: F1 overlap check (0 writes during the backup); fixed in `7e09960` |
+| 53 | `9e9d00a` | still in progress when this was written |
+| 54 | `779a5fa` (includes the conservative F10 policy, `16e52fb` + `d19a521`) | green |
+| 55 | `4346c82` | green |
+| **56** | **`7e09960`** (final code) | **green**, every job's log read (above) |
+
+Commits pushed together have no run of their own: GitHub runs only the last commit of each push. This applies to
+`16e52fb`, `d19a521` and `7f345e2`; their code is included in later green runs.
+
+The docs-only commits after `7e09960` have their own runs. The run on the exact final head is reported in the PR
+description and to the owner, because it cannot be recorded in the commit it tests.
 
 ### 13.11 Risks after the second pass
 * **Accepted (owner):**
