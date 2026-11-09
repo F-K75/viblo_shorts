@@ -4,14 +4,18 @@
 * **Merged by the repository owner** on 2026-11-09 at 14:52:42 UTC (20:22:41 IST), as merge commit
   `39f20005c9cd0227eb2d6334e9f15e1637cb7074`.
 * **Merge provenance:**
-  * GitHub records `merged_by: F-K75`. The merge commit carries GitHub's default title ("Merge pull request #7 from
-    F-K75/claude/keen-feynman-xtbvz2-track-d1"), which GitHub uses when the merge sets none (for example, the web
-    merge button).
-  * The owner confirmed on 2026-11-09 that they merged PR #7 themselves.
-  * The Claude Code session did not initiate the merge. This session's transcript has merge calls only for PRs #2–#6,
-    each made with the owner's explicit approval, and no auto-merge call.
-  * For a while, before the owner's confirmation, this provenance was treated as unverified and recorded as a
-    possible authorization anomaly (PR #8 review). It is resolved: an owner-initiated merge of the reviewed head.
+  * GitHub records `merged_by: F-K75`. This identifies the account recorded for the merge, not by itself the
+    individual who initiated it.
+  * The merge commit carries GitHub's standard pull-request merge title ("Merge pull request #7 from
+    F-K75/claude/keen-feynman-xtbvz2-track-d1"). This does not establish the initiating actor or mechanism.
+  * **Source of attribution.** On 2026-11-09 the Claude Code session asked the repository owner directly: "Did you
+    yourself merge PR #7 … or authorize something else to merge it?" The owner answered **"Yes, I merged it."** This
+    is the owner's own statement. It has not been corroborated against the account's security log.
+  * The Claude Code session did not initiate the merge. Its transcript has merge calls only for PRs #2–#6, each made
+    with the owner's explicit approval, and no auto-merge call.
+  * Before the owner's answer, this provenance was treated as unverified and recorded as a possible authorization
+    anomaly (PR #8 review). With the owner's statement, it is recorded as an owner-initiated merge of the reviewed
+    head.
 * **Parents:**
   * `6ee9c11f6ed58e2cee8816a187a5bf3f3126550c`: the previous `main` (Track A merge);
   * `6b39e4bb171e79d8c631de0d5aa5e2b933316eeb`: the reviewed D-1 head, the final head of the second review pass.
