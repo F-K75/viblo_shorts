@@ -121,7 +121,9 @@ describe('F1: backup manifest is consistent with the dump under concurrent write
       await w.end();
       const dst = await db(false);
       const report = await restoreBackup(cfg, manifest.name, dst.url, key.file);
-      assert.ok(during >= 1, `writes committed while the backup ran (${during}; ${writes} in total)`);
+      // 'writes' is incremented after a write's commit returned, so one counted write may have committed just before
+      // createBackup started; >= 2 guarantees at least one write committed entirely within the backup.
+      assert.ok(during >= 2, `writes committed while the backup ran (${during} counted; ${writes} in total)`);
       assert.equal(report.verified, true, `manifest ${JSON.stringify(manifest.rowCounts)} vs restored ${JSON.stringify(report.rowCounts)}`);
       assert.equal(report.rowCounts.projects, manifest.rowCounts.projects);
     }
