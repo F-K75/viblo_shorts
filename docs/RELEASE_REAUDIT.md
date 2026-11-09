@@ -1,6 +1,58 @@
 # Forge Studio — Independent Re-audit + Corrective Round
 
-## Phase 2.5 Track D-1 (F8, F9, F10, F11, D6, D2, D7): ready for review (F-K75/viblo_shorts#7), NOT merged
+## Phase 2.5 Track D-1, second review pass (2026-11-09): HOLD, awaiting the owner's final review (F-K75/viblo_shorts#7, NOT merged)
+* **Status.** The first review of `614c56b` was HOLD. The owner's decisions and evidence requests of 2026-11-09 are now
+  implemented. Merge, D-2, deployment and production release are **not** authorized.
+* **Evidence:** `docs/PHASE2_5_TRACK_D1.md` §13.
+
+**Changes since `614c56b`.** Each behavioural change was made red-first; verification tests were mutation-checked.
+* **R1, F10 JSON durability.** The attempt is persisted synchronously before the provider is called. If the write
+  fails, the provider is not called and the reservation is refunded.
+* **R2, F10 billing by recorded attempt outcomes** (migration `0006`).
+  * **Owner decision:** provider HTTP 4xx/5xx is `uncertain` and charged, as conservative policy; it is not a claim
+    that the provider billed.
+  * **Refunds** happen only when the provider was provably not invoked, or a successful response reported 0 usage.
+  * **One unit per reservation**, settled exactly once, including under concurrent attempts.
+* **R3, F9 runbook.** A seven-step write freeze for every `migrate` run, re-runs included, with SQL checked on a real
+  database.
+* **R4, F11.** TLS-required restore and verify-restore are tested end to end, including a TLS downgrade at `psql`.
+* **R5, Track A load.**
+  * 60 s and 5 min sustained refusal floods, pool kept at 10.
+  * With slow stat writes, signups p50 / p95 / p99 were 691 / 908 / 933 ms, all successful, against p50 2.4 s before
+    the fix.
+  * Pool wait p95 / p99 were 263 / 290 ms, with 0 errors.
+* **R6, migration `0006`.** Tested on a real version-5 database.
+  * Interruptions (lock timeout, process killed mid-`ALTER`) leave version 5; a re-run recovers.
+  * Legacy rows are byte-identical; the previous release runs against version 6.
+  * The previous release's JSON ledger files load.
+* **F1 test precondition.** The original check could pass with no write overlapping the backup. It now requires at
+  least 2 writes during a backup made long enough by padding. The restore assertions are unchanged.
+
+**Local gate (`7e09960`, the final code commit; later commits are docs only):**
+* D-1 tests (33): 33/33 three times on JSON and three times on PostgreSQL.
+* Full JSON suite: 287 tests, 285 pass, 0 fail, 2 skipped.
+* Full PostgreSQL suite: 287 tests, 278 pass, 0 fail, 9 skipped.
+* Build passes.
+* Browser E2E: see `docs/PHASE2_5_TRACK_D1.md` §13.9.
+
+**CI:** see `docs/PHASE2_5_TRACK_D1.md` §13.10 for the final head.
+
+### Risk register changes (second pass)
+| Item | Before | After |
+|---|---|---|
+| F10 JSON crash window (start not durable for up to 1 s) | found in review | **fixed** (`4a93567`, pending merge) |
+| F10 refund/charge decided by the start alone | owner: change | **fixed**: recorded attempt outcomes decide (`4e87cc0`) |
+| F10 provider HTTP 4xx/5xx billing unknown | open question | **decided**: charged conservatively (`d19a521`). Accepted consequence: provider outages consume users' daily AI quota. |
+| F9 runbook lacked freeze verification, exit and re-run rule | found in review | **fixed** (`20e870c`) |
+| F11 restore / verify-restore not tested end to end under required TLS | found in review | **fixed** (`4fc90a4`) |
+| Migration `0006` upgrade, interruption and rollback compatibility | new | **verified** (`378d028`, `9e9d00a`) |
+| Track A shared pool under refusal floods | measured | **accepted temporarily** by the owner. Isolation is deferred to a later workstream; no batching. |
+| F1 test could pass without concurrent writes | found by CI | **fixed** (`6db5dbd`, `7f345e2`, `7e09960`) |
+| CI database and disk headroom | open | open (D-2); the F1 CI failure was one symptom |
+| D8 EPIPE flake; D9 Playwright install vulnerabilities | open | open (D-2) |
+| R-01 live Gemini validation | release blocker | release blocker (Track E) |
+
+## Phase 2.5 Track D-1 (F8, F9, F10, F11, D6, D2, D7): first review (superseded in part by the second pass above), NOT merged
 * **Evidence:** `docs/PHASE2_5_TRACK_D1.md`. Base: `main` @ `6ee9c11` plus `14c1438`. Head: the commit after `a5a4093` (docs
   only). D-2 has not been started. Passing CI is not merge approval and not release approval.
 * **Fixed, each red-first on `6ee9c11`:**
@@ -81,7 +133,7 @@
 | C, memory protection (R-13) | merged (`53fc724`) |
 | B, render queue and billing (R-04, F7) | merged (`80e02b5`) |
 | A, guest registration protection (R-03) | merged (`6ee9c11`), closed |
-| D, operational hardening | authorized; D-1 ready for review (F-K75/viblo_shorts#7), D-2 waits for the D-1 merge |
+| D, operational hardening | authorized; D-1 on HOLD after the second review pass (F-K75/viblo_shorts#7); D-2 not authorized |
 | E, live Gemini validation (R-01) | not started; needs authorization |
 
 **Open release blockers and pre-launch requirements:**
