@@ -9,9 +9,14 @@ import {
 } from 'firebase/auth';
 import firebaseConfig from '../../firebase-applet-config.json';
 
-// Initialize Firebase
-const app = getApps().length > 0 ? getApps()[0] : initializeApp(firebaseConfig);
+// Initialize primary Firebase app (for Studio user auth) and a separate named app
+// for Google Drive export OAuth so Drive sign-in/sign-out never mutates the main session.
+const app = getApps().find((a) => a.name === '[DEFAULT]') ?? initializeApp(firebaseConfig);
 export const auth = getAuth(app);
+
+const DRIVE_APP_NAME = 'google-drive-export';
+const driveApp = getApps().find((a) => a.name === DRIVE_APP_NAME) ?? initializeApp(firebaseConfig, DRIVE_APP_NAME);
+const driveAuth = getAuth(driveApp);
 
 // Workspace OAuth Scopes configured for this applet
 export const SCOPES = ['https://www.googleapis.com/auth/drive.file'];
@@ -31,7 +36,7 @@ export const initDriveAuth = (
   onAuthSuccess?: (user: User, token: string) => void,
   onAuthFailure?: () => void
 ) => {
-  return onAuthStateChanged(auth, async (user: User | null) => {
+  return onAuthStateChanged(driveAuth, async (user: User | null) => {
     if (user) {
       if (cachedAccessToken) {
         if (onAuthSuccess) onAuthSuccess(user, cachedAccessToken);
@@ -49,7 +54,7 @@ export const initDriveAuth = (
 export const signInWithGoogleDrive = async (): Promise<{ user: User; accessToken: string } | null> => {
   try {
     isSigningIn = true;
-    const result = await signInWithPopup(auth, provider);
+    const result = await signInWithPopup(driveAuth, provider);
     const credential = GoogleAuthProvider.credentialFromResult(result);
     if (!credential?.accessToken) {
       throw new Error('Failed to obtain Google Drive access token.');
@@ -65,7 +70,7 @@ export const signInWithGoogleDrive = async (): Promise<{ user: User; accessToken
 };
 
 export const signOutGoogleDrive = async () => {
-  await signOut(auth);
+  await signOut(driveAuth);
   cachedAccessToken = null;
 };
 

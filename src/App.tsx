@@ -52,9 +52,9 @@ import { GoogleDriveExportModal } from './components/GoogleDriveExportModal';
 import { BillingModal } from './components/BillingModal';
 import { MyProjectsModal } from './components/MyProjectsModal';
 import { PublishingPackModal } from './components/PublishingPackModal';
-import { apiFetch, apiErrorMessage, clearGuestSession } from './utils/api';
+import { apiFetch, apiErrorMessage, clearGuestSession, hasGuestSession } from './utils/api';
 import { auth } from './utils/googleDrive';
-import { signOut } from 'firebase/auth';
+import { onAuthStateChanged, signOut } from 'firebase/auth';
 
 const SAMPLE_PROJECT_ID = 'proj_sample_steve_jobs';
 
@@ -172,16 +172,67 @@ export const App: React.FC = () => {
   const [lastSavedMessage, setLastSavedMessage] = useState<string | null>(null);
   const [userPlan, setUserPlan] = useState<'free' | 'pro' | 'studio'>('free');
   const [saveError, setSaveError] = useState<string | null>(null);
+  const [authSynced, setAuthSynced] = useState(!auth);
+
+  const currentPageRef = useRef(currentPage);
+  currentPageRef.current = currentPage;
+  const currentUserRef = useRef(currentUser);
+  currentUserRef.current = currentUser;
 
   useEffect(() => {
-    if (currentPage !== 'studio' || !currentUser) return;
+    if (!auth) {
+      setAuthSynced(true);
+      return;
+    }
+    const unsubscribe = onAuthStateChanged(auth, (fbUser) => {
+      if (fbUser) {
+        clearGuestSession();
+        setCurrentUser((prev) => {
+          const syncedUser: AuthUser = {
+            id: fbUser.uid,
+            name: fbUser.displayName || fbUser.email?.split('@')[0] || 'Creator',
+            email: fbUser.email || '',
+            avatar:
+              fbUser.photoURL ||
+              `https://api.dicebear.com/7.x/bottts/svg?seed=${encodeURIComponent(fbUser.uid)}`,
+            plan: prev?.id === fbUser.uid ? prev.plan : 'free',
+          };
+          try {
+            localStorage.setItem('forge_user', JSON.stringify(syncedUser));
+          } catch {
+            // ignore
+          }
+          return syncedUser;
+        });
+      } else {
+        const isExplicitGuest = hasGuestSession() && Boolean(currentUserRef.current?.id?.startsWith('guest_'));
+        if (!isExplicitGuest) {
+          setCurrentUser(null);
+          try {
+            localStorage.removeItem('forge_user');
+            localStorage.removeItem('viblo_user');
+          } catch {
+            // ignore
+          }
+          if (currentPageRef.current === 'studio') {
+            setCurrentPage('auth');
+          }
+        }
+      }
+      setAuthSynced(true);
+    });
+    return () => unsubscribe();
+  }, []);
+
+  useEffect(() => {
+    if (!authSynced || currentPage !== 'studio' || !currentUser) return;
     apiFetch('/api/user/subscription')
       .then((r) => (r.ok ? r.json() : null))
       .then((d) => {
         if (d?.subscription?.plan) setUserPlan(d.subscription.plan);
       })
       .catch(() => {});
-  }, [currentPage, currentUser?.id]);
+  }, [authSynced, currentPage, currentUser?.id]);
 
   const playbackRaf = useRef<number | null>(null);
   const lastTimeRef = useRef<number>(0);
