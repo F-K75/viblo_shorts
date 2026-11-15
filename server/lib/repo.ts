@@ -129,6 +129,11 @@ export interface Repo {
    */
   saveProject(userId: string, project: any, opts?: SaveProjectOptions): Promise<void>;
   deleteProject(ownerId: string, id: string): Promise<boolean>;
+  /**
+   * Transfers all projects owned by `fromGuestId` (must be a guest user) to `toUserId` (must be a non-guest user),
+   * enforcing `toUserId`'s storage/project limits atomically. Never claims non-guest projects.
+   */
+  claimGuestProjects(fromGuestId: string, toUserId: string): Promise<{ claimed: number }>;
 
   // ---- subscriptions ----
   getSubscription(userId: string): Promise<StoredSubscription | null>;

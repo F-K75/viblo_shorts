@@ -139,6 +139,48 @@ describe('projects: lifecycle and isolation', () => {
   test('storage files never contain temp leftovers', () => {
     assert.ok(!fs.readdirSync(srv.dataDir).some((f) => f.endsWith('.tmp')));
   });
+
+  test('POST /api/projects/claim transfers guest projects to signed-in user and enforces isolation', async () => {
+    const fb1 = srv.signFirebaseToken({ sub: 'firebase-claim-1', email: 'c1@example.com' });
+    const fb2 = srv.signFirebaseToken({ sub: 'firebase-claim-2', email: 'c2@example.com' });
+
+    // Unauthenticated and guest callers are rejected
+    assert.equal((await post('/api/projects/claim', undefined, { guestToken: A })).status, 401);
+    const guestAttempt = await post('/api/projects/claim', A, { guestToken: M });
+    assert.equal(guestAttempt.status, 403);
+    assert.equal((await guestAttempt.json()).code, 'sign_in_required');
+
+    // Missing, forged, or non-guest tokens are rejected
+    assert.equal((await post('/api/projects/claim', fb1, {})).status, 400);
+    assert.equal((await post('/api/projects/claim', fb1, { guestToken: 'not-a-guest-token' })).status, 400);
+    assert.equal((await post('/api/projects/claim', fb1, { guestToken: A.slice(0, -2) + 'xx' })).status, 400);
+    const nonGuestTokenAttempt = await post('/api/projects/claim', fb1, { guestToken: fb2 });
+    assert.equal(nonGuestTokenAttempt.status, 400);
+    assert.equal((await nonGuestTokenAttempt.json()).code, 'invalid_guest_token');
+
+    // Create one project as guest A and one as guest M
+    const aProj = (await (await post('/api/projects', A, { title: 'Guest A Draft' })).json()).project;
+    const mProj = (await (await post('/api/projects', M, { title: 'Guest M Draft' })).json()).project;
+
+    // fb1 claims guest A's projects
+    const claimRes = await post('/api/projects/claim', fb1, { guestToken: A });
+    assert.equal(claimRes.status, 200);
+    assert.deepEqual(await claimRes.json(), { success: true, claimed: 1 });
+
+    // fb1 owns aProj, A no longer sees it, M's project is untouched, fb2 cannot access it
+    const fb1Read = await api(`/api/projects/${aProj.id}`, fb1);
+    assert.equal(fb1Read.status, 200);
+    assert.equal((await fb1Read.json()).project.userId, 'firebase-claim-1');
+    assert.equal((await api(`/api/projects/${aProj.id}`, A)).status, 404);
+    assert.equal((await api(`/api/projects/${aProj.id}`, fb2)).status, 404);
+    assert.equal((await api(`/api/projects/${mProj.id}`, fb1)).status, 404);
+    assert.equal((await api(`/api/projects/${mProj.id}`, M)).status, 200);
+
+    // Re-claiming is idempotent (0 claimed)
+    const reclaimRes = await post('/api/projects/claim', fb2, { guestToken: A });
+    assert.equal(reclaimRes.status, 200);
+    assert.deepEqual(await reclaimRes.json(), { success: true, claimed: 0 });
+  });
 });
 
 describe('render engine and job queue (real ffmpeg)', () => {

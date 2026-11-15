@@ -143,6 +143,45 @@ export class PostgresRepo implements Repo {
     });
   }
 
+  async claimGuestProjects(fromGuestId: string, toUserId: string): Promise<{ claimed: number }> {
+    if (userKindOf(fromGuestId) !== 'guest' || userKindOf(toUserId) !== 'firebase' || fromGuestId === toUserId) {
+      return { claimed: 0 };
+    }
+    const L = this.limits;
+    return withTx(this.db, async (tx) => {
+      await ensureUser(tx, toUserId);
+      // Lock both user rows in sorted order to follow users -> projects -> storage_totals without deadlocks.
+      const userRows = (await tx.query(
+        'SELECT id, storage_bytes, project_count FROM users WHERE id = ANY($1) ORDER BY id FOR UPDATE',
+        [[fromGuestId, toUserId].sort()],
+      )).rows;
+      const fromUser = userRows.find((r) => r.id === fromGuestId);
+      const toUser = userRows.find((r) => r.id === toUserId);
+      if (!fromUser || !toUser) return { claimed: 0 };
+
+      const projRows = (await tx.query('SELECT id, size_bytes FROM projects WHERE user_id = $1 FOR UPDATE', [fromGuestId])).rows;
+      if (projRows.length === 0) return { claimed: 0 };
+
+      const movedCount = projRows.length;
+      const movedBytes = projRows.reduce((sum, r) => sum + Number(r.size_bytes), 0);
+      if (Number(toUser.project_count) + movedCount > L.userMaxProjects) {
+        throw new StoreLimitError(409, 'project_limit', `Project limit reached (${L.userMaxProjects}). Delete old projects first.`);
+      }
+      if (Number(toUser.storage_bytes) + movedBytes > L.userMaxBytes) {
+        throw new StoreLimitError(409, 'storage_quota_exceeded', `Storage limit reached (${Math.round(L.userMaxBytes / 1048576)} MB). Delete old projects first.`);
+      }
+
+      await tx.query(
+        `UPDATE projects SET user_id = $2, doc = jsonb_set(doc, '{userId}', to_jsonb($2::text)) WHERE user_id = $1`,
+        [fromGuestId, toUserId],
+      );
+      await tx.query('UPDATE users SET storage_bytes = GREATEST(0, storage_bytes - $2), project_count = GREATEST(0, project_count - $3) WHERE id = $1', [fromGuestId, movedBytes, movedCount]);
+      await tx.query('UPDATE users SET storage_bytes = storage_bytes + $2, project_count = project_count + $3 WHERE id = $1', [toUserId, movedBytes, movedCount]);
+      await tx.query("UPDATE storage_totals SET bytes = GREATEST(0, bytes - $1) WHERE scope = 'guest'", [movedBytes]);
+      return { claimed: movedCount };
+    });
+  }
+
   // ---------- subscriptions ----------
   async getSubscription(userId: string): Promise<StoredSubscription | null> {
     const r = (await this.db.query('SELECT * FROM subscriptions WHERE user_id = $1', [userId])).rows[0];
