@@ -27,7 +27,7 @@ import { recalculateWordsFromBeats } from '../utils/pipeline';
 import { getSafeThumbnail } from '../utils/visualPlaceholders';
 import { VoiceToTextPanel } from './VoiceToTextPanel';
 import { startLiveVoiceListener } from '../utils/voiceRecognition';
-import { apiFetch } from '../utils/api';
+import { apiFetch, apiErrorMessage } from '../utils/api';
 
 interface ScriptEditorProps {
   beats: Beat[];
@@ -157,6 +157,7 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({
   const [showHooksModal, setShowHooksModal] = useState(false);
   const [suggestedHooks, setSuggestedHooks] = useState<Array<{ hook: string; style: string; visual_keywords: string }>>([]);
   const [loadingHooks, setLoadingHooks] = useState(false);
+  const [hooksError, setHooksError] = useState<string | null>(null);
   const [activePunchUpMenuBeatId, setActivePunchUpMenuBeatId] = useState<string | null>(null);
   const [fetchingYouTubeCC, setFetchingYouTubeCC] = useState(false);
   const [ccFeedback, setCcFeedback] = useState<string | null>(null);
@@ -172,12 +173,16 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({
   const handleSuggestHooks = async () => {
     setShowHooksModal(true);
     setLoadingHooks(true);
+    setHooksError(null);
     try {
       const res = await apiFetch('/api/gemini/suggest-hooks', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ topic: topic || beats[0]?.text || 'viral YouTube Short' }),
       });
+      if (!res.ok) {
+        throw new Error(await apiErrorMessage(res, 'Failed to get hook suggestions'));
+      }
       const data = await res.json();
       if (data.hooks && Array.isArray(data.hooks)) {
         setSuggestedHooks(
@@ -187,7 +192,9 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({
         );
       }
     } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Failed to get hook suggestions';
       console.error('Failed to get hook suggestions:', err);
+      setHooksError(msg);
     } finally {
       setLoadingHooks(false);
     }
@@ -216,6 +223,11 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({
           topic,
         }),
       });
+      if (!res.ok) {
+        const msg = await apiErrorMessage(res, 'AI rewrite is unavailable right now; the line was left unchanged.');
+        setCcFeedback(msg);
+        return;
+      }
       const data = await res.json();
       if (data.unchanged || data.isFallback) {
         setCcFeedback(data.fallbackMessage || 'AI rewrite is unavailable right now; the line was left unchanged.');
@@ -253,6 +265,10 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ videoId: sourceYouTubeId }),
       });
+      if (!res.ok) {
+        setCcFeedback(await apiErrorMessage(res, 'Could not fetch YouTube CC.'));
+        return;
+      }
       const data = await res.json();
       if (data.success && Array.isArray(data.segments) && data.segments.length > 0) {
         const clipStart = clipStartSeconds ?? 0;
@@ -313,6 +329,10 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({
           clipEndSeconds: clipEndSeconds ?? (clipStartSeconds ? clipStartSeconds + 45 : 300),
         }),
       });
+      if (!res.ok) {
+        setPasteError(await apiErrorMessage(res, 'Error parsing captions'));
+        return;
+      }
       const data = await res.json();
       if (data.success && Array.isArray(data.segments) && data.segments.length > 0) {
         const clipStart = clipStartSeconds ?? 0;
@@ -952,6 +972,10 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({
               <div className="py-8 flex flex-col items-center justify-center gap-3 text-neutral-400 text-xs">
                 <RefreshCw className="w-5 h-5 animate-spin text-rose-400" />
                 <span>Gemini generating viral hook formulas...</span>
+              </div>
+            ) : hooksError ? (
+              <div className="p-3.5 rounded-xl bg-rose-500/10 border border-rose-500/25 text-xs text-rose-300">
+                {hooksError}
               </div>
             ) : (
               <div className="space-y-2.5 max-h-96 overflow-y-auto">

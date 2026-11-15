@@ -54,6 +54,7 @@ export function pcmToWavBlob(base64Pcm: string, sampleRate = 24000): Blob {
 export type MusicMood = 'lofi' | 'hype' | 'ambient';
 
 class AudioManager {
+  private static readonly MAX_TTS_CACHE_SIZE = 50;
   private ctx: AudioContext | null = null;
   private musicGainNode: GainNode | null = null;
   private isMusicPlaying = false;
@@ -307,6 +308,35 @@ class AudioManager {
     }
   }
 
+  private setTtsCache(key: string, blobUrl: string) {
+    const activeSrc = this.currentAudioElement?.src;
+    const existing = this.ttsCache.get(key);
+    if (existing) {
+      this.ttsCache.delete(key);
+      if (existing !== blobUrl && existing !== activeSrc) {
+        URL.revokeObjectURL(existing);
+      }
+    }
+    while (this.ttsCache.size >= AudioManager.MAX_TTS_CACHE_SIZE) {
+      const oldestKey = this.ttsCache.keys().next().value;
+      if (oldestKey === undefined) break;
+      const evictedUrl = this.ttsCache.get(oldestKey);
+      this.ttsCache.delete(oldestKey);
+      if (evictedUrl && evictedUrl !== activeSrc) {
+        URL.revokeObjectURL(evictedUrl);
+      }
+    }
+    this.ttsCache.set(key, blobUrl);
+  }
+
+  public clearTtsCache() {
+    this.stopSpeech();
+    for (const url of this.ttsCache.values()) {
+      URL.revokeObjectURL(url);
+    }
+    this.ttsCache.clear();
+  }
+
   /**
    * Attempts to play studio-quality Google Neural TTS from /api/tts with automatic memory caching,
    * seamlessly falling back to browser SpeechSynthesis if offline or when using system voices.
@@ -316,6 +346,11 @@ class AudioManager {
     if (isGoogleVoice && text.trim()) {
       const cacheKey = `${voiceName}:${text.trim()}`;
       let blobUrl = this.ttsCache.get(cacheKey);
+      if (blobUrl) {
+        // Refresh entry for LRU ordering
+        this.ttsCache.delete(cacheKey);
+        this.ttsCache.set(cacheKey, blobUrl);
+      }
 
       if (!blobUrl) {
         try {
@@ -324,11 +359,13 @@ class AudioManager {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ text, voice: voiceName }),
           });
-          const data = await res.json();
-          if (data.success && data.audioData) {
-            const wavBlob = pcmToWavBlob(data.audioData, data.sampleRate || 24000);
-            blobUrl = URL.createObjectURL(wavBlob);
-            this.ttsCache.set(cacheKey, blobUrl);
+          if (res.ok) {
+            const data = await res.json();
+            if (data.success && data.audioData) {
+              const wavBlob = pcmToWavBlob(data.audioData, data.sampleRate || 24000);
+              blobUrl = URL.createObjectURL(wavBlob);
+              this.setTtsCache(cacheKey, blobUrl);
+            }
           }
         } catch {
           // ignore error, will fall through to speech synthesis

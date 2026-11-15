@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { Copy, Check, Download, Youtube, Sparkles, RefreshCw, Layers, CheckCircle2 } from 'lucide-react';
 import { ShortScript } from '../types';
-import { apiFetch } from '../utils/api';
+import { apiFetch, apiErrorMessage } from '../utils/api';
 
 interface YouTubeMetadataCardProps {
   script: ShortScript;
@@ -12,6 +12,7 @@ interface YouTubeMetadataCardProps {
 export const YouTubeMetadataCard: React.FC<YouTubeMetadataCardProps> = ({ script, topic, onUpdateMetadata }) => {
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [isOptimizing, setIsOptimizing] = useState(false);
+  const [optimizeError, setOptimizeError] = useState<string | null>(null);
   const [titleOptions, setTitleOptions] = useState<string[]>([]);
   const [showTitlePicker, setShowTitlePicker] = useState(false);
 
@@ -23,6 +24,7 @@ export const YouTubeMetadataCard: React.FC<YouTubeMetadataCardProps> = ({ script
 
   const handleOptimizeWithGemini = async () => {
     setIsOptimizing(true);
+    setOptimizeError(null);
     try {
       const res = await apiFetch('/api/gemini/optimize-metadata', {
         method: 'POST',
@@ -32,6 +34,9 @@ export const YouTubeMetadataCard: React.FC<YouTubeMetadataCardProps> = ({ script
           beats: script.beats,
         }),
       });
+      if (!res.ok) {
+        throw new Error(await apiErrorMessage(res, 'Failed to optimize metadata with Gemini'));
+      }
       const data = await res.json();
       if (data.titles && Array.isArray(data.titles) && data.titles.length > 0) {
         setTitleOptions(data.titles);
@@ -45,7 +50,9 @@ export const YouTubeMetadataCard: React.FC<YouTubeMetadataCardProps> = ({ script
         });
       }
     } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Failed to optimize metadata with Gemini';
       console.error('Failed to optimize metadata with Gemini:', err);
+      setOptimizeError(msg);
     } finally {
       setIsOptimizing(false);
     }
@@ -134,6 +141,12 @@ export const YouTubeMetadataCard: React.FC<YouTubeMetadataCardProps> = ({ script
           </button>
         </div>
       </div>
+
+      {optimizeError && (
+        <div className="p-3 rounded-xl bg-rose-500/10 border border-rose-500/25 text-xs text-rose-300">
+          {optimizeError}
+        </div>
+      )}
 
       {/* Grid: Left (Metadata Fields) & Right (Mobile Simulation Card) */}
       <div className="grid grid-cols-1 xl:grid-cols-[1fr_280px] gap-6">
