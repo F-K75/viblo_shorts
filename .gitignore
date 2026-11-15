@@ -21,3 +21,5 @@ output/
 *.mp3
 *.wav
 .DS_Store
+.worktrees/
+
