@@ -43,15 +43,18 @@ test('Guest tokens: issue/verify roundtrip; tamper, wrong secret and expiry reje
   assert.throws(() => new AuthService('short', undefined));
 });
 
-test('Firebase ID tokens: valid token accepted; bad aud/iss/exp/signature/alg rejected', async () => {
+test('Firebase ID tokens: valid token accepted; bad aud/iss/exp/signature/alg or unverified email rejected', async () => {
   const { certsFile, sign } = makeFirebaseFixture();
   const auth = new AuthService(SECRET, PROJECT, new Set(['admin-uid']), certsFile);
   const now = Math.floor(Date.now() / 1000);
-  const base = { aud: PROJECT, iss: `https://securetoken.google.com/${PROJECT}`, sub: 'uid-123', iat: now - 10, exp: now + 3600, email: 'a@b.co' };
+  const base = { aud: PROJECT, iss: `https://securetoken.google.com/${PROJECT}`, sub: 'uid-123', iat: now - 10, exp: now + 3600, email: 'a@b.co', email_verified: true };
 
   const ok = await auth.authenticate(`Bearer ${sign(base)}`);
   assert.deepEqual(ok, { userId: 'uid-123', kind: 'firebase', email: 'a@b.co', isAdmin: false });
   assert.equal((await auth.authenticate(`Bearer ${sign({ ...base, sub: 'admin-uid' })}`))?.isAdmin, true);
+
+  const noEmail = await auth.authenticate(`Bearer ${sign({ aud: PROJECT, iss: `https://securetoken.google.com/${PROJECT}`, sub: 'uid-no-email', iat: now - 10, exp: now + 3600 })}`);
+  assert.deepEqual(noEmail, { userId: 'uid-no-email', kind: 'firebase', email: undefined, isAdmin: false });
 
   for (const bad of [
     sign({ ...base, aud: 'other-project' }),
@@ -59,6 +62,8 @@ test('Firebase ID tokens: valid token accepted; bad aud/iss/exp/signature/alg re
     sign({ ...base, exp: now - 3600 }),
     sign({ ...base, iat: now + 3600 }),
     sign({ ...base, sub: '' }),
+    sign({ ...base, email_verified: false }),
+    sign({ ...base, email_verified: undefined }),
     sign(base, { alg: 'HS256', kid: 'test-kid' }),
     sign(base, { alg: 'RS256', kid: 'unknown-kid' }),
     sign(base).replace(/\.[^.]+$/, '.AAAA'),
