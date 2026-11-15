@@ -94,6 +94,16 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
   const videoRef = useRef<HTMLVideoElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const iframeRef = useRef<HTMLIFrameElement>(null);
+  const wasPlayingRef = useRef(false);
+  const messageStateRef = useRef({
+    audioMode: 'youtube' as AudioSourceMode,
+    isYoutubeMuted: false,
+    youtubeVolume: 1.0,
+    clipStartSec: clipStartSeconds,
+    isPlaying,
+    currentTimestamp,
+    onSeek,
+  });
 
   const [isExporting, setIsExporting] = useState(false);
   const [exportProgress, setExportProgress] = useState(0);
@@ -182,24 +192,46 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
   }, [isPlaying, sourceYouTubeId, audioMode, isYoutubeMuted, youtubeVolume, clipStartSec]);
 
   useEffect(() => {
+    messageStateRef.current = {
+      audioMode,
+      isYoutubeMuted,
+      youtubeVolume,
+      clipStartSec,
+      isPlaying,
+      currentTimestamp,
+      onSeek,
+    };
+  }, [audioMode, isYoutubeMuted, youtubeVolume, clipStartSec, isPlaying, currentTimestamp, onSeek]);
+
+  useEffect(() => {
     const handleWindowMessage = (e: MessageEvent) => {
       try {
         const data = typeof e.data === 'string' ? JSON.parse(e.data) : e.data;
+        const {
+          audioMode: curAudioMode,
+          isYoutubeMuted: curIsYoutubeMuted,
+          youtubeVolume: curYoutubeVolume,
+          clipStartSec: curClipStartSec,
+          isPlaying: curIsPlaying,
+          currentTimestamp: curTimestamp,
+          onSeek: curOnSeek,
+        } = messageStateRef.current;
+
         if (data?.event === 'onReady') {
           postToYouTube('listening');
           postToYouTube('setOption', ['captions', 'track', {}]);
           postToYouTube('unloadModule', ['captions']);
           postToYouTube('unloadModule', ['cc']);
-          if (audioMode === 'youtube' && !isYoutubeMuted) {
+          if (curAudioMode === 'youtube' && !curIsYoutubeMuted) {
             postToYouTube('unMute');
-            postToYouTube('setVolume', [Math.round(youtubeVolume * 100)]);
+            postToYouTube('setVolume', [Math.round(curYoutubeVolume * 100)]);
           }
         }
         if (data?.event === 'infoDelivery' && typeof data?.info?.currentTime === 'number') {
           const ytTime = data.info.currentTime;
-          const clipTime = Math.max(0, ytTime - clipStartSec);
-          if (isPlaying && Math.abs(currentTimestamp - clipTime) > 0.35) {
-            onSeek(clipTime);
+          const clipTime = Math.max(0, ytTime - curClipStartSec);
+          if (curIsPlaying && Math.abs(curTimestamp - clipTime) > 0.35) {
+            curOnSeek(clipTime);
           }
         }
       } catch {
@@ -208,7 +240,7 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
     };
     window.addEventListener('message', handleWindowMessage);
     return () => window.removeEventListener('message', handleWindowMessage);
-  }, [audioMode, isYoutubeMuted, youtubeVolume, clipStartSec, isPlaying, currentTimestamp, onSeek]);
+  }, []);
 
   useEffect(() => {
     if (!isPlaying || !sourceYouTubeId || audioMode !== 'youtube') return;
@@ -290,23 +322,26 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
     const video = videoRef.current;
     if (!video) return;
     const targetUrl = getSafeVideoUrl(activeBeat?.visual_keywords, activeBeat?.video_url);
+    const targetTime = Math.max(0, currentTimestamp - (activeBeat?.start_s || 0));
+    const srcChanged = video.src !== targetUrl;
 
-    if (video.src !== targetUrl) {
+    if (srcChanged) {
       video.src = targetUrl;
       video.load();
-      video.currentTime = Math.max(0, currentTimestamp - (activeBeat?.start_s || 0));
-      if (isPlaying) {
-        video.play().catch(() => {});
-      }
-    } else if (Math.abs(video.currentTime - (currentTimestamp - (activeBeat?.start_s || 0))) > 0.4) {
-      video.currentTime = Math.max(0, currentTimestamp - (activeBeat?.start_s || 0));
+      video.currentTime = targetTime;
+    } else if (Math.abs(video.currentTime - targetTime) > 0.4) {
+      video.currentTime = targetTime;
     }
 
     if (isPlaying) {
-      video.play().catch(() => {});
-    } else {
+      if (srcChanged || !wasPlayingRef.current || video.paused) {
+        video.play().catch(() => {});
+      }
+    } else if (!video.paused) {
       video.pause();
     }
+
+    wasPlayingRef.current = isPlaying;
   }, [activeBeat, isPlaying, currentTimestamp]);
 
   // Video Export Handler using Canvas + MediaRecorder with mixed audio
