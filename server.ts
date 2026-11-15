@@ -39,8 +39,11 @@ import { createPool, isUnavailable, isRetryableTxError, txRetryCount } from './s
 import { migrate } from './server/db/migrate.ts';
 import { createSnapshot, listSnapshots, pruneSnapshots, writeServerLock, removeServerLock, restoreInProgressReason } from './server/lib/backup.ts';
 import { cleanAndParseJSON, validateScript, normalizeHashtags, quoteUserInput } from './server/lib/llm.ts';
-import { CaptchaUnavailableError, TurnstileVerifier, deviceCookieHeader, newDeviceId, normalizeIp, parseCaptchaConfig, readDeviceCookie, sha256Hex, subnetOf, type CaptchaVerifier } from './server/lib/guestProtection.ts';
+import { TurnstileVerifier, parseCaptchaConfig, type CaptchaVerifier } from './server/lib/guestProtection.ts';
 import { MemoryGuard, computeMemoryBudget, containerMemoryLimitBytes, createBodyGuard, createRouteJsonParser, type BodyLimits, type MemoryBudget } from './server/lib/requestGuards.ts';
+import { registerHealthRoutes } from './server/routes/health.ts';
+import { registerAuthRoutes } from './server/routes/auth.ts';
+import { registerProjectRoutes } from './server/routes/projects.ts';
 
 dotenv.config();
 
@@ -1059,111 +1062,43 @@ const probeSweep = setInterval(() => {
 probeSweep.unref();
 const PROBE_LIMIT_PER_MIN = envNum('PROBE_RATE_LIMIT_PER_MIN', 600, 10);
 
-// Liveness: the process is up and serving. No dependencies, no internals.
-const liveness = (_req: express.Request, res: express.Response) => res.json({ status: 'ok' });
-app.get('/api/live', probeLimit(PROBE_LIMIT_PER_MIN), liveness);
-app.get('/api/health', probeLimit(PROBE_LIMIT_PER_MIN), liveness);
-
 // Diagnostics require HEALTH_DETAILS_TOKEN (>= 32 chars, compared in constant time) or an admin identity.
 const HEALTH_DETAILS_TOKEN = process.env.HEALTH_DETAILS_TOKEN?.trim() || '';
 if (HEALTH_DETAILS_TOKEN && HEALTH_DETAILS_TOKEN.length < 32) {
   console.error('[Config] HEALTH_DETAILS_TOKEN must be at least 32 characters.');
   process.exit(1);
 }
-function hasDiagnosticsAccess(req: express.Request): boolean {
-  if (isAdmin(req)) return true;
-  if (!HEALTH_DETAILS_TOKEN) return false;
-  const m = /^Bearer\s+(\S+)$/i.exec(String(req.headers.authorization || ''));
-  if (!m) return false;
-  const a = crypto.createHash('sha256').update(m[1]).digest();
-  const b = crypto.createHash('sha256').update(HEALTH_DETAILS_TOKEN).digest();
-  return crypto.timingSafeEqual(a, b);
-}
-
-app.get('/api/health/details', probeLimit(60), async (req, res) => {
-  // 404, not 401/403: do not advertise that a diagnostics endpoint exists.
-  if (!hasDiagnosticsAccess(req)) return res.status(404).json({ error: 'Not found' });
-  const mem = process.memoryUsage();
-  const storeHealth = await repo.health();
-  res.json({
-    status: 'ok',
-    uptimeSeconds: Math.floor(process.uptime()),
-    timestamp: new Date().toISOString(),
-    services: {
-      geminiLlm: resolveGeminiApiKey() ? 'ready' : 'fallback-engine',
-      pexelsStock: hasPexelsKey() ? 'ready' : 'curated-library',
-    },
-    system: {
-      heapUsedMb: Math.round((mem.heapUsed / 1024 / 1024) * 10) / 10,
-      heapTotalMb: Math.round((mem.heapTotal / 1024 / 1024) * 10) / 10,
-      rssMb: Math.round((mem.rss / 1024 / 1024) * 10) / 10,
-      memoryGuard: { ...MEMORY_BUDGET, pressured: memoryGuard.pressured, lastRssMb: Math.round(memoryGuard.lastRssMb * 10) / 10, trips: memoryGuard.trips },
-    },
-    requests: { ...bodyGuard.stats, headersTimeoutMs: HEADERS_TIMEOUT_MS, requestTimeoutMs: REQUEST_TIMEOUT_MS },
-    ai: {
-      calls: llmMetrics.calls,
-      successes: llmMetrics.successes,
-      failures: llmMetrics.failures,
-      fallbacksServed: llmMetrics.fallbacksServed,
-      avgLatencyMs: llmMetrics.successes ? Math.round(llmMetrics.totalLatencyMs / llmMetrics.successes) : null,
-      promptTokens: llmMetrics.promptTokens,
-      outputTokens: llmMetrics.outputTokens,
-    },
-    renders: { running: runningRenders.size, instance: INSTANCE_ID },
-    storage: {
-      backend: repo.kind,
-      ok: storeHealth.ok,
-      ...storeHealth.detail,
-      freeDiskMb: (() => {
-        const f = freeDiskBytes(DATA_DIR);
-        return f === null ? null : Math.round(f / MB);
-      })(),
-    },
-    backups: repo.kind === 'json' ? backupStatus() : { mode: 'database', note: 'PostgreSQL: encrypted off-site backups (scripts/db-backup.ts) and provider PITR; see docs/BACKUP_AND_RECOVERY.md' },
-    proxy: { trust: trustProxy.ok ? trustProxy.description : 'invalid', untrustedForwardedRequests: proxyDiagnostics.untrustedForwardedRequests },
-    guestMints: await guestMintStatus().catch(() => null),
-    database: repo.kind === 'postgres' ? { txRetries: txRetryCount } : undefined,
-    readinessComputations,
-  });
-});
-
-// Readiness: storage writable + ffmpeg present. Returns 503 when the instance cannot serve renders/saves.
-let readyCache: { at: number; body: { ready: boolean; checks: Record<string, boolean> } } | null = null;
-let readyInFlight: Promise<{ ready: boolean; checks: Record<string, boolean> }> | null = null;
 const READY_CACHE_MS = envNum('READY_CACHE_MS', 1000, 0);
 
-app.get('/api/ready', probeLimit(PROBE_LIMIT_PER_MIN), async (_req, res) => {
-  // At most one real check per READY_CACHE_MS per instance, however many probes arrive (R-12).
-  if (!readyCache || Date.now() - readyCache.at > READY_CACHE_MS) {
-    readyInFlight ||= computeReadiness().finally(() => {
-      readyInFlight = null;
-    });
-    readyCache = { at: Date.now(), body: await readyInFlight };
-  }
-  const body = readyCache.body;
-  res.status(body.ready ? 200 : 503).json(body);
+registerHealthRoutes(app, {
+  probeLimit,
+  probeLimitPerMin: PROBE_LIMIT_PER_MIN,
+  isAdmin,
+  healthDetailsToken: HEALTH_DETAILS_TOKEN,
+  getRepo: () => repo,
+  resolveGeminiApiKey,
+  hasPexelsKey,
+  memoryBudget: MEMORY_BUDGET,
+  memoryGuard,
+  getBodyGuardStats: () => bodyGuard.stats,
+  headersTimeoutMs: HEADERS_TIMEOUT_MS,
+  requestTimeoutMs: REQUEST_TIMEOUT_MS,
+  llmMetrics,
+  getRunningRendersCount: () => runningRenders.size,
+  instanceId: INSTANCE_ID,
+  dataDir: DATA_DIR,
+  mb: MB,
+  freeDiskBytes,
+  backupStatus,
+  trustProxy,
+  proxyDiagnostics,
+  guestMintStatus,
+  getTxRetryCount: () => txRetryCount,
+  readyCacheMs: READY_CACHE_MS,
+  checkFfmpeg,
+  billingMode: BILLING_MODE,
+  captcha: CAPTCHA,
 });
-
-let readinessComputations = 0;
-async function computeReadiness() {
-  readinessComputations++;
-  let storage = false;
-  try {
-    const probe = path.join(DATA_DIR, `.ready-${process.pid}`);
-    fs.writeFileSync(probe, 'ok');
-    fs.unlinkSync(probe);
-    storage = true;
-  } catch {
-    storage = false;
-  }
-  const ffmpeg = await checkFfmpeg();
-  // Stores every request depends on must be usable (JSON: shared files readable; PostgreSQL: reachable).
-  // A single corrupt JSON user shard does not fail readiness.
-  const stores = (await repo.health()).ok;
-  const memory = !memoryGuard.pressured; // Track C: drain this instance under memory pressure
-  const ready = storage && ffmpeg && stores && memory;
-  return { ready, checks: { storage, ffmpeg, stores, memory } };
-}
 
 // Test-only (Track C correction 2): retains / releases GENUINE memory inside this process so the memory guard can be
 // exercised against real RSS. Registered only when NODE_ENV=test AND MEMORY_TEST_HOOKS=1; never in production.
@@ -1182,99 +1117,9 @@ if (IS_TEST && process.env.MEMORY_TEST_HOOKS === '1') {
   });
 }
 
-// Public feature flags only (no model names, provider fingerprints or key details).
-app.get('/api/config', probeLimit(PROBE_LIMIT_PER_MIN), (_req, res) => {
-  res.json({
-    features: {
-      ai: Boolean(resolveGeminiApiKey()),
-      stockFootage: hasPexelsKey(),
-      billing: BILLING_MODE === 'demo' ? 'demo' : 'disabled',
-      // Public site key only; the secret never leaves the server except to Cloudflare's siteverify.
-      captcha: CAPTCHA.required ? { provider: 'turnstile', siteKey: CAPTCHA.siteKey } : null,
-    },
-  });
-});
-
 // ==========================================
-// AUTH ENDPOINTS
+// AUTH & SUBSCRIPTION ENDPOINTS (registered below after subscription helpers)
 // ==========================================
-// Guest registration (Track A). Order: cheap per-IP pre-filter -> single-use redemption -> CAPTCHA verification ->
-// budgets (only verified requests spend them) -> mint. Nothing here touches existing sessions: an outage of the
-// CAPTCHA provider or a spent budget only ever refuses NEW guests; signed-in users never come through this route.
-app.post('/api/auth/guest', rateLimit('auth-guest', 10), async (req, res) => {
-  const hour = currentHour();
-  const ip = normalizeIp(clientIp(req));
-  let device = readDeviceCookie(req.headers.cookie);
-  if (!device) {
-    device = newDeviceId();
-    res.setHeader('Set-Cookie', deviceCookieHeader(device));
-  }
-
-  if (captchaVerifier) {
-    const token = req.body?.['cf-turnstile-response'];
-    if (typeof token !== 'string' || token.length === 0 || token.length > 2048) {
-      return refuseGuestMint(res, 403, 'captcha_required', 'Please complete the verification to continue as a guest.');
-    }
-    // Single use on every instance, decided before the provider is asked (a replay never reaches it twice).
-    if (!(await repo.redeemOnce(`ts:${sha256Hex(token)}`, (CAPTCHA.maxTokenAgeS + 60) * 1000))) {
-      return refuseGuestMint(res, 403, 'captcha_replayed', 'This verification was already used. Please verify again.');
-    }
-    let verdict: Awaited<ReturnType<CaptchaVerifier['verify']>>;
-    try {
-      verdict = await captchaVerifier.verify(token, ip === 'unknown' ? undefined : ip);
-    } catch (err) {
-      if (!(err instanceof CaptchaUnavailableError)) throw err;
-      if (Date.now() - alerted.captchaOutageAt > 60000) {
-        alerted.captchaOutageAt = Date.now();
-        console.error(JSON.stringify({ level: 'error', event: 'captcha_provider_unavailable', reason: err.reason, note: 'New guest registrations are paused; existing sessions and signed-in users are unaffected.' }));
-      }
-      return refuseGuestMint(res, 503, 'captcha_unavailable', 'Guest sign-up is temporarily unavailable. Please try again shortly, or sign in to continue.', {}, 30);
-    }
-    if (!verdict.ok) {
-      return refuseGuestMint(res, 403, 'captcha_failed', 'Verification failed. Please try again.', { reason: verdict.reason });
-    }
-  }
-
-  // Budgets (all instances). Above the soft threshold, per-IP and per-subnet budgets are halved (never below 1).
-  const mintedThisHour = (await repo.statSeries(GUEST_MINT_STAT, hour))[0]?.count ?? 0;
-  const tighten = mintedThisHour >= GUEST_MINT_SOFT_PER_HOUR ? 2 : 1;
-  const dayWindow = Math.floor(hour / 24) * 24; // hour-aligned id, so the 48 h window sweep never cuts a day short
-  const entries = [
-    { key: `gm:dev:${sha256Hex(device)}`, windowId: dayWindow, limit: GUEST_MINT_PER_DEVICE_PER_DAY },
-    { key: `gm:ip:${ip}`, windowId: hour, limit: Math.max(1, Math.floor(GUEST_MINT_PER_IP_PER_HOUR / tighten)) },
-    { key: `gm:net:${subnetOf(ip)}`, windowId: hour, limit: Math.max(1, Math.floor(GUEST_MINT_PER_SUBNET_PER_HOUR / tighten)) },
-    ...(GUEST_MINT_HARD_PER_HOUR ? [{ key: 'gm:hard', windowId: hour, limit: GUEST_MINT_HARD_PER_HOUR }] : []),
-  ];
-  const taken = await repo.takeWindows(entries);
-  if (!taken.ok) {
-    const untilNextHour = 3600 - Math.floor((Date.now() % 3600000) / 1000);
-    if (taken.key === 'gm:hard') {
-      console.error(JSON.stringify({ level: 'error', event: 'guest_mint_hard_ceiling', perHour: GUEST_MINT_HARD_PER_HOUR }));
-      return refuseGuestMint(res, 429, 'guest_capacity', 'Guest sign-ups are paused because of unusually high demand. Please sign in (free) to continue.', {}, untilNextHour);
-    }
-    const scope = taken.key.startsWith('gm:dev:') ? 'device' : taken.key.startsWith('gm:ip:') ? 'ip' : 'subnet';
-    const retry = scope === 'device' ? (dayWindow + 24 - hour) * 3600 - Math.floor((Date.now() % 3600000) / 1000) : untilNextHour;
-    // Every request here already passed the CAPTCHA: an IP or subnet refusal is shared-network impact, recorded apart.
-    await Promise.all([
-      repo.recordStat(GUEST_REJECT_STAT + `guest_rate_limited:${scope}`, hour).catch(() => {}),
-      scope !== 'device' ? repo.recordStat(GUEST_NETWORK_REFUSAL_STAT, hour).catch(() => {}) : null,
-    ]);
-    res.setHeader('Retry-After', String(retry));
-    return res.status(429).json({ error: 'Too many guest sessions were started from here recently. Please try again later, or sign in to continue.', code: 'guest_rate_limited', scope });
-  }
-
-  const issued = authService.issueGuestToken();
-  const count = await repo.recordStat(GUEST_MINT_STAT, hour).catch(() => 0);
-  if (count >= GUEST_MINT_SOFT_PER_HOUR && alerted.softHour !== hour) {
-    alerted.softHour = hour;
-    console.warn(JSON.stringify({ level: 'warn', event: 'guest_mint_soft_threshold', perHour: GUEST_MINT_SOFT_PER_HOUR, thisHour: count, note: 'Per-IP and per-subnet guest budgets are halved for the rest of this hour. Verified sign-ups are not rejected.' }));
-  }
-  res.json({ success: true, token: issued.token, userId: issued.userId, expiresAt: issued.expiresAt });
-});
-
-app.get('/api/auth/me', rateLimit('auth-me', 60), (req, res) => {
-  res.json({ success: true, userId: uid(req), kind: req.identity!.kind, isAdmin: isAdmin(req) });
-});
 
 // ==========================================
 // SUBSCRIPTIONS (keyed by authenticated user id, never by IP)
@@ -1350,25 +1195,30 @@ app.get('/api/quota', rateLimit('quota', 60), async (req, res) => {
   });
 });
 
-app.get('/api/user/subscription', rateLimit('subscription', 60), async (req, res) => {
-  res.json({ success: true, subscription: await getUserSubscription(uid(req)), billingMode: BILLING_MODE });
-});
-
-app.post('/api/user/subscription/upgrade', rateLimit('subscription-upgrade', 10), async (req, res) => {
-  const plan = req.body?.plan;
-  if (typeof plan !== 'string' || !(plan in PLANS)) {
-    return res.status(400).json({ error: `Unknown plan. Valid plans: ${Object.keys(PLANS).join(', ')}` });
-  }
-  if (BILLING_MODE !== 'demo') {
-    // No payment provider is integrated. Granting paid plans without payment would be a revenue/abuse hole.
-    return res.status(501).json({
-      error: 'Online payments are not available yet. Plan changes are disabled on this server.',
-      billingConfigured: false,
-    });
-  }
-  const sub = newSubscription(plan as PlanId, true);
-  await repo.putSubscription(uid(req), { plan: sub.plan, status: 'active', monthlyRenderMinutesUsed: 0, currentPeriodEnd: sub.currentPeriodEnd, demo: true });
-  res.json({ success: true, subscription: sub, demo: true });
+registerAuthRoutes(app, {
+  rateLimit,
+  getRepo: () => repo,
+  authService,
+  uid,
+  isAdmin,
+  clientIp,
+  currentHour,
+  captchaMaxTokenAgeS: CAPTCHA.maxTokenAgeS,
+  captchaVerifier,
+  alerted,
+  refuseGuestMint,
+  guestMintStat: GUEST_MINT_STAT,
+  guestRejectStat: GUEST_REJECT_STAT,
+  guestNetworkRefusalStat: GUEST_NETWORK_REFUSAL_STAT,
+  guestMintSoftPerHour: GUEST_MINT_SOFT_PER_HOUR,
+  guestMintHardPerHour: GUEST_MINT_HARD_PER_HOUR,
+  guestMintPerDevicePerDay: GUEST_MINT_PER_DEVICE_PER_DAY,
+  guestMintPerIpPerHour: GUEST_MINT_PER_IP_PER_HOUR,
+  guestMintPerSubnetPerHour: GUEST_MINT_PER_SUBNET_PER_HOUR,
+  billingMode: BILLING_MODE,
+  plans: PLANS,
+  getUserSubscription,
+  newSubscription,
 });
 
 // ==========================================
@@ -1493,100 +1343,21 @@ const PROJECT_FIELDS = [
 ] as const;
 const newProjectId = () => `proj_${Date.now()}_${crypto.randomBytes(5).toString('hex')}`;
 
-const byUpdatedDesc = (a: any, b: any) => new Date(b.updatedAt || 0).getTime() - new Date(a.updatedAt || 0).getTime();
-
 const ADMIN_LIST_LIMIT = 5000;
 
-app.get('/api/projects', rateLimit('projects-read', 120), async (req, res) => {
-  if (isAdmin(req) && req.query.all === '1') {
-    const { projects, unreadable } = await repo.listAllProjects(ADMIN_LIST_LIMIT);
-    return res.json({ success: true, projects: [...projects.sort(byUpdatedDesc), SAMPLE_PROJECT], unreadableShards: unreadable });
-  }
-  const mine = (await repo.listProjects(uid(req))).sort(byUpdatedDesc);
-  res.json({ success: true, projects: [...mine, SAMPLE_PROJECT] });
-});
-
-/** The project if the caller may read it (owner or admin); otherwise null (callers answer 404, never 403). */
-async function readableProject(req: express.Request, id: string) {
-  const found = await repo.getProject(id);
-  if (!found || !(found.ownerId === uid(req) || isAdmin(req))) return null;
-  return found;
-}
-
-app.get('/api/projects/:id', rateLimit('projects-read', 120), async (req, res) => {
-  if (req.params.id === SAMPLE_ID) return res.json({ success: true, project: SAMPLE_PROJECT });
-  const found = await readableProject(req, req.params.id);
-  // 404 (not 403) for other users' projects so ids cannot be enumerated.
-  if (!found) return res.status(404).json({ error: 'Project not found' });
-  res.json({ success: true, project: found.project });
-});
-
-app.post('/api/projects', rateLimit('projects-write', 60), async (req, res) => {
-  const payload = req.body;
-  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
-    return res.status(400).json({ error: 'Invalid project payload' });
-  }
-  const title = sanitizeString(payload.title, 200);
-  if (!title) return res.status(400).json({ error: 'Project title is required' });
-  if (payload.id !== undefined && (typeof payload.id !== 'string' || !PROJECT_ID_RE.test(payload.id))) {
-    return res.status(400).json({ error: 'Invalid project id format' });
-  }
-  if (payload.id === SAMPLE_ID) {
-    return res.status(409).json({ error: 'The sample project is read-only. Save it as a new project instead.', code: 'sample_read_only' });
-  }
-  if (payload.script !== undefined && (typeof payload.script !== 'object' || !Array.isArray(payload.script?.beats))) {
-    return res.status(400).json({ error: 'script.beats must be an array' });
-  }
-
-  const clean: Record<string, any> = {};
-  for (const f of PROJECT_FIELDS) if (payload[f] !== undefined) clean[f] = payload[f];
-  clean.title = title;
-  if (Buffer.byteLength(JSON.stringify(clean)) > STORE_LIMITS.maxProjectBytes) {
-    return res.status(413).json({ error: `Project is too large (max ${Math.round(STORE_LIMITS.maxProjectBytes / 1024)} KB).`, code: 'project_too_large' });
-  }
-
-  const userId = uid(req);
-  let id: string = payload.id;
-  let existing: any = null;
-  if (id) {
-    const found = await repo.getProject(id);
-    if (found && found.ownerId !== userId) return res.status(404).json({ error: 'Project not found' });
-    existing = found?.project ?? null;
-    // Ids are always server-issued: an unknown client id is treated as a new project with a fresh id.
-    if (!existing) id = newProjectId();
-  } else {
-    id = newProjectId();
-  }
-  const now = new Date().toISOString();
-  const project = { ...clean, id, userId, createdAt: existing?.createdAt || now, updatedAt: now };
-  // Ownership and quotas are re-checked atomically inside saveProject (ProjectOwnershipError -> 404). An update must
-  // not re-create a project deleted since it was read above (F8: ProjectNotFoundError -> the same 404).
-  await repo.saveProject(userId, project, { mustExist: Boolean(existing) });
-  res.json({ success: true, project });
-});
-
-app.delete('/api/projects/:id', rateLimit('projects-write', 60), async (req, res) => {
-  if (req.params.id === SAMPLE_ID) return res.status(400).json({ error: 'Cannot delete the built-in sample project' });
-  const found = await readableProject(req, req.params.id);
-  if (!found || !(await repo.deleteProject(found.ownerId, req.params.id))) return res.status(404).json({ error: 'Project not found' });
-  res.json({ success: true, message: 'Project deleted' });
-});
-
-app.post('/api/projects/:id/duplicate', rateLimit('projects-write', 60), async (req, res) => {
-  const existing = req.params.id === SAMPLE_ID ? SAMPLE_PROJECT : (await readableProject(req, req.params.id))?.project;
-  if (!existing) return res.status(404).json({ error: 'Source project not found' });
-  const now = new Date().toISOString();
-  const { isSample: _ignored, ...rest } = JSON.parse(JSON.stringify(existing));
-  const duplicated = {
-    ...rest,
-    id: newProjectId(),
-    userId: uid(req),
-    title: `${existing.title} (Copy)`.slice(0, 200),
-    createdAt: now,
-    updatedAt: now,
-  };
-  await repo.saveProject(uid(req), duplicated);
-  res.json({ success: true, project: duplicated });
+registerProjectRoutes(app, {
+  rateLimit,
+  getRepo: () => repo,
+  uid,
+  isAdmin,
+  sampleProject: SAMPLE_PROJECT,
+  sampleId: SAMPLE_ID,
+  adminListLimit: ADMIN_LIST_LIMIT,
+  projectIdRe: PROJECT_ID_RE,
+  projectFields: PROJECT_FIELDS,
+  maxProjectBytes: STORE_LIMITS.maxProjectBytes,
+  newProjectId,
+  sanitizeString,
 });
 
 app.post('/api/projects/claim', rateLimit('projects-write', 60), async (req, res) => {
