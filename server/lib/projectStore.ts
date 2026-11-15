@@ -13,6 +13,7 @@ import fs from 'fs';
 import path from 'path';
 import { readJsonFile, writeJsonFileAtomic, StoreUnavailableError, freeDiskBytes } from './storage.ts';
 import { createSnapshot, verifySnapshotDir } from './backup.ts';
+import { userKindOf } from './repo.ts';
 
 export interface StoreLimits {
   maxProjectBytes: number;
@@ -322,5 +323,26 @@ export class ProjectStore {
 
   countFor(userId: string): number {
     return this.readShard(userId).length;
+  }
+
+  /**
+   * Atomically transfers all projects from a guest shard to a non-guest user shard, enforcing the target user's
+   * storage and project-count limits before clearing the guest shard.
+   */
+  claimGuestProjects(fromGuestId: string, toUserId: string): number {
+    if (userKindOf(fromGuestId) !== 'guest' || userKindOf(toUserId) !== 'firebase' || fromGuestId === toUserId) {
+      return 0;
+    }
+    const fromProjects = this.readShard(fromGuestId);
+    if (fromProjects.length === 0) return 0;
+    const toProjects = this.readShard(toUserId);
+    const moved = fromProjects.map((p) => ({ ...p, userId: toUserId }));
+    // Write target shard first so any StoreLimitError leaves the guest shard and index untouched.
+    this.writeShard(toUserId, [...moved, ...toProjects], toProjects.length, this.shardBytes.get(toUserId) ?? 0);
+    for (const p of moved) {
+      if (typeof p?.id === 'string') this.index.set(p.id, toUserId);
+    }
+    this.writeShard(fromGuestId, [], fromProjects.length, this.shardBytes.get(fromGuestId) ?? 0);
+    return moved.length;
   }
 }

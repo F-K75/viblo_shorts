@@ -1589,6 +1589,22 @@ app.post('/api/projects/:id/duplicate', rateLimit('projects-write', 60), async (
   res.json({ success: true, project: duplicated });
 });
 
+app.post('/api/projects/claim', rateLimit('projects-write', 60), async (req, res) => {
+  if (req.identity?.kind !== 'firebase') {
+    return res.status(403).json({ error: 'Sign in with a non-guest account to claim guest projects.', code: 'sign_in_required' });
+  }
+  const guestToken = typeof req.body?.guestToken === 'string' ? req.body.guestToken.trim() : '';
+  if (!guestToken) {
+    return res.status(400).json({ error: 'guestToken is required', code: 'invalid_guest_token' });
+  }
+  const guestIdentity = authService.verifyGuestToken(guestToken);
+  if (!guestIdentity || guestIdentity.kind !== 'guest') {
+    return res.status(400).json({ error: 'Invalid or expired guest token', code: 'invalid_guest_token' });
+  }
+  const { claimed } = await repo.claimGuestProjects(guestIdentity.userId, req.identity.userId);
+  res.json({ success: true, claimed });
+});
+
 // ==========================================
 // FFMPEG RENDER ENGINE + BACKGROUND JOB QUEUE
 // ==========================================

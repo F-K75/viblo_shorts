@@ -87,6 +87,48 @@ for (const kind of ['json', 'postgres'] as const) {
       await r.saveProject(G2, proj('proj_h2', G2, 20 * KB));
     });
 
+    test('claimGuestProjects: transfers guest projects, enforces isolation and limits atomically', async () => {
+      const r = await makeRepo(kind);
+      await r.saveProject(G1, proj('proj_cg1', G1, 10 * KB));
+      await r.saveProject(G1, proj('proj_cg2', G1, 10 * KB));
+      await r.saveProject(G2, proj('proj_cg_other', G2, 30 * KB));
+      await r.saveProject('alice', proj('proj_alice_1', 'alice', 5 * KB));
+
+      // Non-guest source or guest target is a no-op; never claims non-guest projects
+      assert.deepEqual(await r.claimGuestProjects('alice', 'bob'), { claimed: 0 });
+      assert.equal((await r.getProject('proj_alice_1'))!.ownerId, 'alice');
+      assert.deepEqual(await r.claimGuestProjects(G2, G1), { claimed: 0 });
+      assert.equal((await r.getProject('proj_cg_other'))!.ownerId, G2);
+
+      // Claim G1 -> alice
+      assert.deepEqual(await r.claimGuestProjects(G1, 'alice'), { claimed: 2 });
+      assert.deepEqual(await r.listProjects(G1), []);
+      const aliceIds = (await r.listProjects('alice')).map((p) => p.id).sort();
+      assert.deepEqual(aliceIds, ['proj_alice_1', 'proj_cg1', 'proj_cg2']);
+      assert.equal((await r.getProject('proj_cg1'))!.ownerId, 'alice');
+      assert.equal((await r.getProject('proj_cg1'))!.project.userId, 'alice');
+      assert.equal((await r.getProject('proj_cg_other'))!.ownerId, G2, 'other guest untouched');
+
+      // Re-claiming is idempotent (0 claimed)
+      assert.deepEqual(await r.claimGuestProjects(G1, 'alice'), { claimed: 0 });
+
+      // Enforces target user byte quota atomically (G2 has 30 KB; charlie has 385 KB / 400 KB)
+      for (let i = 1; i <= 7; i++) await r.saveProject('charlie', proj(`proj_ch_${i}`, 'charlie', 55 * KB));
+      await assert.rejects(
+        r.claimGuestProjects(G2, 'charlie'),
+        (e: any) => e instanceof StoreLimitError && e.code === 'storage_quota_exceeded',
+      );
+      assert.equal((await r.getProject('proj_cg_other'))!.ownerId, G2, 'guest project preserved on quota error');
+
+      // Enforces target user project-count limit atomically (dave has 50 / 50 projects)
+      for (let i = 1; i <= 50; i++) await r.saveProject('dave', proj(`proj_dv_${i}`, 'dave', 10));
+      await assert.rejects(
+        r.claimGuestProjects(G2, 'dave'),
+        (e: any) => e instanceof StoreLimitError && e.code === 'project_limit',
+      );
+      assert.equal((await r.getProject('proj_cg_other'))!.ownerId, G2, 'guest project preserved on count limit error');
+    });
+
     test('AI quota: all-or-nothing reservation, idempotent reserve/settle, refund, expiry', async () => {
       const r = await makeRepo(kind);
       const d = today();

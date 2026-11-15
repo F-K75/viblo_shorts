@@ -137,6 +137,9 @@ export class JsonRepo implements Repo {
   async deleteProject(ownerId: string, id: string) {
     return this.store.delete(ownerId, id);
   }
+  async claimGuestProjects(fromGuestId: string, toUserId: string) {
+    return { claimed: this.store.claimGuestProjects(fromGuestId, toUserId) };
+  }
 
   // ---------- subscriptions ----------
   private subs() {
