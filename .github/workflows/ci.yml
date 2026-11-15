@@ -49,7 +49,6 @@ jobs:
         run: npm run build
       - name: Browser E2E (Playwright) on JSON and on PostgreSQL
         run: |
-          npm install --no-save playwright@1
           npx playwright install --with-deps chromium
           npm run test:e2e
           TEST_STORAGE_BACKEND=postgres npm run test:e2e
