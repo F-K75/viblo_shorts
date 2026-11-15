@@ -113,6 +113,7 @@ export class AuthService {
     if (typeof payload.sub !== 'string' || !payload.sub || payload.sub.length > 128) return null;
     if (typeof payload.exp !== 'number' || payload.exp + skew < nowS) return null;
     if (typeof payload.iat !== 'number' || payload.iat - skew > nowS) return null;
+    if (payload.email && payload.email_verified !== true) return null;
     return {
       userId: payload.sub,
       kind: 'firebase',

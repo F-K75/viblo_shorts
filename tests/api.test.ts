@@ -73,7 +73,7 @@ describe('authentication (P0 regression)', () => {
     assert.equal((await api('/api/projects', 'guest.e30.AAAA')).status, 401);
   });
   test('valid Firebase ID token accepted; wrong audience rejected', async () => {
-    const good = srv.signFirebaseToken({ sub: 'firebase-uid-1', email: 'u@example.com' });
+    const good = srv.signFirebaseToken({ sub: 'firebase-uid-1', email: 'u@example.com', email_verified: true });
     const me = await (await api('/api/auth/me', good)).json();
     assert.deepEqual(me, { success: true, userId: 'firebase-uid-1', kind: 'firebase', isAdmin: false });
     const bad = srv.signFirebaseToken({ sub: 'x', aud: 'someone-elses-project' });

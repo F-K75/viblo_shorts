@@ -9,6 +9,7 @@ import {
   sanitizeString,
   clampNumber,
 } from '../server/lib/security.ts';
+import { startTestServer } from './helpers/server.ts';
 
 test('SSRF: blocks loopback, private, link-local, metadata, IPv6 and encoded IPs', () => {
   const unsafe = [
@@ -73,4 +74,26 @@ test('sanitizeString and clampNumber', () => {
   assert.equal(clampNumber('5', 0, 10, 1), 5);
   assert.equal(clampNumber('nope', 0, 10, 7), 7);
   assert.equal(clampNumber(1e9, 0, 60, 1), 60);
+});
+
+test('Content-Security-Policy header is set with required directives and external origins', async () => {
+  const srv = await startTestServer();
+  try {
+    const res = await fetch(`${srv.baseUrl}/api/health`);
+    const csp = res.headers.get('content-security-policy');
+    assert.ok(csp, 'Content-Security-Policy header must be present');
+    assert.match(csp, /default-src 'self'/);
+    assert.match(csp, /object-src 'none'/);
+    assert.match(csp, /frame-ancestors 'self'/);
+    assert.match(csp, /script-src[^;]*'self'/);
+    assert.match(csp, /script-src[^;]*https:\/\/challenges\.cloudflare\.com/);
+    assert.match(csp, /style-src[^;]*https:\/\/fonts\.googleapis\.com/);
+    assert.match(csp, /font-src[^;]*https:\/\/fonts\.gstatic\.com/);
+    assert.match(csp, /img-src[^;]*https:\/\/i\.ytimg\.com/);
+    assert.match(csp, /img-src[^;]*blob:/);
+    assert.match(csp, /media-src[^;]*https:\/\/videos\.pexels\.com/);
+    assert.match(csp, /frame-src[^;]*https:\/\/www\.youtube\.com/);
+  } finally {
+    await srv.stop();
+  }
 });
