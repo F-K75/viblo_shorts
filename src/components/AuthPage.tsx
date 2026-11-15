@@ -17,6 +17,7 @@ import {
 import {
   signInWithEmailAndPassword,
   createUserWithEmailAndPassword,
+  sendPasswordResetEmail,
   signInWithPopup,
   GoogleAuthProvider,
   updateProfile,
@@ -161,6 +162,39 @@ export const AuthPage: React.FC<AuthPageProps> = ({
       } else {
         setError(err?.message || 'Google sign-in encountered an issue. You can continue as Guest.');
       }
+    }
+  };
+
+  const handleForgotPassword = async () => {
+    setError(null);
+    setInfoMessage(null);
+
+    const cleanEmail = email.trim();
+    if (!cleanEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
+      setError('Please enter a valid email address to reset your password.');
+      return;
+    }
+
+    setIsLoading(true);
+    try {
+      await sendPasswordResetEmail(auth, cleanEmail);
+      setInfoMessage(`Password reset email sent to ${cleanEmail}. Check your inbox and spam folder.`);
+    } catch (err: any) {
+      const code = err?.code || '';
+      console.warn('[Firebase Auth] Password reset error:', code, err?.message);
+      if (code === 'auth/invalid-email') {
+        setError('Invalid email address format.');
+      } else if (code === 'auth/user-not-found') {
+        setError('No account found with this email address.');
+      } else if (code === 'auth/too-many-requests') {
+        setError('Too many reset requests. Please wait a moment and try again.');
+      } else if (code === 'auth/network-request-failed') {
+        setError('Network error. Please check your connection and try again.');
+      } else {
+        setError(err?.message || 'Failed to send password reset email. Please try again.');
+      }
+    } finally {
+      setIsLoading(false);
     }
   };
 
@@ -325,11 +359,9 @@ export const AuthPage: React.FC<AuthPageProps> = ({
                 {mode === 'signin' && (
                   <button
                     type="button"
-                    onClick={() => {
-                      setInfoMessage('Password reset email instructions sent to your email.');
-                      setError(null);
-                    }}
-                    className="text-[11px] text-rose-400 hover:text-rose-300 transition"
+                    onClick={handleForgotPassword}
+                    disabled={isLoading}
+                    className="text-[11px] text-rose-400 hover:text-rose-300 transition disabled:opacity-50"
                   >
                     Forgot password?
                   </button>

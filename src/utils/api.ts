@@ -47,6 +47,21 @@ export async function ensureGuestSession(): Promise<{ token: string; userId: str
   return { token: data.token, userId: data.userId };
 }
 
+export function hasGuestSession(): boolean {
+  return readGuestToken() !== null;
+}
+
+function hasStoredNonGuestUser(): boolean {
+  try {
+    const raw = localStorage.getItem('forge_user') || localStorage.getItem('viblo_user');
+    if (!raw) return false;
+    const parsed = JSON.parse(raw);
+    return typeof parsed?.id === 'string' && !parsed.id.startsWith('guest_');
+  } catch {
+    return false;
+  }
+}
+
 export function clearGuestSession() {
   localStorage.removeItem(GUEST_TOKEN_KEY);
 }
@@ -57,6 +72,9 @@ async function getAuthToken(): Promise<string> {
     if (auth.currentUser) return await auth.currentUser.getIdToken();
   } catch {
     // Firebase unavailable (offline / blocked): fall back to guest session
+  }
+  if (!readGuestToken() && hasStoredNonGuestUser()) {
+    throw new Error('Your session has expired. Please sign in again.');
   }
   if (!guestTokenPromise) {
     guestTokenPromise = ensureGuestSession()
