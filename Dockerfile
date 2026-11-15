@@ -7,6 +7,12 @@ RUN bun install --frozen-lockfile
 COPY . .
 RUN bunx vite build
 
+# ---- prod-deps ----
+FROM oven/bun:1.4 AS prod-deps
+WORKDIR /app
+COPY package.json bun.lock ./
+RUN bun install --frozen-lockfile --production
+
 # ---- runtime ----
 FROM node:22-slim AS runtime
 RUN apt-get update \
@@ -16,11 +22,11 @@ WORKDIR /app
 ENV NODE_ENV=production \
     PORT=3000 \
     DATA_DIR=/data
-COPY --from=build /app/node_modules ./node_modules
+COPY --from=prod-deps /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
 COPY package.json server.ts firebase-applet-config.json ./
 COPY server ./server
-COPY scripts/backup.ts ./scripts/backup.ts
+COPY scripts/backup.ts scripts/data-migration.ts ./scripts/
 COPY assets ./assets
 RUN mkdir -p /data && chown -R node:node /data /app
 USER node
