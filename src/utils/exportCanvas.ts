@@ -200,3 +200,37 @@ export function drawCaptionChunk(
   });
   ctx.restore();
 }
+
+/**
+ * Draws a landscape (or any) source video frame into the vertical canvas.
+ * fill: centre crop to 9:16. fit: blurred, darkened cover as background + the whole frame centred.
+ */
+export function drawSourceFrame(ctx: CanvasRenderingContext2D, video: HTMLVideoElement, mode: 'fill' | 'fit', w: number, h: number) {
+  const vw = video.videoWidth;
+  const vh = video.videoHeight;
+  const cover = () => {
+    const target = w / h;
+    const src = vw / vh;
+    let sx = 0, sy = 0, sw = vw, sh = vh;
+    if (src > target) {
+      sw = vh * target;
+      sx = (vw - sw) / 2;
+    } else {
+      sh = vw / target;
+      sy = (vh - sh) / 2;
+    }
+    ctx.drawImage(video, sx, sy, sw, sh, 0, 0, w, h);
+  };
+  if (mode === 'fill') {
+    cover();
+    return;
+  }
+  ctx.save();
+  ctx.filter = 'blur(40px) brightness(0.45)';
+  cover();
+  ctx.restore();
+  const scale = Math.min(w / vw, h / vh);
+  const dw = vw * scale;
+  const dh = vh * scale;
+  ctx.drawImage(video, (w - dw) / 2, (h - dh) / 2, dw, dh);
+}

@@ -18,12 +18,14 @@ import {
   Eye,
   EyeOff,
   ShieldAlert,
+  FileVideo,
+  X,
 } from 'lucide-react';
 import { Beat, CaptionStyle, WordTiming, VisualSourceMode, AudioSourceMode } from '../types';
 import { chunkWords, applyCaptionOffset } from '../utils/pipeline';
 import { audioManager, MusicMood } from '../utils/audio';
 import { getSafeThumbnail, getSafeVideoUrl, isPlaceholderImage } from '../utils/visualPlaceholders';
-import { drawCaptionChunk, drawMotionBackground } from '../utils/exportCanvas';
+import { drawCaptionChunk, drawMotionBackground, drawSourceFrame } from '../utils/exportCanvas';
 
 function formatSecondsToTimestamp(sec: number): string {
   const m = Math.floor(sec / 60);
@@ -124,6 +126,35 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
   const [youtubeVolume, setYoutubeVolume] = useState(1.0);
   const [isYoutubeMuted, setIsYoutubeMuted] = useState(false);
   const [clipStartSec, setClipStartSec] = useState<number>(clipStartSeconds);
+
+  // The user's own copy of the source video (local file, never uploaded). YouTube's embedded player cannot be
+  // recorded, so this is what puts the real footage and the speaker's audio into exported clips.
+  const [sourceFile, setSourceFile] = useState<{ url: string; name: string } | null>(null);
+  const sourceVideoRef = useRef<HTMLVideoElement>(null);
+  const useSourceFile = Boolean(sourceFile) && visualMode !== 'b-roll';
+  useEffect(() => () => {
+    if (sourceFile) URL.revokeObjectURL(sourceFile.url);
+  }, [sourceFile]);
+  const handlePickSourceFile = (file: File | undefined) => {
+    if (!file) return;
+    if (!file.type.startsWith('video/') && !/\.(mp4|webm|mov|m4v|mkv)$/i.test(file.name)) {
+      setExportError('Please choose a video file (MP4, WebM or MOV).');
+      return;
+    }
+    setExportError(null);
+    setSourceFile({ url: URL.createObjectURL(file), name: file.name });
+  };
+
+  // Keep the local source video on the clip timeline: source time = clip start + playhead.
+  useEffect(() => {
+    const v = sourceVideoRef.current;
+    if (!v || !useSourceFile) return;
+    const target = clipStartSec + currentTimestamp;
+    if (Math.abs(v.currentTime - target) > 0.3) v.currentTime = target;
+    v.volume = youtubeVolume;
+    if (isPlaying && v.paused) v.play().catch(() => {});
+    if (!isPlaying && !v.paused) v.pause();
+  }, [isPlaying, currentTimestamp, clipStartSec, useSourceFile, youtubeVolume]);
 
   useEffect(() => {
     if (propVisualMode) {
@@ -370,8 +401,30 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
 
     try {
       const audioRunning = await audioManager.ensureRunning();
+      // The user's own source video: real footage + original speech. Music is ducked under the speech.
+      let sourceVideo: HTMLVideoElement | null = null;
+      let disconnectSource: (() => void) | null = null;
+      const sourceAudible = useSourceFile && audioMode === 'youtube' && !isYoutubeMuted;
+      if (useSourceFile && sourceFile) {
+        sourceVideo = document.createElement('video');
+        sourceVideo.src = sourceFile.url;
+        sourceVideo.playsInline = true;
+        sourceVideo.preload = 'auto';
+        sourceVideo.muted = !sourceAudible;
+        sourceVideo.volume = youtubeVolume;
+        await new Promise<void>((resolve, reject) => {
+          sourceVideo!.onloadedmetadata = () => resolve();
+          sourceVideo!.onerror = () => reject(new Error('could not read the source video file'));
+        });
+        sourceVideo.currentTime = Math.min(clipStartSec, Math.max(0, sourceVideo.duration - 0.1));
+        await new Promise((r) => {
+          sourceVideo!.onseeked = r;
+          setTimeout(r, 3000);
+        });
+        if (sourceAudible && audioRunning) disconnectSource = audioManager.connectElementToExport(sourceVideo);
+      }
       if (musicEnabled) {
-        audioManager.startBackgroundMusic(musicVolume, musicMood);
+        audioManager.startBackgroundMusic(sourceAudible ? musicVolume * 0.3 : musicVolume, musicMood);
       }
       // Only attach an audio track when the audio graph is running; a dead track stalls the muxer.
       const audioTrack = audioRunning ? audioManager.getExportAudioStream() : null;
@@ -445,6 +498,7 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
       ]);
 
       videoElements.forEach((v) => v.play().catch(() => {}));
+      if (sourceVideo) await sourceVideo.play().catch(() => {});
 
       // MediaRecorder captures in WALL-CLOCK time, so frames must be drawn in real time.
       // (Previously the loop ran ~3x faster than real time and a 33s Short exported as ~10s.)
@@ -487,7 +541,12 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
           });
 
         try {
-          if (currentV && currentV.videoWidth) {
+          if (sourceVideo && sourceVideo.videoWidth) {
+            // Keep footage on the wall clock (the recorder is real time): resync only on real drift.
+            const want = clipStartSec + t;
+            if (Math.abs(sourceVideo.currentTime - want) > 0.35 && !sourceVideo.seeking) sourceVideo.currentTime = want;
+            drawSourceFrame(ctx, sourceVideo, visualMode === 'youtube-fit' ? 'fit' : 'fill', canvasW, canvasH);
+          } else if (currentV && currentV.videoWidth) {
             const vw = currentV.videoWidth;
             const vh = currentV.videoHeight;
             const targetRatio = canvasW / canvasH;
@@ -550,6 +609,12 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
       recorder.stop();
       audioManager.stopSpeech();
       videoElements.forEach((v) => v.pause());
+      if (sourceVideo) {
+        sourceVideo.pause();
+        disconnectSource?.();
+        sourceVideo.removeAttribute('src');
+        sourceVideo.load();
+      }
 
       const blob = await exportPromise;
       const downloadUrl = URL.createObjectURL(blob);
@@ -640,7 +705,21 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
         className="relative w-full aspect-[9/16] rounded-3xl overflow-hidden shadow-2xl bg-black border border-white/12 select-none group"
       >
         {/* Visual Layer: YouTube Video OR Vertical B-Roll */}
-        {sourceYouTubeId && visualMode !== 'b-roll' ? (
+        {useSourceFile && sourceFile ? (
+          <div className="absolute inset-0 overflow-hidden bg-black flex items-center justify-center">
+            <video
+              ref={sourceVideoRef}
+              src={sourceFile.url}
+              playsInline
+              preload="auto"
+              muted={audioMode !== 'youtube' || isYoutubeMuted}
+              onLoadedMetadata={(e) => {
+                e.currentTarget.currentTime = clipStartSec + currentTimestamp;
+              }}
+              className={`w-full h-full pointer-events-none ${visualMode === 'youtube-fit' ? 'object-contain' : 'object-cover'}`}
+            />
+          </div>
+        ) : sourceYouTubeId && visualMode !== 'b-roll' ? (
           visualMode === 'youtube-fit' ? (
             <div className="absolute inset-0 overflow-hidden bg-black flex items-center justify-center">
               {/* Ambient blurred backdrop of original YouTube video */}
@@ -874,6 +953,44 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
           </div>
         )}
 
+        {sourceYouTubeId && (
+          <div className="p-2.5 bg-[#0f141c] border border-white/8 rounded-xl text-xs flex flex-col gap-1.5">
+            {sourceFile ? (
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-1.5 min-w-0 text-emerald-300">
+                  <FileVideo className="w-3.5 h-3.5 shrink-0" />
+                  <span className="truncate" title={sourceFile.name}>{sourceFile.name}</span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setSourceFile(null)}
+                  className="p-1 rounded-md text-neutral-400 hover:text-white hover:bg-white/5"
+                  aria-label="Remove source video file"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            ) : (
+              <label className="flex items-center justify-center gap-1.5 py-1.5 rounded-lg border border-dashed border-white/15 text-neutral-200 hover:border-rose-400/60 hover:text-white cursor-pointer transition">
+                <FileVideo className="w-3.5 h-3.5" />
+                <span>Add your video file for real footage + audio</span>
+                <input
+                  type="file"
+                  accept="video/*"
+                  className="sr-only"
+                  aria-label="Source video file"
+                  onChange={(e) => handlePickSourceFile(e.target.files?.[0])}
+                />
+              </label>
+            )}
+            <p className="text-[10px] leading-snug text-neutral-500">
+              {sourceFile
+                ? 'Export uses this file from the clip start, with its original audio. It stays on your device.'
+                : 'Use a copy of the full video you have the rights to (e.g. your own upload from YouTube Studio). It stays on your device.'}
+            </p>
+          </div>
+        )}
+
         {/* Primary Transport Controls */}
         <div className="flex items-center justify-between gap-2 p-2 bg-[#0f141c] border border-white/8 rounded-2xl">
           <div className="flex items-center gap-1.5">
@@ -1046,7 +1163,9 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
           </div>
 
           <p className="text-[10px] leading-snug text-neutral-500 px-1">
-            {isYouTubeSource
+            {isYouTubeSource && useSourceFile
+              ? 'Exports in real time with your video file\'s footage and original audio (a 30s clip takes ~30s). Keep this tab in the foreground.'
+              : isYouTubeSource
               ? 'Note: YouTube footage and audio cannot be recorded by the browser (embedded player). The export contains the thumbnail/B-roll with your captions; publish the clip from the original video with these captions (SRT in Publishing Pack).'
               : 'Exports render in real time (a 30s Short takes ~30s). Keep this tab in the foreground. Narration is included when server AI voice is available; browser system voices cannot be recorded.'}
           </p>

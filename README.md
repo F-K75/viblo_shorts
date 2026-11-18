@@ -42,6 +42,21 @@ normalised to YouTube loudness (−14 LUFS). With `GEMINI_API_KEY` set you get a
 with `PEXELS_API_KEY`, real stock footage. Without keys you get the built-in template script on animated
 motion-graphics backgrounds with background music.
 
+## Clip a long video (YouTube link + your own copy of the video)
+
+```bash
+npm run build
+npm run make-clip -- --url "https://www.youtube.com/watch?v=VIDEO_ID" \
+  --source my-video.mp4 --transcript transcript.txt --clip 1        # → output/forge_clip_1.mp4
+```
+
+* `--transcript`: paste of YouTube's "Show transcript" panel (or any `m:ss` timed text). Without it the server tries the
+  video's captions; without AI it then picks clips from the transcript itself (hook, complete sentences, no intro/outro).
+* `--source`: your own copy of the full video (e.g. downloaded from YouTube Studio). The browser cannot record
+  YouTube's embedded player, so this is what puts real footage and the speaker's audio into the clip. In the app:
+  *Canvas & Timeline → Add your video file*. It stays on your device.
+* `--clip N` picks the Nth candidate (1 = best), `--fit` letterboxes instead of centre-cropping.
+
 ## Production
 
 ```bash

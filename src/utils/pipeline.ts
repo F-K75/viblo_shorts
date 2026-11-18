@@ -131,19 +131,29 @@ export function assignBeatTimings(
  */
 export function chunkWords(words: WordTiming[], wordsPerChunk = 3): CaptionChunk[] {
   const chunks: CaptionChunk[] = [];
-
-  for (let i = 0; i < words.length; i += wordsPerChunk) {
-    const group = words.slice(i, i + wordsPerChunk);
-    if (!group || group.length === 0) continue;
-
+  const max = Math.max(1, wordsPerChunk);
+  let group: WordTiming[] = [];
+  const flush = () => {
+    if (group.length === 0) return;
     chunks.push({
-      text: group.map(w => w.word.toUpperCase().replace(/[.,!?;:]/g, '')).join(' '),
+      text: group.map((w) => w.word.toUpperCase().replace(/[.,!?;:]/g, '')).join(' '),
       start_s: group[0].start_s,
       end_s: group[group.length - 1].end_s,
       words: group,
     });
-  }
+    group = [];
+  };
 
+  words.forEach((w, i) => {
+    const prev = words[i - 1];
+    // Never join words across a sentence end, a beat change, or a real pause: "LAZY THE" reads badly.
+    if (group.length > 0 && prev && (/[.!?]["')\]]?$/.test(prev.word) || prev.beatId !== w.beatId || w.start_s - prev.end_s > 0.5)) {
+      flush();
+    }
+    group.push(w);
+    if (group.length >= max) flush();
+  });
+  flush();
   return chunks;
 }
 

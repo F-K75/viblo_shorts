@@ -134,11 +134,11 @@ export const StudioPage2ClipStrategies: React.FC<StudioPage2ClipStrategiesProps>
             <div className="flex items-center gap-2">
               <Flame className="w-4 h-4 text-amber-400" />
               <h2 className="text-base font-semibold text-white tracking-tight">
-                AI Clip Strategies & Viral Candidates
+                Clip Candidates
               </h2>
             </div>
             <p className="text-xs text-neutral-400 mt-0.5">
-              Ranked by retention probability and 3-second hook strength. Click any candidate to load its segment into the trimmer.
+              Best first: strongest opening hook and a complete, self-contained thought. Click any candidate to load its segment into the trimmer.
             </p>
           </div>
 
@@ -159,6 +159,7 @@ export const StudioPage2ClipStrategies: React.FC<StudioPage2ClipStrategiesProps>
               return (
                 <div
                   key={cand.id || idx}
+                  data-clip-candidate
                   onClick={() => onSelectCandidate(cand)}
                   className={`p-4 rounded-xl border cursor-pointer transition-all flex flex-col justify-between text-left ${
                     isCurrent

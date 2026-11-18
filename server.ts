@@ -26,6 +26,7 @@ import {
   parsePastedTranscriptToSegments,
   estimateWordTimeline,
   estimateSentenceBeats,
+  pickTranscriptClips,
 } from './server/lib/youtube.ts';
 import { AuthService, resolveSessionSecret, type AuthIdentity } from './server/lib/auth.ts';
 import os from 'os';
@@ -1990,49 +1991,48 @@ app.post('/api/stock-footage', rateLimit('stock', 60), async (req, res) => {
  * the transcript is cut into consecutive ~30s windows on segment boundaries. Captions are verbatim.
  */
 function buildTranscriptClips(segments: Array<{ start_s: number; end_s: number; text: string }>, videoId: string) {
-  const clips: any[] = [];
-  let i = 0;
-  while (i < segments.length && clips.length < 3) {
-    const start = segments[i].start_s;
-    const window: typeof segments = [];
-    while (i < segments.length && (window.length === 0 || segments[i].end_s - start <= 45)) {
-      window.push(segments[i]);
-      i++;
-      if (segments[i - 1].end_s - start >= 25) break;
-    }
-    const end = window[window.length - 1].end_s;
+  const segs = [...segments].sort((a, b) => a.start_s - b.start_s);
+  const fmt = (t: number) => `${String(Math.floor(t / 60)).padStart(2, '0')}:${String(Math.floor(t % 60)).padStart(2, '0')}`;
+  return pickTranscriptClips(segs).map((p, n) => {
+    const window = segs.slice(p.startIdx, p.endIdx + 1);
     const beats = window.map((seg) => {
-      const relStart = Math.max(0, +(seg.start_s - start).toFixed(2));
-      return { text: seg.text, visual_keywords: 'speaker talking close up', start_s: relStart, end_s: Math.max(relStart + 0.6, +(seg.end_s - start).toFixed(2)) };
+      const relStart = Math.max(0, +(seg.start_s - p.start_s).toFixed(2));
+      return {
+        text: seg.text,
+        visual_keywords: p.keywords.slice(0, 3).join(' ') || 'speaker talking close up',
+        start_s: relStart,
+        end_s: Math.max(relStart + 0.6, +(seg.end_s - p.start_s).toFixed(2)),
+      };
     });
-    const fmt = (t: number) => `${String(Math.floor(t / 60)).padStart(2, '0')}:${String(Math.floor(t % 60)).padStart(2, '0')}`;
-    clips.push({
-      id: `yt-clip-${videoId}-${clips.length + 1}`,
-      clipTitle: window[0].text.slice(0, 60),
-      reasoning: 'Consecutive transcript segment (AI ranking unavailable).',
+    const tags = p.keywords.slice(0, 3).map((k) => `#${k}`);
+    return {
+      id: `yt-clip-${videoId}-${n + 1}`,
+      clipTitle: p.title,
+      // Heuristic transcript score (hook, clean sentence boundaries, length), not a prediction of views.
+      viralScore: p.score,
+      reasoning: `Picked from the transcript (AI ranking unavailable): ${p.reasons.join(', ')}.`,
       hook: window[0].text,
-      approxStartTimestamp: fmt(start),
-      approxEndTimestamp: fmt(end),
-      startSeconds: start,
-      endSeconds: end,
+      approxStartTimestamp: fmt(p.start_s),
+      approxEndTimestamp: fmt(p.end_s),
+      startSeconds: p.start_s,
+      endSeconds: p.end_s,
       beats,
-      suggestedTitles: [`${window[0].text.slice(0, 55)} #shorts`],
+      suggestedTitles: [`${p.title.replace(/[.…]$/, '')} #shorts`],
       description: window.map((w) => w.text).join(' ').slice(0, 200),
-      hashtags: ['#shorts'],
+      hashtags: ['#shorts', ...tags],
       hasAudioCC: true,
       timestampsEstimated: false,
-    });
-  }
-  return clips;
+    };
+  });
 }
 
 // Fallback clips for YouTube videos when offline or model unavailable
-function generateFallbackYouTubeClips(title: string, authorName: string, videoId: string) {
+function generateFallbackYouTubeClips(title: string, _authorName: string, videoId: string) {
+  // No transcript and no AI: generic drafts only. No scores and nothing attributed to the real channel.
   return [
     {
       id: `clip-${videoId}-1`,
       clipTitle: 'The Core Revelation Hook',
-      viralScore: 96,
       reasoning: 'Opens with high curiosity contrarian question that prevents swipe-away in the first 2 seconds.',
       hook: `Most people get this completely wrong about ${title.slice(0, 30)}...`,
       approxStartTimestamp: '00:15',
@@ -2043,7 +2043,7 @@ function generateFallbackYouTubeClips(title: string, authorName: string, videoId
           visual_keywords: 'person typing laptop desk focus',
         },
         {
-          text: `Here is the one counter-intuitive insight shared by ${authorName}.`,
+          text: `Here is one counter-intuitive idea worth testing.`,
           visual_keywords: 'speaker microphone stage talking',
         },
         {
@@ -2062,15 +2062,14 @@ function generateFallbackYouTubeClips(title: string, authorName: string, videoId
       suggestedTitles: [
         `The 60-Second Truth About ${title.slice(0, 25)} #shorts`,
         `Why 99% Fail at This (Watch Till End)`,
-        `The Secret Hack Revealed by ${authorName} 🚀`,
+        `One Idea Worth Stealing 🚀`,
       ],
-      description: `Key insight extracted from "${title}" by ${authorName}. Watch the full breakdown.`,
+      description: `Template draft (not taken from the video). Replace these lines with the speaker's actual words.`,
       hashtags: ['#shorts', '#viral', '#mindset', '#productivity', '#success'],
     },
     {
       id: `clip-${videoId}-2`,
       clipTitle: 'The Biggest Mistake Breakdown',
-      viralScore: 91,
       reasoning: 'Warning framing triggers loss aversion and creates an intense loop of attention.',
       hook: `Stop doing this immediately if you want to avoid burnout!`,
       approxStartTimestamp: '01:20',
@@ -2102,13 +2101,12 @@ function generateFallbackYouTubeClips(title: string, authorName: string, videoId
         `Stop Doing This Immediately! #shorts`,
         `How to Actually Win (Hard Truth)`,
       ],
-      description: `Crucial warning from "${title}". Save and share with someone who needs this.`,
+      description: `Template draft (not taken from the video). Replace these lines with the speaker's actual words.`,
       hashtags: ['#shorts', '#lifehack', '#discipline', '#growth', '#motivation'],
     },
     {
       id: `clip-${videoId}-3`,
       clipTitle: 'The 3-Step Action Blueprint',
-      viralScore: 88,
       reasoning: 'Clean listicle structure keeps viewer retention high from step 1 through step 3.',
       hook: `Here are 3 rules you can steal from this video today.`,
       approxStartTimestamp: '02:45',
@@ -2140,7 +2138,7 @@ function generateFallbackYouTubeClips(title: string, authorName: string, videoId
         `The Exact Blueprint (Step by Step)`,
         `Master This Before It's Too Late #shorts`,
       ],
-      description: `3 actionable takeaways from "${title}". Which one will you try first?`,
+      description: `Template draft (not taken from the video). Replace these lines with the speaker's actual words.`,
       hashtags: ['#shorts', '#productivity', '#habits', '#goals', '#tips'],
     },
   ];

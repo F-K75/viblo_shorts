@@ -8,7 +8,9 @@ import {
   parseTimestampToSeconds,
   estimateWordTimeline,
   estimateSentenceBeats,
+  pickTranscriptClips,
 } from '../server/lib/youtube.ts';
+import fs from 'node:fs';
 
 test('extractYouTubeId: all valid link formats', () => {
   const id = 'UF8uR6Z6KLc';
@@ -95,4 +97,37 @@ test('estimateSentenceBeats: splits sentences and covers full duration', () => {
   assert.equal(beats.length, 3);
   assert.equal(beats[0].start_s, 0);
   assert.ok(Math.abs(beats[2].end_s - 12) < 0.05);
+});
+
+test('pickTranscriptClips: finds the strongest self-contained moments, skips intro/outro/tangents', () => {
+  const segs = parsePastedTranscriptToSegments(fs.readFileSync(new URL('./fixtures/talk.transcript.txt', import.meta.url), 'utf8'));
+  assert.equal(segs.length, 31);
+  const clips = pickTranscriptClips(segs);
+  assert.equal(clips.length, 3);
+  const firstLine = (c: (typeof clips)[number]) => segs[c.startIdx].text;
+  assert.deepEqual(clips.map(firstLine).sort(), [
+    'Here is the simple rule that changed everything for me.',
+    'The biggest mistake people make is writing tasks as vague nouns.',
+    'Why does your to-do list never actually get done?',
+  ]);
+  assert.equal(firstLine(clips[0]), 'Why does your to-do list never actually get done?'); // best first
+  for (const c of clips) {
+    const d = c.end_s - c.start_s;
+    assert.ok(d >= 18 && d <= 50, `duration ${d}`);
+    assert.match(segs[c.endIdx].text, /[.!?]$/, 'ends on a full sentence');
+    const text = segs.slice(c.startIdx, c.endIdx + 1).map((s) => s.text).join(' ');
+    assert.doesNotMatch(text, /subscribe|welcome back|office setup|Thank you so much/);
+    assert.ok(c.score >= 0 && c.score <= 100);
+  }
+  // no overlaps
+  const sorted = [...clips].sort((a, b) => a.start_s - b.start_s);
+  for (let i = 1; i < sorted.length; i++) assert.ok(sorted[i].start_s >= sorted[i - 1].end_s);
+});
+
+test('pickTranscriptClips: unpunctuated auto-captions and tiny inputs', () => {
+  assert.deepEqual(pickTranscriptClips([]), []);
+  const auto = Array.from({ length: 40 }, (_, i) => ({ start_s: i * 2, end_s: i * 2 + 2, text: `word ${i} and some more spoken words here` }));
+  const clips = pickTranscriptClips(auto);
+  assert.ok(clips.length >= 1 && clips.length <= 3);
+  for (const c of clips) assert.ok(c.end_s - c.start_s >= 18 && c.end_s - c.start_s <= 50);
 });
