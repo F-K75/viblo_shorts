@@ -30,6 +30,18 @@ Without `GEMINI_API_KEY` the app still works, using built-in template content th
 | `npm run build` | Typecheck + production bundle in `dist/` |
 | `npm start` | Production server (requires `SESSION_SECRET`) |
 
+## Make a finished video from the command line
+
+```bash
+npm run build
+npm run make-video -- "5 science-backed habits to fall asleep faster"   # → output/forge_short.mp4
+```
+
+Drives the real UI in headless Chromium (guest → idea → script → export) and writes a 1080×1920 H.264/AAC MP4
+normalised to YouTube loudness (−14 LUFS). With `GEMINI_API_KEY` set you get an AI-written script and AI voiceover;
+with `PEXELS_API_KEY`, real stock footage. Without keys you get the built-in template script on animated
+motion-graphics backgrounds with background music.
+
 ## Production
 
 ```bash

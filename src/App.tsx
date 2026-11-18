@@ -159,8 +159,9 @@ export const App: React.FC = () => {
   const [isPlaying, setIsPlaying] = useState(false);
   const [voiceName, setVoiceName] = useState('Kore');
   const [aiVoiceEnabled, setAiVoiceEnabled] = useState(false);
-  const [musicEnabled, setMusicEnabled] = useState(false);
-  const [musicVolume, setMusicVolume] = useState(0.12);
+  // On by default: a silent Short is rarely what anyone wants to upload. Toggle in the player.
+  const [musicEnabled, setMusicEnabled] = useState(true);
+  const [musicVolume, setMusicVolume] = useState(0.3);
 
   const [editingClipBeat, setEditingClipBeat] = useState<Beat | null>(null);
   const [isDriveModalOpen, setIsDriveModalOpen] = useState(false);

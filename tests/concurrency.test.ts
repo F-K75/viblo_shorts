@@ -59,7 +59,7 @@ describe('R-02: AI quota under concurrency (two instances, one shared IP)', { sk
     assert.deepEqual([...new Set(statuses)], [200], `statuses: ${statuses.join(',')}`);
     assert.ok(bodies.every((b) => b.isFallback === true), 'no key configured: every response is a labelled fallback');
     const counters = await settled(db);
-    assert.deepEqual(counters.filter((c) => c.count !== 0), [], `every reservation refunded: ${JSON.stringify(counters)}`);
+    assert.deepEqual(counters.filter((c: { key: string; count: number }) => c.count !== 0), [], `every reservation refunded: ${JSON.stringify(counters)}`);
     assert.deepEqual([...errorsIn(A), ...errorsIn(B)], [], 'no deadlocks or failed refunds in either instance log');
   });
 
@@ -79,8 +79,8 @@ describe('R-02: AI quota under concurrency (two instances, one shared IP)', { sk
     assert.equal(real, 30, 'exactly 3 real model results per user');
     assert.equal(stub.calls, 30, 'model called exactly as often as charged');
     const counters = await settled(db);
-    for (let i = 0; i < 10; i++) assert.equal(counters.find((c) => c.key === `user:mixed-${i}`)?.count, 3, `user ${i} charged exactly 3`);
-    assert.equal(counters.find((c) => c.key.startsWith('ip:'))?.count, 30, 'IP charged only for real results');
+    for (let i = 0; i < 10; i++) assert.equal(counters.find((c: { key: string; count: number }) => c.key === `user:mixed-${i}`)?.count, 3, `user ${i} charged exactly 3`);
+    assert.equal(counters.find((c: { key: string; count: number }) => c.key.startsWith('ip:'))?.count, 30, 'IP charged only for real results');
     assert.deepEqual([...errorsIn(A), ...errorsIn(B)], []);
   });
 });

@@ -22,7 +22,8 @@ import {
 import { Beat, CaptionStyle, WordTiming, VisualSourceMode, AudioSourceMode } from '../types';
 import { chunkWords, applyCaptionOffset } from '../utils/pipeline';
 import { audioManager, MusicMood } from '../utils/audio';
-import { getSafeThumbnail, getSafeVideoUrl } from '../utils/visualPlaceholders';
+import { getSafeThumbnail, getSafeVideoUrl, isPlaceholderImage } from '../utils/visualPlaceholders';
+import { drawCaptionChunk, drawMotionBackground } from '../utils/exportCanvas';
 
 function formatSecondsToTimestamp(sec: number): string {
   const m = Math.floor(sec / 60);
@@ -357,7 +358,6 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
 
     const canvasW = exportResolution === '720p' ? 720 : 1080;
     const canvasH = exportResolution === '720p' ? 1280 : 1920;
-    const scaleFactor = canvasW / 1080;
 
     const canvas = document.createElement('canvas');
     canvas.width = canvasW;
@@ -473,6 +473,18 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
 
         ctx.fillStyle = '#0a0a0a';
         ctx.fillRect(0, 0, canvasW, canvasH);
+        const drawMotion = () =>
+          drawMotionBackground(ctx, {
+            t,
+            beatIndex: activeIdx,
+            beatCount: beats.length,
+            beatProgress: currentBeat ? Math.max(0, Math.min(1, (t - currentBeat.start_s) / Math.max(0.5, currentBeat.end_s - currentBeat.start_s))) : 0,
+            beatElapsed: currentBeat ? Math.max(0, t - currentBeat.start_s) : t,
+            text: currentBeat?.text,
+            keywords: currentBeat?.visual_keywords,
+            w: canvasW,
+            h: canvasH,
+          });
 
         try {
           if (currentV && currentV.videoWidth) {
@@ -490,7 +502,7 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
               sy = (vh - sh) / 2;
             }
             ctx.drawImage(currentV, sx, sy, sw, sh, 0, 0, canvasW, canvasH);
-          } else if (currentImg && currentImg.naturalWidth) {
+          } else if (currentImg && currentImg.naturalWidth && !isPlaceholderImage(currentImg.src)) {
             const iw = currentImg.naturalWidth;
             const ih = currentImg.naturalHeight;
             const targetRatio = canvasW / canvasH;
@@ -517,75 +529,16 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
             ctx.drawImage(currentImg, sx, sy, sw, sh, 0, 0, canvasW, canvasH);
             ctx.restore();
           } else {
-            // Elegant native background gradient fallback
-            const grad = ctx.createLinearGradient(0, 0, canvasW, canvasH);
-            grad.addColorStop(0, '#0d121c');
-            grad.addColorStop(1, '#1b2234');
-            ctx.fillStyle = grad;
-            ctx.fillRect(0, 0, canvasW, canvasH);
+            drawMotion();
           }
         } catch {
-          // Graceful fallback if CORS blocks image capture
-          const grad = ctx.createLinearGradient(0, 0, canvasW, canvasH);
-          grad.addColorStop(0, '#0d121c');
-          grad.addColorStop(1, '#1e1b4b');
-          ctx.fillStyle = grad;
-          ctx.fillRect(0, 0, canvasW, canvasH);
+          // CORS-tainted or undecodable media: keep the frame alive with the motion background
+          drawMotion();
         }
 
         const chunk = captionChunks.find((c) => t >= c.start_s && t <= c.end_s);
         if (captionStyle.showCaptions !== false && chunk) {
-          ctx.save();
-          const fontFam = captionStyle.fontFamily || 'Montserrat';
-          const fontWt = captionStyle.fontWeight || '900';
-          const computedFontSize = (captionStyle.fontSize * 1.5) * scaleFactor;
-          ctx.font = `${fontWt} ${computedFontSize}px '${fontFam}', 'Poppins', sans-serif`;
-          ctx.textAlign = 'center';
-          ctx.textBaseline = 'middle';
-
-          const textY = canvasH * (captionStyle.positionY / 100);
-          const wordsInChunk = chunk.words;
-          const isUpper = captionStyle.textTransform !== 'none';
-          const formatWord = (w: string) => isUpper ? w.toUpperCase().replace(/[.,!?;:]/g, '') : w.replace(/[.,!?;:]/g, '');
-
-          const wordMetrics = wordsInChunk.map((w) => {
-            const formatted = formatWord(w.word);
-            return {
-              word: formatted,
-              width: ctx.measureText(formatted + ' ').width,
-              isActive: t >= w.start_s && t <= w.end_s,
-            };
-          });
-
-          const totalTextWidth = wordMetrics.reduce((acc, m) => acc + m.width, 0);
-          let currentX = (canvasW - totalTextWidth) / 2;
-
-          ctx.fillStyle = captionStyle.boxStyle === 'glow' ? 'rgba(10,5,20,0.85)' : 'rgba(0,0,0,0.72)';
-          const padX = 35 * scaleFactor;
-          const boxH = (captionStyle.fontSize * 2.2) * scaleFactor;
-          ctx.beginPath();
-          ctx.roundRect(
-            (canvasW - totalTextWidth) / 2 - padX,
-            textY - boxH / 2,
-            totalTextWidth + padX * 2,
-            boxH,
-            24 * scaleFactor
-          );
-          ctx.fill();
-
-          wordMetrics.forEach((item) => {
-            const wordCenterX = currentX + item.width / 2;
-            ctx.strokeStyle = captionStyle.strokeColor || '#000000';
-            ctx.lineWidth = ((captionStyle.strokeWidth || 4) * 2) * scaleFactor;
-            ctx.strokeText(item.word, wordCenterX, textY);
-
-            ctx.fillStyle = item.isActive ? captionStyle.highlightColor : captionStyle.textColor;
-            ctx.fillText(item.word, wordCenterX, textY);
-
-            currentX += item.width;
-          });
-
-          ctx.restore();
+          drawCaptionChunk(ctx, { words: chunk.words, t, style: captionStyle, w: canvasW, h: canvasH });
         }
 
         videoTrack.requestFrame?.();
