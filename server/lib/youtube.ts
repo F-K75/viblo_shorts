@@ -325,7 +325,9 @@ export function pickTranscriptClips(
     const title = firstSentence.length <= 60 ? firstSentence : firstSentence.slice(0, 60).replace(/\s+\S*$/, '') + '…';
     const freq = new Map<string, number>();
     for (const w of text.toLowerCase().match(/[a-z][a-z']{3,}/g) || []) {
-      if (!STOPWORDS.has(w.replace(/'/g, ''))) freq.set(w, (freq.get(w) || 0) + 1);
+      const k = w.replace(/'/g, '');
+      // Topic words only: stopwords and generic hook words ("never", "always") make useless hashtags.
+      if (!STOPWORDS.has(k) && !STRONG_WORDS.includes(k)) freq.set(w, (freq.get(w) || 0) + 1);
     }
     const keywords = [...freq.entries()].sort((a, b) => b[1] - a[1]).slice(0, 4).map(([w]) => w.replace(/'/g, ''));
     const positives = c.reasons.filter((r) => !/mid-sentence|intro|slow|connective|tangent/.test(r));

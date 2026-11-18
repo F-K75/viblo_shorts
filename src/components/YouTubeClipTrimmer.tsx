@@ -133,7 +133,7 @@ export const YouTubeClipTrimmer: React.FC<YouTubeClipTrimmerProps> = ({
           {script.viralScore && (
             <div className="hidden sm:flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-amber-500/10 border border-amber-500/20 text-amber-300 text-xs font-mono font-bold shrink-0">
               <Flame className="w-3.5 h-3.5 text-amber-400" />
-              <span>{script.viralScore}/100 Virality</span>
+              <span>Clip score {script.viralScore}/100</span>
             </div>
           )}
         </div>

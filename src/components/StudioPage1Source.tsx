@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   Wand2,
   Youtube,
@@ -58,6 +58,10 @@ export const StudioPage1Source: React.FC<StudioPage1SourceProps> = ({
   const [clipObjective, setClipObjective] = useState('Viral Hook & High Retention');
   const [transcript, setTranscript] = useState('');
   const [showTranscript, setShowTranscript] = useState(false);
+  // When the server needs a transcript, open the paste box right away.
+  useEffect(() => {
+    if (errorMessage && /Show transcript/.test(errorMessage)) setShowTranscript(true);
+  }, [errorMessage]);
   const [showAdvancedPrompt, setShowAdvancedPrompt] = useState(false);
   const [targetDuration, setTargetDuration] = useState<30 | 45 | 60>(30);
 

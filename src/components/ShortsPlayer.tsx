@@ -1166,9 +1166,18 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
             {isYouTubeSource && useSourceFile
               ? 'Exports in real time with your video file\'s footage and original audio (a 30s clip takes ~30s). Keep this tab in the foreground.'
               : isYouTubeSource
-              ? 'Note: YouTube footage and audio cannot be recorded by the browser (embedded player). The export contains the thumbnail/B-roll with your captions; publish the clip from the original video with these captions (SRT in Publishing Pack).'
+              ? 'Without your video file the export is a captions-only clip on animated backgrounds (no speaker footage or voice). YouTube\'s embedded player cannot be recorded.'
               : 'Exports render in real time (a 30s Short takes ~30s). Keep this tab in the foreground. Narration is included when server AI voice is available; browser system voices cannot be recorded.'}
           </p>
+          {isYouTubeSource && !sourceFile && visualMode !== 'b-roll' && (
+            <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-200 flex items-start gap-2">
+              <FileVideo className="w-3.5 h-3.5 mt-0.5 shrink-0" />
+              <span>
+                <strong className="font-semibold">Add your video file</strong> (above the play controls) to export this clip with the
+                real footage and the speaker&apos;s voice.
+              </span>
+            </div>
+          )}
           {exportError && (
             <div role="alert" className="rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-[11px] text-rose-200">
               {exportError}

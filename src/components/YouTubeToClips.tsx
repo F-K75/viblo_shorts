@@ -374,7 +374,7 @@ export const YouTubeToClips: React.FC<YouTubeToClipsProps> = ({
                       </div>
 
                       <div className="flex items-center gap-2 text-neutral-400 font-mono tabular-nums">
-                        <span className="text-amber-400 font-semibold">{clip.viralScore}/100 Virality</span>
+                        <span className="text-amber-400 font-semibold">Clip score {clip.viralScore}/100</span>
                         <span aria-hidden="true">·</span>
                         <span>{clip.approxStartTimestamp || '00:00'} ({durationSec}s)</span>
                       </div>

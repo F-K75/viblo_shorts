@@ -83,13 +83,16 @@ test('generate-clips with a pasted transcript is grounded: verbatim captions fro
   for (const c of d.clips) assert.ok(c.endSeconds > c.startSeconds);
 });
 
-test('generate-clips without any transcript: template clips carry a clear grounding warning', async () => {
-  const d = await (await post('/api/youtube/generate-clips', { url: 'https://www.youtube.com/watch?v=UF8uR6Z6KLc' })).json();
-  // In this sandbox YouTube is unreachable, so no captions can be fetched.
-  if (d.transcriptSource === 'none') {
-    assert.equal(d.grounded, false);
-    assert.match(d.groundingWarning, /not match/);
-    assert.ok(d.clips.every((c: any) => c.timestampsEstimated === true));
+test('generate-clips without any transcript and without AI: asks for the transcript instead of inventing clips', async () => {
+  const r = await post('/api/youtube/generate-clips', { url: 'https://www.youtube.com/watch?v=UF8uR6Z6KLc' });
+  const d = await r.json();
+  // Captions may be reachable from some networks; only the no-transcript case is asserted.
+  if (r.status === 422) {
+    assert.equal(d.code, 'transcript_required');
+    assert.match(d.error, /Show transcript/);
+    assert.equal(d.clips, undefined, 'no template clips that look real but are not');
+  } else {
+    assert.equal(d.grounded, true);
   }
 });
 

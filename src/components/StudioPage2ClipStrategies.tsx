@@ -196,7 +196,7 @@ export const StudioPage2ClipStrategies: React.FC<StudioPage2ClipStrategiesProps>
 
                   <div className="mt-4 pt-3 border-t border-white/6 flex items-center justify-between text-xs">
                     <span className="font-mono text-neutral-400 text-[11px]">
-                      {cand.approxStartTimestamp || '00:00'} ({candDuration}s)
+                      {cand.approxStartTimestamp || '00:00'} ({+candDuration.toFixed(1)}s)
                     </span>
 
                     {isCurrent ? (
@@ -220,9 +220,11 @@ export const StudioPage2ClipStrategies: React.FC<StudioPage2ClipStrategiesProps>
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2">
                 <span className="text-xs font-semibold text-white">Active Hook Strategy</span>
-                <span className="text-[10px] font-mono text-emerald-400 bg-emerald-950/60 border border-emerald-500/30 px-1.5 py-0.5 rounded">
-                  97/100 Virality
-                </span>
+                {typeof script.viralScore === 'number' && script.viralScore > 0 && (
+                  <span className="text-[10px] font-mono text-emerald-400 bg-emerald-950/60 border border-emerald-500/30 px-1.5 py-0.5 rounded">
+                    Clip score {script.viralScore}/100
+                  </span>
+                )}
               </div>
               <span className="font-mono text-xs text-neutral-400">{duration.toFixed(1)}s Target Duration</span>
             </div>

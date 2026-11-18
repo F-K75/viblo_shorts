@@ -619,7 +619,7 @@ export const App: React.FC = () => {
       setVideoInfo(infoData);
       setTopic(infoData.title);
 
-      setGenerationStep('Gemini analyzing viral moments and high-retention clip strategies...');
+      setGenerationStep(customTranscript ? 'Finding the strongest clip moments in the transcript...' : 'Fetching captions and finding the strongest clip moments...');
       const genRes = await apiFetch('/api/youtube/generate-clips', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
