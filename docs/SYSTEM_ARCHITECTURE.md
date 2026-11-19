@@ -25,7 +25,8 @@ Browser (React SPA)
   │  Authorization: Bearer <Firebase ID token | guest token>
   ▼
 Express server (server.ts) ─────────────┬── server/lib/auth.ts      (RS256 Firebase verify, HMAC guest tokens)
-  │  security headers, request log,     ├── server/lib/security.ts  (SSRF, render-id, range, drawtext escaping)
+  │  security headers (CSP, COOP, …),   ├── server/lib/csp.ts       (CSP allow-list builder, CSP_* env parsing)
+  │  request log,                       ├── server/lib/security.ts  (SSRF, render-id, range, drawtext escaping)
   │  CORS, JSON body (1 MB), auth gate, ├── server/lib/youtube.ts   (URL/caption parsing, timing estimation)
   │  per-route token-bucket limiter     ├── server/lib/llm.ts       (JSON parse + schema validation)
   │                                     ├── server/lib/repo.ts      (Repo interface; jsonRepo.ts / db/pgRepo.ts)

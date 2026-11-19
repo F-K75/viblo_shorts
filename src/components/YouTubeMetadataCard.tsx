@@ -96,7 +96,7 @@ export const YouTubeMetadataCard: React.FC<YouTubeMetadataCardProps> = ({ script
               {script.viralScore && (
                 <>
                   <span aria-hidden="true">·</span>
-                  <span className="font-mono tabular-nums text-amber-400 font-medium">Virality {script.viralScore}/100</span>
+                  <span className="font-mono tabular-nums text-amber-400 font-medium">Clip score {script.viralScore}/100</span>
                 </>
               )}
             </div>

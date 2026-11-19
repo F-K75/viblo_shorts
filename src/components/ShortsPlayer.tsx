@@ -18,11 +18,18 @@ import {
   Eye,
   EyeOff,
   ShieldAlert,
+  FileVideo,
+  X,
+  ScanFace,
 } from 'lucide-react';
 import { Beat, CaptionStyle, WordTiming, VisualSourceMode, AudioSourceMode } from '../types';
 import { chunkWords, applyCaptionOffset } from '../utils/pipeline';
 import { audioManager, MusicMood } from '../utils/audio';
-import { getSafeThumbnail, getSafeVideoUrl } from '../utils/visualPlaceholders';
+import { apiFetch, apiErrorMessage } from '../utils/api';
+import type { SourceFootage } from '../utils/useSourceFootage';
+import { getSafeThumbnail, getSafeVideoUrl, isPlaceholderImage } from '../utils/visualPlaceholders';
+import { drawCaptionChunk, drawMotionBackground, drawSourceFrame } from '../utils/exportCanvas';
+import { analyzeSubjectTrack, cropCenterAt, cropXAt, objectPositionPercent, type CropPath } from '../utils/smartCrop';
 
 function formatSecondsToTimestamp(sec: number): string {
   const m = Math.floor(sec / 60);
@@ -59,6 +66,11 @@ interface ShortsPlayerProps {
   onUpdateCaptionStyle?: (updates: Partial<CaptionStyle>) => void;
   visualMode?: VisualSourceMode;
   onChangeVisualMode?: (mode: VisualSourceMode) => void;
+  /** The user's own copy of the source video, held by the parent so it survives step changes and reloads. */
+  sourceFile?: SourceFootage | null;
+  onChangeSourceFile?: (next: SourceFootage | null) => void;
+  /** Set when the clip is cut from the user's own video file (no YouTube link): its file name. */
+  localSourceName?: string;
 }
 
 export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
@@ -90,6 +102,9 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
   onUpdateCaptionStyle,
   visualMode: propVisualMode,
   onChangeVisualMode,
+  sourceFile: propSourceFile,
+  onChangeSourceFile,
+  localSourceName,
 }) => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -109,12 +124,13 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
   const [exportProgress, setExportProgress] = useState(0);
   const [exportResolution, setExportResolution] = useState<'1080p' | '720p'>('1080p');
   const [exportError, setExportError] = useState<string | null>(null);
-  const isYouTubeSource = Boolean(sourceYouTubeId);
+  // A clip cut from a source video: a YouTube link, or the user's own file (localSourceName, no YouTube UI).
+  const isYouTubeSource = Boolean(sourceYouTubeId) || Boolean(localSourceName);
   const [musicMood, setMusicMood] = useState<MusicMood>('lofi');
   const [videoLoaded, setVideoLoaded] = useState(false);
   const [videoError, setVideoError] = useState(false);
   const [visualMode, setVisualMode] = useState<VisualSourceMode>(
-    propVisualMode || (sourceYouTubeId ? 'youtube-crop' : 'split')
+    propVisualMode || (isYouTubeSource ? 'youtube-crop' : 'split')
   );
   const [showSafeZones, setShowSafeZones] = useState(false);
 
@@ -123,6 +139,96 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
   const [youtubeVolume, setYoutubeVolume] = useState(1.0);
   const [isYoutubeMuted, setIsYoutubeMuted] = useState(false);
   const [clipStartSec, setClipStartSec] = useState<number>(clipStartSeconds);
+
+  // The user's own copy of the source video (local file, never uploaded). YouTube's embedded player cannot be
+  // recorded, so this is what puts the real footage and the speaker's audio into exported clips.
+  // `offset`: source time at which the file starts (a downloaded YouTube section starts before the clip; a full
+  // local copy starts at 0). Source time for playhead t = clip start + t, so file time = that minus offset.
+  // Held by the parent when it passes onChangeSourceFile (kept across steps, stored in this browser); else local.
+  const [ownSourceFile, setOwnSourceFile] = useState<SourceFootage | null>(null);
+  const isSourceFileLifted = onChangeSourceFile !== undefined;
+  const sourceFile = isSourceFileLifted ? propSourceFile ?? null : ownSourceFile;
+  const setSourceFile = isSourceFileLifted ? onChangeSourceFile : setOwnSourceFile;
+  const sourceOffset = sourceFile?.offset ?? 0;
+  const sourceStartSec = Math.max(0, clipStartSec - sourceOffset);
+  const [ytDownloadEnabled, setYtDownloadEnabled] = useState(false);
+  const [rightsConfirmed, setRightsConfirmed] = useState(false);
+  const [isDownloading, setIsDownloading] = useState(false);
+  useEffect(() => {
+    if (!sourceYouTubeId) return;
+    let alive = true;
+    fetch('/api/config')
+      .then((r) => (r.ok ? r.json() : null))
+      .then((c) => alive && setYtDownloadEnabled(Boolean(c?.features?.youtubeDownload)))
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [sourceYouTubeId]);
+  const handleDownloadFromYouTube = async () => {
+    if (!sourceYouTubeId || isDownloading) return;
+    setIsDownloading(true);
+    setExportError(null);
+    try {
+      const clipLen = beats.length ? Math.max(...beats.map((b) => b.end_s)) : 30;
+      const r = await apiFetch('/api/youtube/download', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          url: `https://www.youtube.com/watch?v=${sourceYouTubeId}`,
+          startSeconds: clipStartSec,
+          endSeconds: clipStartSec + clipLen,
+          rightsConfirmed,
+        }),
+      });
+      if (!r.ok) throw new Error(await apiErrorMessage(r, 'YouTube download failed.'));
+      const d = await r.json();
+      const fileRes = await apiFetch(`/api/youtube/download/${d.downloadId}`);
+      if (!fileRes.ok) throw new Error(await apiErrorMessage(fileRes, 'Could not load the downloaded footage.'));
+      const blob = await fileRes.blob();
+      setSourceFile({ url: URL.createObjectURL(blob), name: `YouTube footage (${Math.round(d.offsetSeconds)}s–${Math.round(d.endSeconds)}s)`, offset: d.offsetSeconds, end: d.endSeconds, blob });
+    } catch (e: any) {
+      setExportError(e?.message || 'YouTube download failed.');
+    } finally {
+      setIsDownloading(false);
+    }
+  };
+  const sourceVideoRef = useRef<HTMLVideoElement>(null);
+  const useSourceFile = Boolean(sourceFile) && visualMode !== 'b-roll';
+  useEffect(() => () => {
+    // A lifted file outlives this component (the parent revokes it when it is replaced or removed).
+    if (sourceFile && !isSourceFileLifted) URL.revokeObjectURL(sourceFile.url);
+  }, [sourceFile, isSourceFileLifted]);
+  const handlePickSourceFile = (file: File | undefined) => {
+    if (!file) return;
+    if (!file.type.startsWith('video/') && !/\.(mp4|webm|mov|m4v|mkv)$/i.test(file.name)) {
+      setExportError('Please choose a video file (MP4, WebM or MOV).');
+      return;
+    }
+    setExportError(null);
+    setSourceFile({ url: URL.createObjectURL(file), name: file.name, offset: 0, blob: file });
+  };
+
+  // A downloaded section only covers the range it was fetched for; if the clip moves outside it, drop it.
+  useEffect(() => {
+    if (!sourceFile?.end) return;
+    const clipLen = beats.length ? Math.max(...beats.map((b) => b.end_s)) : 0;
+    if (clipStartSec < sourceFile.offset - 0.05 || clipStartSec + clipLen > sourceFile.end + 0.05) {
+      setSourceFile(null);
+      setExportError('The clip range moved outside the downloaded footage. Get the footage again for the new range.');
+    }
+  }, [clipStartSec, beats, sourceFile]);
+
+  // Keep the local source video on the clip timeline: source time = clip start + playhead.
+  useEffect(() => {
+    const v = sourceVideoRef.current;
+    if (!v || !useSourceFile) return;
+    const target = sourceStartSec + currentTimestamp;
+    if (Math.abs(v.currentTime - target) > 0.3) v.currentTime = target;
+    v.volume = youtubeVolume;
+    if (isPlaying && v.paused) v.play().catch(() => {});
+    if (!isPlaying && !v.paused) v.pause();
+  }, [isPlaying, currentTimestamp, sourceStartSec, useSourceFile, youtubeVolume]);
 
   useEffect(() => {
     if (propVisualMode) {
@@ -136,11 +242,11 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
   };
 
   useEffect(() => {
-    if (sourceYouTubeId) {
+    if (sourceYouTubeId || localSourceName) {
       setVisualMode('youtube-crop');
       setAudioMode('youtube');
     }
-  }, [sourceYouTubeId]);
+  }, [sourceYouTubeId, localSourceName]);
 
   useEffect(() => {
     setClipStartSec(clipStartSeconds);
@@ -288,6 +394,37 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
     return Math.max(...beats.map((b) => b.end_s), 10);
   }, [beats]);
 
+  // Speaker-aware Vertical Fill: a centre crop cuts off speakers who stand left or right of centre, so the clip range
+  // of the source file is analysed (in the background; playback isn't blocked) and the 9:16 window follows the subject.
+  const [autoFrame, setAutoFrame] = useState(true);
+  const [cropTrack, setCropTrack] = useState<{ key: string; path: CropPath } | null>(null);
+  const [isFindingSpeaker, setIsFindingSpeaker] = useState(false);
+  const cropAnalysisRef = useRef<Promise<{ key: string; path: CropPath } | null> | null>(null);
+  const smartCropOn = useSourceFile && autoFrame && visualMode === 'youtube-crop';
+  const cropKey = sourceFile ? `${sourceFile.url}|${sourceStartSec.toFixed(2)}|${totalDuration.toFixed(2)}` : '';
+  const cropPath = smartCropOn && cropTrack?.key === cropKey ? cropTrack.path : null;
+  useEffect(() => {
+    if (!smartCropOn || !sourceFile || cropTrack?.key === cropKey) return;
+    const ac = new AbortController();
+    const key = cropKey;
+    setIsFindingSpeaker(true);
+    cropAnalysisRef.current = analyzeSubjectTrack(sourceFile.url, sourceStartSec, sourceStartSec + totalDuration, { signal: ac.signal })
+      .then(({ path }) => {
+        if (ac.signal.aborted) return null;
+        setCropTrack({ key, path });
+        return { key, path };
+      })
+      .catch(() => null) // a nicety, never a blocker: on failure the centre crop stays
+      .finally(() => {
+        if (!ac.signal.aborted) setIsFindingSpeaker(false);
+      });
+    // A new file, range or mode cancels the running analysis.
+    return () => {
+      ac.abort();
+      setIsFindingSpeaker(false);
+    };
+  }, [smartCropOn, cropKey]);
+
   const activeBeat = useMemo(() => {
     if (beats.length === 0) return null;
     const found = beats.find((b) => currentTimestamp >= b.start_s && currentTimestamp < b.end_s);
@@ -357,7 +494,6 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
 
     const canvasW = exportResolution === '720p' ? 720 : 1080;
     const canvasH = exportResolution === '720p' ? 1280 : 1920;
-    const scaleFactor = canvasW / 1080;
 
     const canvas = document.createElement('canvas');
     canvas.width = canvasW;
@@ -370,8 +506,36 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
 
     try {
       const audioRunning = await audioManager.ensureRunning();
+      // The user's own source video: real footage + original speech. Music is ducked under the speech.
+      let sourceVideo: HTMLVideoElement | null = null;
+      let disconnectSource: (() => void) | null = null;
+      const sourceAudible = useSourceFile && audioMode === 'youtube' && !isYoutubeMuted;
+      // Export follows the speaker too; if analysis is still running, wait for it rather than export a centre crop.
+      let exportCropPath: CropPath | null = cropPath;
+      if (!exportCropPath && smartCropOn && cropAnalysisRef.current) {
+        const done = await cropAnalysisRef.current;
+        if (done?.key === cropKey) exportCropPath = done.path;
+      }
+      if (useSourceFile && sourceFile) {
+        sourceVideo = document.createElement('video');
+        sourceVideo.src = sourceFile.url;
+        sourceVideo.playsInline = true;
+        sourceVideo.preload = 'auto';
+        sourceVideo.muted = !sourceAudible;
+        sourceVideo.volume = youtubeVolume;
+        await new Promise<void>((resolve, reject) => {
+          sourceVideo!.onloadedmetadata = () => resolve();
+          sourceVideo!.onerror = () => reject(new Error('could not read the source video file'));
+        });
+        sourceVideo.currentTime = Math.min(sourceStartSec, Math.max(0, sourceVideo.duration - 0.1));
+        await new Promise((r) => {
+          sourceVideo!.onseeked = r;
+          setTimeout(r, 3000);
+        });
+        if (sourceAudible && audioRunning) disconnectSource = audioManager.connectElementToExport(sourceVideo);
+      }
       if (musicEnabled) {
-        audioManager.startBackgroundMusic(musicVolume, musicMood);
+        audioManager.startBackgroundMusic(sourceAudible ? musicVolume * 0.3 : musicVolume, musicMood);
       }
       // Only attach an audio track when the audio graph is running; a dead track stalls the muxer.
       const audioTrack = audioRunning ? audioManager.getExportAudioStream() : null;
@@ -445,6 +609,7 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
       ]);
 
       videoElements.forEach((v) => v.play().catch(() => {}));
+      if (sourceVideo) await sourceVideo.play().catch(() => {});
 
       // MediaRecorder captures in WALL-CLOCK time, so frames must be drawn in real time.
       // (Previously the loop ran ~3x faster than real time and a 33s Short exported as ~10s.)
@@ -473,9 +638,27 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
 
         ctx.fillStyle = '#0a0a0a';
         ctx.fillRect(0, 0, canvasW, canvasH);
+        const drawMotion = () =>
+          drawMotionBackground(ctx, {
+            t,
+            beatIndex: activeIdx,
+            beatCount: beats.length,
+            beatProgress: currentBeat ? Math.max(0, Math.min(1, (t - currentBeat.start_s) / Math.max(0.5, currentBeat.end_s - currentBeat.start_s))) : 0,
+            beatElapsed: currentBeat ? Math.max(0, t - currentBeat.start_s) : t,
+            text: currentBeat?.text,
+            keywords: currentBeat?.visual_keywords,
+            w: canvasW,
+            h: canvasH,
+          });
 
         try {
-          if (currentV && currentV.videoWidth) {
+          if (sourceVideo && sourceVideo.videoWidth) {
+            // Keep footage on the wall clock (the recorder is real time): resync only on real drift.
+            const want = sourceStartSec + t;
+            if (Math.abs(sourceVideo.currentTime - want) > 0.35 && !sourceVideo.seeking) sourceVideo.currentTime = want;
+            const cropCenter = exportCropPath ? cropCenterAt(exportCropPath, sourceVideo.currentTime) : 0.5;
+            drawSourceFrame(ctx, sourceVideo, visualMode === 'youtube-fit' ? 'fit' : 'fill', canvasW, canvasH, cropCenter);
+          } else if (currentV && currentV.videoWidth) {
             const vw = currentV.videoWidth;
             const vh = currentV.videoHeight;
             const targetRatio = canvasW / canvasH;
@@ -490,7 +673,7 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
               sy = (vh - sh) / 2;
             }
             ctx.drawImage(currentV, sx, sy, sw, sh, 0, 0, canvasW, canvasH);
-          } else if (currentImg && currentImg.naturalWidth) {
+          } else if (currentImg && currentImg.naturalWidth && !isPlaceholderImage(currentImg.src)) {
             const iw = currentImg.naturalWidth;
             const ih = currentImg.naturalHeight;
             const targetRatio = canvasW / canvasH;
@@ -517,75 +700,16 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
             ctx.drawImage(currentImg, sx, sy, sw, sh, 0, 0, canvasW, canvasH);
             ctx.restore();
           } else {
-            // Elegant native background gradient fallback
-            const grad = ctx.createLinearGradient(0, 0, canvasW, canvasH);
-            grad.addColorStop(0, '#0d121c');
-            grad.addColorStop(1, '#1b2234');
-            ctx.fillStyle = grad;
-            ctx.fillRect(0, 0, canvasW, canvasH);
+            drawMotion();
           }
         } catch {
-          // Graceful fallback if CORS blocks image capture
-          const grad = ctx.createLinearGradient(0, 0, canvasW, canvasH);
-          grad.addColorStop(0, '#0d121c');
-          grad.addColorStop(1, '#1e1b4b');
-          ctx.fillStyle = grad;
-          ctx.fillRect(0, 0, canvasW, canvasH);
+          // CORS-tainted or undecodable media: keep the frame alive with the motion background
+          drawMotion();
         }
 
         const chunk = captionChunks.find((c) => t >= c.start_s && t <= c.end_s);
         if (captionStyle.showCaptions !== false && chunk) {
-          ctx.save();
-          const fontFam = captionStyle.fontFamily || 'Montserrat';
-          const fontWt = captionStyle.fontWeight || '900';
-          const computedFontSize = (captionStyle.fontSize * 1.5) * scaleFactor;
-          ctx.font = `${fontWt} ${computedFontSize}px '${fontFam}', 'Poppins', sans-serif`;
-          ctx.textAlign = 'center';
-          ctx.textBaseline = 'middle';
-
-          const textY = canvasH * (captionStyle.positionY / 100);
-          const wordsInChunk = chunk.words;
-          const isUpper = captionStyle.textTransform !== 'none';
-          const formatWord = (w: string) => isUpper ? w.toUpperCase().replace(/[.,!?;:]/g, '') : w.replace(/[.,!?;:]/g, '');
-
-          const wordMetrics = wordsInChunk.map((w) => {
-            const formatted = formatWord(w.word);
-            return {
-              word: formatted,
-              width: ctx.measureText(formatted + ' ').width,
-              isActive: t >= w.start_s && t <= w.end_s,
-            };
-          });
-
-          const totalTextWidth = wordMetrics.reduce((acc, m) => acc + m.width, 0);
-          let currentX = (canvasW - totalTextWidth) / 2;
-
-          ctx.fillStyle = captionStyle.boxStyle === 'glow' ? 'rgba(10,5,20,0.85)' : 'rgba(0,0,0,0.72)';
-          const padX = 35 * scaleFactor;
-          const boxH = (captionStyle.fontSize * 2.2) * scaleFactor;
-          ctx.beginPath();
-          ctx.roundRect(
-            (canvasW - totalTextWidth) / 2 - padX,
-            textY - boxH / 2,
-            totalTextWidth + padX * 2,
-            boxH,
-            24 * scaleFactor
-          );
-          ctx.fill();
-
-          wordMetrics.forEach((item) => {
-            const wordCenterX = currentX + item.width / 2;
-            ctx.strokeStyle = captionStyle.strokeColor || '#000000';
-            ctx.lineWidth = ((captionStyle.strokeWidth || 4) * 2) * scaleFactor;
-            ctx.strokeText(item.word, wordCenterX, textY);
-
-            ctx.fillStyle = item.isActive ? captionStyle.highlightColor : captionStyle.textColor;
-            ctx.fillText(item.word, wordCenterX, textY);
-
-            currentX += item.width;
-          });
-
-          ctx.restore();
+          drawCaptionChunk(ctx, { words: chunk.words, t, style: captionStyle, w: canvasW, h: canvasH });
         }
 
         videoTrack.requestFrame?.();
@@ -597,6 +721,12 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
       recorder.stop();
       audioManager.stopSpeech();
       videoElements.forEach((v) => v.pause());
+      if (sourceVideo) {
+        sourceVideo.pause();
+        disconnectSource?.();
+        sourceVideo.removeAttribute('src');
+        sourceVideo.load();
+      }
 
       const blob = await exportPromise;
       const downloadUrl = URL.createObjectURL(blob);
@@ -631,12 +761,12 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
           <span className="font-semibold text-white">9:16 Canvas</span>
           <span aria-hidden="true">·</span>
           <span className="font-mono text-[11px] text-neutral-400">
-            {sourceYouTubeId ? (visualMode === 'youtube-crop' ? 'YT Fill' : visualMode === 'youtube-fit' ? 'YT Fit' : 'B-Roll') : 'HD B-Roll'}
+            {isYouTubeSource ? `${sourceYouTubeId ? 'YT ' : ''}${visualMode === 'youtube-crop' ? 'Fill' : visualMode === 'youtube-fit' ? 'Fit' : 'B-Roll'}` : 'HD B-Roll'}
           </span>
         </div>
 
         <div className="flex items-center gap-1.5">
-          {sourceYouTubeId && (
+          {isYouTubeSource && (
             <div className="flex items-center bg-black/40 border border-white/8 rounded-lg p-0.5 text-[10px]">
               <button
                 type="button"
@@ -687,7 +817,26 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
         className="relative w-full aspect-[9/16] rounded-3xl overflow-hidden shadow-2xl bg-black border border-white/12 select-none group"
       >
         {/* Visual Layer: YouTube Video OR Vertical B-Roll */}
-        {sourceYouTubeId && visualMode !== 'b-roll' ? (
+        {useSourceFile && sourceFile ? (
+          <div className="absolute inset-0 overflow-hidden bg-black flex items-center justify-center">
+            <video
+              ref={sourceVideoRef}
+              src={sourceFile.url}
+              playsInline
+              preload="auto"
+              muted={audioMode !== 'youtube' || isYoutubeMuted}
+              onLoadedMetadata={(e) => {
+                e.currentTarget.currentTime = sourceStartSec + currentTimestamp;
+              }}
+              className={`w-full h-full pointer-events-none ${visualMode === 'youtube-fit' ? 'object-contain' : 'object-cover'}`}
+              style={
+                cropPath && visualMode === 'youtube-crop'
+                  ? { objectPosition: `${objectPositionPercent(cropXAt(cropPath, sourceStartSec + currentTimestamp), cropPath.cropFrac)}% 50%` }
+                  : undefined
+              }
+            />
+          </div>
+        ) : sourceYouTubeId && visualMode !== 'b-roll' ? (
           visualMode === 'youtube-fit' ? (
             <div className="absolute inset-0 overflow-hidden bg-black flex items-center justify-center">
               {/* Ambient blurred backdrop of original YouTube video */}
@@ -891,8 +1040,8 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
           </div>
         </div>
 
-        {/* Framing Selector for YouTube Clip */}
-        {sourceYouTubeId && (
+        {/* Framing Selector for a clip from a source video (YouTube or the user's own file) */}
+        {isYouTubeSource && (
           <div className="grid grid-cols-3 gap-1.5 p-1 bg-[#0f141c] border border-white/8 rounded-xl text-xs">
             <button
               onClick={() => handleSetVisualMode('youtube-crop')}
@@ -920,6 +1069,93 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
             </button>
           </div>
         )}
+        {isYouTubeSource && visualMode === 'youtube-crop' && (
+          <div className="flex items-center justify-between gap-2 px-1 text-[11px]">
+            <label className="flex items-center gap-1.5 text-neutral-300 cursor-pointer">
+              <input type="checkbox" checked={autoFrame} onChange={(e) => setAutoFrame(e.target.checked)} className="accent-rose-500" />
+              <ScanFace className="w-3.5 h-3.5" />
+              <span>Auto-frame speaker</span>
+            </label>
+            {smartCropOn && (
+              <span className="flex items-center gap-1 text-neutral-500" aria-live="polite">
+                {isFindingSpeaker ? (
+                  <>
+                    <Loader2 className="w-3 h-3 animate-spin" />
+                    Finding the speaker…
+                  </>
+                ) : cropPath ? (
+                  'Speaker framed'
+                ) : null}
+              </span>
+            )}
+          </div>
+        )}
+
+        {isYouTubeSource && (
+          <div className="p-2.5 bg-[#0f141c] border border-white/8 rounded-xl text-xs flex flex-col gap-1.5">
+            {sourceFile ? (
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-1.5 min-w-0 text-emerald-300">
+                  <FileVideo className="w-3.5 h-3.5 shrink-0" />
+                  <span className="truncate" title={sourceFile.name}>{sourceFile.name}</span>
+                  {sourceFile.restored && <span className="shrink-0 text-[10px] text-neutral-400">· restored from this browser</span>}
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setSourceFile(null)}
+                  className="p-1 rounded-md text-neutral-400 hover:text-white hover:bg-white/5"
+                  aria-label="Remove source video file"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            ) : (
+              <>
+              {ytDownloadEnabled && (
+                <div className="flex flex-col gap-1.5 pb-1.5 border-b border-white/8">
+                  <label className="flex items-start gap-1.5 text-[11px] text-neutral-300 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={rightsConfirmed}
+                      onChange={(e) => setRightsConfirmed(e.target.checked)}
+                      className="mt-0.5 accent-rose-500"
+                    />
+                    <span>I own this video or have permission to use it</span>
+                  </label>
+                  <button
+                    type="button"
+                    onClick={handleDownloadFromYouTube}
+                    disabled={!rightsConfirmed || isDownloading}
+                    className="flex items-center justify-center gap-1.5 py-1.5 rounded-lg bg-rose-600 hover:bg-rose-500 disabled:opacity-40 disabled:cursor-not-allowed text-white font-medium transition"
+                  >
+                    {isDownloading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Youtube className="w-3.5 h-3.5" />}
+                    <span>{isDownloading ? 'Downloading clip footage…' : 'Get this clip\'s footage from YouTube'}</span>
+                  </button>
+                </div>
+              )}
+              <label className="flex items-center justify-center gap-1.5 py-1.5 rounded-lg border border-dashed border-white/15 text-neutral-200 hover:border-rose-400/60 hover:text-white cursor-pointer transition">
+                <FileVideo className="w-3.5 h-3.5" />
+                <span>Add your video file for real footage + audio</span>
+                <input
+                  type="file"
+                  accept="video/*"
+                  className="sr-only"
+                  aria-label="Source video file"
+                  onChange={(e) => handlePickSourceFile(e.target.files?.[0])}
+                />
+              </label>
+              </>
+            )}
+            <p className="text-[10px] leading-snug text-neutral-500">
+              {sourceFile
+                ? 'Export uses this file from the clip start, with its original audio. It stays on your device.'
+                : localSourceName
+                ? `Add ${localSourceName} again (the video the transcript belongs to) to preview and export it. It stays on your device.`
+                : 'Use a copy of the full video you have the rights to (e.g. your own upload from YouTube Studio). It stays on your device.'}
+            </p>
+            {sourceFile?.storageNote && <p className="text-[10px] leading-snug text-amber-300">{sourceFile.storageNote}</p>}
+          </div>
+        )}
 
         {/* Primary Transport Controls */}
         <div className="flex items-center justify-between gap-2 p-2 bg-[#0f141c] border border-white/8 rounded-2xl">
@@ -942,7 +1178,7 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
           </div>
 
           <div className="flex items-center gap-1.5">
-            {sourceYouTubeId && (
+            {isYouTubeSource && (
               <div className="flex items-center gap-1 bg-black/40 border border-white/8 px-2 py-1.5 rounded-xl">
                 <button
                   type="button"
@@ -967,7 +1203,7 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
               </div>
             )}
 
-            {!sourceYouTubeId && onToggleAiVoice && (
+            {!isYouTubeSource && onToggleAiVoice && (
               <button
                 type="button"
                 onClick={onToggleAiVoice}
@@ -1093,10 +1329,21 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
           </div>
 
           <p className="text-[10px] leading-snug text-neutral-500 px-1">
-            {isYouTubeSource
-              ? 'Note: YouTube footage and audio cannot be recorded by the browser (embedded player). The export contains the thumbnail/B-roll with your captions; publish the clip from the original video with these captions (SRT in Publishing Pack).'
+            {isYouTubeSource && useSourceFile
+              ? 'Exports in real time with your video file\'s footage and original audio (a 30s clip takes ~30s). Keep this tab in the foreground.'
+              : isYouTubeSource
+              ? `Without your video file the export is a captions-only clip on animated backgrounds (no speaker footage or voice).${sourceYouTubeId ? ' YouTube\'s embedded player cannot be recorded.' : ''}`
               : 'Exports render in real time (a 30s Short takes ~30s). Keep this tab in the foreground. Narration is included when server AI voice is available; browser system voices cannot be recorded.'}
           </p>
+          {isYouTubeSource && !sourceFile && visualMode !== 'b-roll' && (
+            <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-200 flex items-start gap-2">
+              <FileVideo className="w-3.5 h-3.5 mt-0.5 shrink-0" />
+              <span>
+                <strong className="font-semibold">{ytDownloadEnabled ? 'Get the footage from YouTube or add your video file' : 'Add your video file'}</strong>{' '}
+                (above the play controls) to export this clip with the real footage and the speaker&apos;s voice.
+              </span>
+            </div>
+          )}
           {exportError && (
             <div role="alert" className="rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-[11px] text-rose-200">
               {exportError}

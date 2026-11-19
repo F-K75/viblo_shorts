@@ -13,6 +13,8 @@
     "test:e2e": "tsx --test tests/e2e/*.test.ts",
     "test:live": "tsx --test tests/llm.live.test.ts",
     "test:load": "tsx scripts/loadtest.ts",
+    "make-video": "tsx scripts/make-video.ts",
+    "make-clip": "tsx scripts/make-clip.ts",
     "lint": "tsc --noEmit && tsc --noEmit -p tsconfig.node.json",
     "lint:tests": "tsc --noEmit -p tsconfig.tests.json",
     "backup": "tsx scripts/backup.ts",

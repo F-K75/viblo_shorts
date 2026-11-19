@@ -8,6 +8,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import { execFileSync } from 'node:child_process';
+import { watchCspViolations, formatViolations } from '../helpers/cspWatch.ts';
 import { startTestServer, TEST_BACKEND, type TestServer } from '../helpers/server.ts';
 
 const require = createRequire(import.meta.url);
@@ -33,6 +34,7 @@ test('E2E: guest onboarding → generate → save → projects → export', { sk
   const browser = await chromium.launch({ args: ['--autoplay-policy=no-user-gesture-required'] });
   const ctx = await browser.newContext({ viewport: { width: 1366, height: 900 }, acceptDownloads: true });
   const page = await ctx.newPage();
+  const cspViolations = await watchCspViolations(page, srv.baseUrl); // FS-013: the production CSP blocks nothing legitimate
   const pageErrors: string[] = [];
   page.on('pageerror', (e: Error) => pageErrors.push(e.message));
   try {
@@ -90,6 +92,7 @@ test('E2E: guest onboarding → generate → save → projects → export', { sk
     assert.match(streams, /audio/, 'export must contain an audio track');
     fs.rmSync(out, { force: true });
     assert.deepEqual(pageErrors, []);
+    assert.equal(cspViolations.length, 0, `CSP violations:\n${formatViolations(cspViolations)}`);
   } finally {
     await browser.close();
   }

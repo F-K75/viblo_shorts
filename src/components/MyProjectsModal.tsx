@@ -220,7 +220,7 @@ export const MyProjectsModal: React.FC<MyProjectsModalProps> = ({
                             {proj.duration ? `${proj.duration}s` : '30s'}
                           </span>
                           <span className="px-1.5 py-0.5 rounded bg-rose-600/90 font-semibold uppercase tracking-wider text-[9px]">
-                            {proj.creationMode === 'youtube' ? 'YouTube' : 'Idea'}
+                            {proj.creationMode === 'youtube' ? 'YouTube' : proj.creationMode === 'local' ? 'Your video' : 'Idea'}
                           </span>
                         </div>
                       </div>

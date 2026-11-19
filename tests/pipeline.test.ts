@@ -141,3 +141,9 @@ test('Pipeline: generateSrtFromBeats formats standard SRT timecodes', () => {
   assert.ok(srt.includes('1\n00:00:01,250 --> 00:00:04,500\nWelcome to Forge Studio'));
   assert.ok(srt.includes('2\n00:00:04,500 --> 00:00:08,000\nCreate viral YouTube Shorts'));
 });
+
+test('Pipeline: chunkWords never joins words across a sentence end, beat change or pause', () => {
+  const w = (word: string, start_s: number, beatId = 'b1') => ({ word, start_s, end_s: start_s + 0.3, beatId });
+  const chunks = chunkWords([w('not', 0), w('lazy.', 0.35), w('The', 0.7), w('real', 1.05), w('reason', 2.5), w('next', 2.85, 'b2')], 3);
+  assert.deepEqual(chunks.map((c) => c.text), ['NOT LAZY', 'THE REAL', 'REASON', 'NEXT']);
+});

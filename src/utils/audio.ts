@@ -120,6 +120,31 @@ class AudioManager {
   }
 
   /**
+   * Routes a media element's audio (e.g. the user's own source video) into the export recording.
+   * `monitor` also plays it through the speakers. Returns a disconnect function.
+   * Note: createMediaElementSource takes over the element's audio, so use a dedicated element per export.
+   */
+  public connectElementToExport(el: HTMLMediaElement, monitor = true): (() => void) | null {
+    const ctx = this.initContext();
+    if (!ctx) return null;
+    this.getExportAudioStream(); // ensures the export destination exists
+    try {
+      const src = ctx.createMediaElementSource(el);
+      src.connect(this.exportDestination!);
+      if (monitor) src.connect(ctx.destination);
+      return () => {
+        try {
+          src.disconnect();
+        } catch {
+          // already disconnected
+        }
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  /**
    * Generates royalty-free background music using Web Audio synthesis with selectable mood.
    */
   public startBackgroundMusic(volume = 0.12, mood: MusicMood = 'lofi') {
