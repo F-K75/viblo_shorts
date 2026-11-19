@@ -1,3 +1,4 @@
+import { youTubeDownloadEnabled } from './youtubeDownload.ts';
 import type express from 'express';
 import crypto from 'crypto';
 import fs from 'fs';
@@ -197,6 +198,7 @@ export function registerHealthRoutes(app: express.Express, deps: HealthRoutesDep
       features: {
         ai: Boolean(resolveGeminiApiKey()),
         stockFootage: hasPexelsKey(),
+        youtubeDownload: youTubeDownloadEnabled(),
         billing: billingMode === 'demo' ? 'demo' : 'disabled',
         // Public site key only; the secret never leaves the server except to Cloudflare's siteverify.
         captcha: captcha.required ? { provider: 'turnstile', siteKey: captcha.siteKey } : null,

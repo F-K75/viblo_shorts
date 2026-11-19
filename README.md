@@ -56,6 +56,17 @@ npm run make-clip -- --url "https://www.youtube.com/watch?v=VIDEO_ID" \
   YouTube's embedded player, so this is what puts real footage and the speaker's audio into the clip. In the app:
   *Canvas & Timeline → Add your video file*. It stays on your device.
 * `--clip N` picks the Nth candidate (1 = best), `--fit` letterboxes instead of centre-cropping.
+* `--download --i-have-rights` instead of `--source`: fetches just the clip's section from YouTube with
+  [yt-dlp](https://github.com/yt-dlp/yt-dlp) (`pip install yt-dlp`; needs ffmpeg). Only for videos you own or have
+  permission to use — downloading other people's videos breaks YouTube's Terms of Service.
+
+### Optional: YouTube footage download in the app
+
+Off by default. Install `yt-dlp` on the server and set `YOUTUBE_DOWNLOAD_ENABLED=true`. The editor then shows
+*Get this clip's footage from YouTube* (after the user confirms they own the video or have permission). Only the clip
+section (±15 s) is downloaded, files are visible only to their owner and deleted after `YTDLP_TTL_MIN` (60). Limits:
+`YTDLP_MAX_MB` (500), `YTDLP_TIMEOUT_S` (300), `YTDLP_MAX_CONCURRENT` (2), `YTDLP_MAX_SECTION_S` (300); `YTDLP_PATH`
+overrides the binary. YouTube may block downloads from cloud/datacenter IPs ("confirm you're not a bot").
 
 ## Production
 

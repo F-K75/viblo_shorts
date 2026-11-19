@@ -5,6 +5,7 @@
  * Usage (after `npm run build`):
  *   npm run make-clip -- --url <youtube-url> --source <your-video.mp4> [--transcript <timed-transcript.txt>]
  *                        [--clip 1] [--fit] [--out output]
+ *   npm run make-clip -- --url <youtube-url> --download --i-have-rights [...]   # footage via yt-dlp (must be installed)
  *
  * --transcript: YouTube "Show transcript" text (or any "m:ss" timed text). Without it the server tries YouTube CC.
  * --clip:       which candidate to export (1 = best). --fit: letterbox instead of centre-crop.
@@ -22,8 +23,13 @@ const opt = (name: string) => {
 };
 const url = opt('url');
 const source = opt('source');
-if (!url || !source) {
-  console.error('Usage: npm run make-clip -- --url <youtube-url> --source <video-file> [--transcript <file>] [--clip N] [--fit] [--out dir]');
+const fromYouTube = args.includes('--download');
+if (!url || (!source && !fromYouTube)) {
+  console.error('Usage: npm run make-clip -- --url <youtube-url> (--source <video-file> | --download --i-have-rights) [--transcript <file>] [--clip N] [--fit] [--out dir]');
+  process.exit(2);
+}
+if (fromYouTube && !args.includes('--i-have-rights')) {
+  console.error('--download needs --i-have-rights: only download videos you own or have permission to use (YouTube Terms of Service).');
   process.exit(2);
 }
 const transcript = opt('transcript') ? fs.readFileSync(opt('transcript')!, 'utf8') : '';
@@ -31,7 +37,10 @@ const clipNo = Math.max(1, Number(opt('clip') || 1));
 const outDir = path.resolve(opt('out') || 'output');
 fs.mkdirSync(outDir, { recursive: true });
 
-const srv = await startTestServer({ NODE_ENV: 'production', TRUST_PROXY: 'none', CAPTCHA_REQUIRED: 'false', STORAGE_BACKEND: 'json' });
+const srv = await startTestServer({
+  NODE_ENV: 'production', TRUST_PROXY: 'none', CAPTCHA_REQUIRED: 'false', STORAGE_BACKEND: 'json',
+  ...(fromYouTube ? { YOUTUBE_DOWNLOAD_ENABLED: 'true' } : {}),
+});
 const browser = await chromium.launch({ args: ['--autoplay-policy=no-user-gesture-required'] });
 try {
   const page = await (await browser.newContext({ viewport: { width: 1366, height: 900 }, acceptDownloads: true })).newPage();
@@ -55,7 +64,17 @@ try {
   await cards.nth(Math.min(clipNo, count) - 1).click();
   await page.getByRole('button', { name: /Continue to Studio Canvas/ }).first().click();
 
-  await page.getByLabel('Source video file').setInputFiles(path.resolve(source));
+  if (fromYouTube) {
+    console.log('Downloading the clip section from YouTube (yt-dlp)...');
+    await page.getByLabel(/I own this video or have permission/).check();
+    await page.getByRole('button', { name: /footage from YouTube/ }).click();
+    const done = page.getByText(/^YouTube footage \(/);
+    const failed = page.locator('[role=alert]');
+    await Promise.race([done.waitFor({ timeout: 360000 }), failed.waitFor({ timeout: 360000 })]);
+    if (await failed.isVisible()) throw new Error(await failed.innerText());
+  } else {
+    await page.getByLabel('Source video file').setInputFiles(path.resolve(source!));
+  }
   if (args.includes('--fit')) await page.getByRole('button', { name: 'Letterbox Fit' }).first().click();
   await page.waitForTimeout(2500);
   await page.screenshot({ path: path.join(outDir, 'clip_editor.png') });

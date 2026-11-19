@@ -26,7 +26,11 @@ let tmp: string;
 let sourceFile: string;
 before(async () => {
   if (skip) return;
-  srv = await startTestServer({ NODE_ENV: 'production', TRUST_PROXY: 'none', CAPTCHA_REQUIRED: 'false', ...(TEST_BACKEND === 'json' ? { STORAGE_BACKEND: 'json' } : {}) });
+  srv = await startTestServer({
+    NODE_ENV: 'production', TRUST_PROXY: 'none', CAPTCHA_REQUIRED: 'false', ...(TEST_BACKEND === 'json' ? { STORAGE_BACKEND: 'json' } : {}),
+    // Optional YouTube footage download, with a stand-in yt-dlp that produces a real MP4 of the requested section.
+    YOUTUBE_DOWNLOAD_ENABLED: 'true', YTDLP_PATH: path.resolve(import.meta.dirname, '../fixtures/fake-yt-dlp.sh'),
+  });
   tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-clip-'));
   sourceFile = path.join(tmp, 'source.mp4');
   // 135 s landscape source with a continuous 440 Hz tone standing in for speech.
@@ -75,6 +79,46 @@ test('E2E: YouTube link + transcript → best clip → own video file → export
     const log = spawnSync('ffmpeg', ['-nostdin', '-i', out, '-af', 'volumedetect', '-f', 'null', '-'], { encoding: 'utf8' }).stderr;
     const mean = Number(/mean_volume: (-?[0-9.]+)/.exec(log)?.[1]);
     assert.ok(mean > -35, `source audio must be in the export (mean ${mean} dB)`);
+    assert.deepEqual(pageErrors, []);
+  } finally {
+    await browser.close();
+  }
+});
+
+test('E2E: YouTube clip → "Get this clip\'s footage from YouTube" (rights confirmed) → export with footage + audio', { skip, timeout: 240000 }, async () => {
+  const browser = await chromium.launch({ args: ['--autoplay-policy=no-user-gesture-required'] });
+  const page = await (await browser.newContext({ viewport: { width: 1366, height: 900 }, acceptDownloads: true })).newPage();
+  const pageErrors: string[] = [];
+  page.on('pageerror', (e: Error) => pageErrors.push(e.message));
+  try {
+    await page.goto(srv.baseUrl);
+    await page.getByRole('button', { name: /Get Started Free/ }).first().click();
+    await page.getByRole('button', { name: /Guest/ }).click();
+    await page.getByRole('heading', { name: 'YouTube Video to Clips' }).click();
+    await page.getByPlaceholder(/Paste YouTube link/).fill('https://www.youtube.com/watch?v=arj7oStGLkU');
+    await page.getByRole('button', { name: 'Add custom CC' }).click();
+    await page.getByPlaceholder(/Paste transcript/).fill(transcript);
+    await page.getByRole('button', { name: /^Analyze$/ }).click();
+    await page.getByText(/Clip Candidates/).first().waitFor({ timeout: 60000 });
+    await page.locator('[data-clip-candidate]').first().click();
+    await page.getByRole('button', { name: /Continue to Studio Canvas/ }).first().click();
+
+    const getFootage = page.getByRole('button', { name: /footage from YouTube/ });
+    assert.equal(await getFootage.isDisabled(), true, 'rights must be confirmed first');
+    await page.getByLabel(/I own this video or have permission/).check();
+    await getFootage.click();
+    await page.getByText(/YouTube footage \(15s–74s\)/).waitFor({ timeout: 60000 });
+
+    const dl = page.waitForEvent('download', { timeout: 180000 });
+    await page.getByRole('button', { name: /Export & Download Finished Short/ }).click();
+    const download = await dl;
+    const out = path.join(tmp, `yt.${download.suggestedFilename().split('.').pop()}`);
+    await download.saveAs(out);
+    const dur = Number(execFileSync('ffprobe', ['-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', out]).toString());
+    assert.ok(Math.abs(dur - 28.7) < 2, `clip duration ${dur}s`);
+    const log = spawnSync('ffmpeg', ['-nostdin', '-i', out, '-af', 'volumedetect', '-f', 'null', '-'], { encoding: 'utf8' }).stderr;
+    const mean = Number(/mean_volume: (-?[0-9.]+)/.exec(log)?.[1]);
+    assert.ok(mean > -35, `downloaded audio must be in the export (mean ${mean} dB)`);
     assert.deepEqual(pageErrors, []);
   } finally {
     await browser.close();

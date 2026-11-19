@@ -24,6 +24,7 @@ import {
 import { Beat, CaptionStyle, WordTiming, VisualSourceMode, AudioSourceMode } from '../types';
 import { chunkWords, applyCaptionOffset } from '../utils/pipeline';
 import { audioManager, MusicMood } from '../utils/audio';
+import { apiFetch, apiErrorMessage } from '../utils/api';
 import { getSafeThumbnail, getSafeVideoUrl, isPlaceholderImage } from '../utils/visualPlaceholders';
 import { drawCaptionChunk, drawMotionBackground, drawSourceFrame } from '../utils/exportCanvas';
 
@@ -129,7 +130,53 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
 
   // The user's own copy of the source video (local file, never uploaded). YouTube's embedded player cannot be
   // recorded, so this is what puts the real footage and the speaker's audio into exported clips.
-  const [sourceFile, setSourceFile] = useState<{ url: string; name: string } | null>(null);
+  // `offset`: source time at which the file starts (a downloaded YouTube section starts before the clip; a full
+  // local copy starts at 0). Source time for playhead t = clip start + t, so file time = that minus offset.
+  const [sourceFile, setSourceFile] = useState<{ url: string; name: string; offset: number; end?: number } | null>(null);
+  const sourceOffset = sourceFile?.offset ?? 0;
+  const sourceStartSec = Math.max(0, clipStartSec - sourceOffset);
+  const [ytDownloadEnabled, setYtDownloadEnabled] = useState(false);
+  const [rightsConfirmed, setRightsConfirmed] = useState(false);
+  const [isDownloading, setIsDownloading] = useState(false);
+  useEffect(() => {
+    if (!sourceYouTubeId) return;
+    let alive = true;
+    fetch('/api/config')
+      .then((r) => (r.ok ? r.json() : null))
+      .then((c) => alive && setYtDownloadEnabled(Boolean(c?.features?.youtubeDownload)))
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [sourceYouTubeId]);
+  const handleDownloadFromYouTube = async () => {
+    if (!sourceYouTubeId || isDownloading) return;
+    setIsDownloading(true);
+    setExportError(null);
+    try {
+      const clipLen = beats.length ? Math.max(...beats.map((b) => b.end_s)) : 30;
+      const r = await apiFetch('/api/youtube/download', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          url: `https://www.youtube.com/watch?v=${sourceYouTubeId}`,
+          startSeconds: clipStartSec,
+          endSeconds: clipStartSec + clipLen,
+          rightsConfirmed,
+        }),
+      });
+      if (!r.ok) throw new Error(await apiErrorMessage(r, 'YouTube download failed.'));
+      const d = await r.json();
+      const fileRes = await apiFetch(`/api/youtube/download/${d.downloadId}`);
+      if (!fileRes.ok) throw new Error(await apiErrorMessage(fileRes, 'Could not load the downloaded footage.'));
+      const blob = await fileRes.blob();
+      setSourceFile({ url: URL.createObjectURL(blob), name: `YouTube footage (${Math.round(d.offsetSeconds)}s–${Math.round(d.endSeconds)}s)`, offset: d.offsetSeconds, end: d.endSeconds });
+    } catch (e: any) {
+      setExportError(e?.message || 'YouTube download failed.');
+    } finally {
+      setIsDownloading(false);
+    }
+  };
   const sourceVideoRef = useRef<HTMLVideoElement>(null);
   const useSourceFile = Boolean(sourceFile) && visualMode !== 'b-roll';
   useEffect(() => () => {
@@ -142,19 +189,29 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
       return;
     }
     setExportError(null);
-    setSourceFile({ url: URL.createObjectURL(file), name: file.name });
+    setSourceFile({ url: URL.createObjectURL(file), name: file.name, offset: 0 });
   };
+
+  // A downloaded section only covers the range it was fetched for; if the clip moves outside it, drop it.
+  useEffect(() => {
+    if (!sourceFile?.end) return;
+    const clipLen = beats.length ? Math.max(...beats.map((b) => b.end_s)) : 0;
+    if (clipStartSec < sourceFile.offset - 0.05 || clipStartSec + clipLen > sourceFile.end + 0.05) {
+      setSourceFile(null);
+      setExportError('The clip range moved outside the downloaded footage. Get the footage again for the new range.');
+    }
+  }, [clipStartSec, beats, sourceFile]);
 
   // Keep the local source video on the clip timeline: source time = clip start + playhead.
   useEffect(() => {
     const v = sourceVideoRef.current;
     if (!v || !useSourceFile) return;
-    const target = clipStartSec + currentTimestamp;
+    const target = sourceStartSec + currentTimestamp;
     if (Math.abs(v.currentTime - target) > 0.3) v.currentTime = target;
     v.volume = youtubeVolume;
     if (isPlaying && v.paused) v.play().catch(() => {});
     if (!isPlaying && !v.paused) v.pause();
-  }, [isPlaying, currentTimestamp, clipStartSec, useSourceFile, youtubeVolume]);
+  }, [isPlaying, currentTimestamp, sourceStartSec, useSourceFile, youtubeVolume]);
 
   useEffect(() => {
     if (propVisualMode) {
@@ -416,7 +473,7 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
           sourceVideo!.onloadedmetadata = () => resolve();
           sourceVideo!.onerror = () => reject(new Error('could not read the source video file'));
         });
-        sourceVideo.currentTime = Math.min(clipStartSec, Math.max(0, sourceVideo.duration - 0.1));
+        sourceVideo.currentTime = Math.min(sourceStartSec, Math.max(0, sourceVideo.duration - 0.1));
         await new Promise((r) => {
           sourceVideo!.onseeked = r;
           setTimeout(r, 3000);
@@ -543,7 +600,7 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
         try {
           if (sourceVideo && sourceVideo.videoWidth) {
             // Keep footage on the wall clock (the recorder is real time): resync only on real drift.
-            const want = clipStartSec + t;
+            const want = sourceStartSec + t;
             if (Math.abs(sourceVideo.currentTime - want) > 0.35 && !sourceVideo.seeking) sourceVideo.currentTime = want;
             drawSourceFrame(ctx, sourceVideo, visualMode === 'youtube-fit' ? 'fit' : 'fill', canvasW, canvasH);
           } else if (currentV && currentV.videoWidth) {
@@ -714,7 +771,7 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
               preload="auto"
               muted={audioMode !== 'youtube' || isYoutubeMuted}
               onLoadedMetadata={(e) => {
-                e.currentTarget.currentTime = clipStartSec + currentTimestamp;
+                e.currentTarget.currentTime = sourceStartSec + currentTimestamp;
               }}
               className={`w-full h-full pointer-events-none ${visualMode === 'youtube-fit' ? 'object-contain' : 'object-cover'}`}
             />
@@ -971,6 +1028,29 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
                 </button>
               </div>
             ) : (
+              <>
+              {ytDownloadEnabled && (
+                <div className="flex flex-col gap-1.5 pb-1.5 border-b border-white/8">
+                  <label className="flex items-start gap-1.5 text-[11px] text-neutral-300 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={rightsConfirmed}
+                      onChange={(e) => setRightsConfirmed(e.target.checked)}
+                      className="mt-0.5 accent-rose-500"
+                    />
+                    <span>I own this video or have permission to use it</span>
+                  </label>
+                  <button
+                    type="button"
+                    onClick={handleDownloadFromYouTube}
+                    disabled={!rightsConfirmed || isDownloading}
+                    className="flex items-center justify-center gap-1.5 py-1.5 rounded-lg bg-rose-600 hover:bg-rose-500 disabled:opacity-40 disabled:cursor-not-allowed text-white font-medium transition"
+                  >
+                    {isDownloading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Youtube className="w-3.5 h-3.5" />}
+                    <span>{isDownloading ? 'Downloading clip footage…' : 'Get this clip\'s footage from YouTube'}</span>
+                  </button>
+                </div>
+              )}
               <label className="flex items-center justify-center gap-1.5 py-1.5 rounded-lg border border-dashed border-white/15 text-neutral-200 hover:border-rose-400/60 hover:text-white cursor-pointer transition">
                 <FileVideo className="w-3.5 h-3.5" />
                 <span>Add your video file for real footage + audio</span>
@@ -982,6 +1062,7 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
                   onChange={(e) => handlePickSourceFile(e.target.files?.[0])}
                 />
               </label>
+              </>
             )}
             <p className="text-[10px] leading-snug text-neutral-500">
               {sourceFile
@@ -1173,8 +1254,8 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
             <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-200 flex items-start gap-2">
               <FileVideo className="w-3.5 h-3.5 mt-0.5 shrink-0" />
               <span>
-                <strong className="font-semibold">Add your video file</strong> (above the play controls) to export this clip with the
-                real footage and the speaker&apos;s voice.
+                <strong className="font-semibold">{ytDownloadEnabled ? 'Get the footage from YouTube or add your video file' : 'Add your video file'}</strong>{' '}
+                (above the play controls) to export this clip with the real footage and the speaker&apos;s voice.
               </span>
             </div>
           )}

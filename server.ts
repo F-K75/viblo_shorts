@@ -45,6 +45,7 @@ import { MemoryGuard, computeMemoryBudget, containerMemoryLimitBytes, createBody
 import { registerHealthRoutes } from './server/routes/health.ts';
 import { registerAuthRoutes } from './server/routes/auth.ts';
 import { registerProjectRoutes } from './server/routes/projects.ts';
+import { registerYouTubeDownloadRoutes } from './server/routes/youtubeDownload.ts';
 
 dotenv.config();
 
@@ -1360,6 +1361,9 @@ registerProjectRoutes(app, {
   newProjectId,
   sanitizeString,
 });
+
+// Optional, off by default (YOUTUBE_DOWNLOAD_ENABLED=true + yt-dlp): real YouTube footage for clips.
+const youTubeDownloads = registerYouTubeDownloadRoutes(app, { dataDir: DATA_DIR, rateLimit, uid, extractYouTubeId, parseRangeHeader });
 
 app.post('/api/projects/claim', rateLimit('projects-write', 60), async (req, res) => {
   if (req.identity?.kind !== 'firebase') {
@@ -2774,6 +2778,7 @@ export async function startServer(): Promise<Server> {
 
   let shuttingDown = false;
   const shutdown = async (signal: string, code = 0) => {
+    youTubeDownloads.stop();
     if (shuttingDown) return;
     shuttingDown = true;
     console.log(`[Forge Studio] ${signal} received, shutting down...`);
