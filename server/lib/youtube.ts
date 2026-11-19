@@ -298,7 +298,7 @@ const STOPWORDS = new Set(('the a an and or but so because which that this these
 const endsSentence = (t: string) => /[.!?]["')\]]?$/.test(t.trim());
 const startsSentence = (t: string) => /^["'(\[]?[A-Z0-9]/.test(t.trim());
 
-function hookFeatures(text: string) {
+export function hookFeatures(text: string) {
   const words = text.toLowerCase().match(/[a-z0-9']+/g) || [];
   const first = words.slice(0, 18);
   const reasons: string[] = [];

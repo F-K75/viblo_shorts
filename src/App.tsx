@@ -38,6 +38,8 @@ import {
   estimateWordTimings,
   assignBeatTimings,
   recalculateWordsFromBeats,
+  pickDistinctAssets,
+  retimeBeatsToNarration,
   autoAlignBeatTimelines,
   shiftAllBeats,
 } from './utils/pipeline';
@@ -535,7 +537,9 @@ export const App: React.FC = () => {
       setGenerationStep('Matching vertical footage to Gemini visual prompts...');
       const timedBeats = assignBeatTimings(scriptData.beats, words);
 
-      const finalBeats: Beat[] = await Promise.all(
+      // Search per scene, then choose per scene WITHOUT repeating a clip another scene already uses (results[0] for
+      // every beat showed the same clip again whenever queries were similar or the fallback library answered).
+      const searchResults: Array<Array<{ url?: string; thumbnail?: string }>> = await Promise.all(
         timedBeats.map(async (beat) => {
           try {
             const fRes = await apiFetch('/api/stock-footage', {
@@ -544,20 +548,21 @@ export const App: React.FC = () => {
               body: JSON.stringify({ query: beat.visual_keywords }),
             });
             const fData = await fRes.json();
-            const chosen = fData.results?.[0];
-            return {
-              ...beat,
-              video_url: chosen?.url || '',
-              thumbnail: getSafeThumbnail(beat.visual_keywords, chosen?.thumbnail),
-            };
-          } catch (e) {
-            return {
-              ...beat,
-              thumbnail: getSafeThumbnail(beat.visual_keywords),
-            };
+            return Array.isArray(fData.results) ? fData.results : [];
+          } catch {
+            return [];
           }
         })
       );
+      const picks = pickDistinctAssets(searchResults);
+      const finalBeats: Beat[] = timedBeats.map((beat, i) => {
+        const chosen = picks[i] >= 0 ? searchResults[i][picks[i]] : undefined;
+        return {
+          ...beat,
+          video_url: chosen?.url || '',
+          thumbnail: getSafeThumbnail(beat.visual_keywords, chosen?.thumbnail),
+        };
+      });
 
       const newScript: ShortScript = {
         hook: scriptData.hook || finalBeats[0]?.text || '',
@@ -824,14 +829,34 @@ export const App: React.FC = () => {
     }
   };
 
-  const handleToggleAiVoice = () => {
-    setAiVoiceEnabled((prev) => {
-      const next = !prev;
-      if (!next) {
-        audioManager.stopSpeech();
+  const [isSyncingVoice, setIsSyncingVoice] = useState(false);
+  /**
+   * Times every beat (and its captions) to the real narration: lines are fetched once up front (cached, so playback and
+   * export use them without another call), measured, and the beats re-timed so no line is cut off by the next and
+   * captions follow the voice. Only for scripted Shorts; clips keep the speaker's own timing.
+   */
+  const syncBeatsToNarration = async (voice: string) => {
+    if (!script?.beats?.length || script.sourceYouTubeId || script.sourceLocalVideo) return;
+    setIsSyncingVoice(true);
+    try {
+      const durations = await Promise.all(script.beats.map((b) => audioManager.prefetchTts(b.text, voice)));
+      if (durations.every((d) => d === null)) {
+        setAiNotice('AI voice is unavailable on this server, so beats keep their estimated timing.');
+        return;
       }
-      return next;
-    });
+      const beats = retimeBeatsToNarration(script.beats, durations);
+      setScript({ ...script, beats });
+      setAllWords(recalculateWordsFromBeats(beats));
+    } finally {
+      setIsSyncingVoice(false);
+    }
+  };
+
+  const handleToggleAiVoice = () => {
+    const next = !aiVoiceEnabled;
+    setAiVoiceEnabled(next);
+    if (!next) audioManager.stopSpeech();
+    else void syncBeatsToNarration(voiceName);
   };
 
   const handleTogglePlay = () => {
@@ -1295,7 +1320,10 @@ export const App: React.FC = () => {
             onSeek={handleSeek}
             onTogglePlay={handleTogglePlay}
             onReset={handleReset}
-            onSelectVoiceName={setVoiceName}
+            onSelectVoiceName={(v: string) => {
+              setVoiceName(v);
+              if (aiVoiceEnabled) void syncBeatsToNarration(v); // a different voice speaks at a different pace
+            }}
             onToggleAiVoice={handleToggleAiVoice}
             onToggleMusic={() => {
               setMusicEnabled(!musicEnabled);

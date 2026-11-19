@@ -223,8 +223,21 @@ describe('S1: the queue worker is the only code that starts a render encoder', (
     assert.ok(call > exec && call < execEnd, 'the only call is inside executeRenderJob (the queue worker)');
     const spawns = [...src.matchAll(/spawn\('ffmpeg', ([^,]+)/g)].map((m) => m[1]);
     assert.deepEqual(spawns, ["['-version']", 'args'], 'ffmpeg spawned only by the readiness probe and the render function');
-    // nothing else in the server tree spawns ffmpeg
+    // Nothing else in the server tree spawns ffmpeg, except the post-export quality gate, which is not a render: it
+    // probes/conforms an already-exported reel, costs no credits, and is bounded on its own (concurrency cap,
+    // per-process timeouts, rate limits, upload size cap). Only these two files may, and only with those bounds.
+    const QUALITY = new Set(['lib/videoQuality/probe.ts', 'routes/quality.ts'].map((f) => path.normalize(f)));
     const others = fs.readdirSync(path.join(ROOT, 'server'), { recursive: true }).map(String).filter((f) => f.endsWith('.ts'));
-    for (const f of others) assert.doesNotMatch(fs.readFileSync(path.join(ROOT, 'server', f), 'utf8'), /['"]ffmpeg['"]/, f);
+    for (const f of others) {
+      const code = fs.readFileSync(path.join(ROOT, 'server', f), 'utf8');
+      if (QUALITY.has(path.normalize(f))) continue;
+      assert.doesNotMatch(code, /['"]ffmpeg['"]/, f);
+    }
+    const route = fs.readFileSync(path.join(ROOT, 'server/routes/quality.ts'), 'utf8');
+    assert.match(route, /running >= maxConcurrent/, 'quality gate caps concurrent ffmpeg work');
+    assert.match(route, /setTimeout\(\(\) => p\.kill\('SIGKILL'\), timeoutMs\)/, 'quality conform has a kill timeout');
+    assert.match(fs.readFileSync(path.join(ROOT, 'server/lib/videoQuality/probe.ts'), 'utf8'), /proc\.kill\('SIGKILL'\)/, 'probe has a kill timeout');
+    const probeUsers = others.filter((f) => /from ['"].*videoQuality\/probe\.ts['"]/.test(fs.readFileSync(path.join(ROOT, 'server', f), 'utf8')));
+    assert.deepEqual(probeUsers.map((f) => path.normalize(f)), [path.normalize('routes/quality.ts')], 'probe runs only behind the capped quality route');
   });
 });

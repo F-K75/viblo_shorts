@@ -362,21 +362,32 @@ export const CaptionStyleConfig: React.FC<CaptionStyleConfigProps> = ({
 
           {/* Right Column: Size, Pacing, and Screen Position */}
           <div className="space-y-4">
-            {/* Words Per Chunk */}
+            {/* Caption grouping: phrases (default) or fixed word bursts */}
             <div>
               <div className="flex items-center justify-between mb-1.5">
-                <label className="text-xs font-semibold text-white">Words Per Animated Line</label>
+                <label className="text-xs font-semibold text-white">Caption Grouping</label>
                 <span className="text-xs text-neutral-400 font-mono tabular-nums">
-                  {style.wordsPerChunk} {style.wordsPerChunk === 1 ? 'word' : 'words'}
+                  {style.grouping === 'words' ? `${style.wordsPerChunk} ${style.wordsPerChunk === 1 ? 'word' : 'words'}` : 'phrases'}
                 </span>
               </div>
-              <div className="grid grid-cols-3 gap-2">
+              <div className="grid grid-cols-4 gap-2">
+                <button
+                  onClick={() => onChange({ grouping: 'phrase' })}
+                  title="Whole phrases that fit two lines (recommended: readable, no fragments)"
+                  className={`py-2 rounded-lg text-xs font-medium border text-center transition ${
+                    style.grouping !== 'words'
+                      ? 'bg-rose-500/10 border-rose-500/40 text-white font-semibold'
+                      : 'bg-black/25 border-white/6 text-neutral-400 hover:text-white'
+                  }`}
+                >
+                  Phrases
+                </button>
                 {[1, 2, 3].map((count) => (
                   <button
                     key={count}
-                    onClick={() => onChange({ wordsPerChunk: count })}
+                    onClick={() => onChange({ grouping: 'words', wordsPerChunk: count })}
                     className={`py-2 rounded-lg text-xs font-medium border text-center transition ${
-                      style.wordsPerChunk === count
+                      style.grouping === 'words' && style.wordsPerChunk === count
                         ? 'bg-rose-500/10 border-rose-500/40 text-white font-semibold'
                         : 'bg-black/25 border-white/6 text-neutral-400 hover:text-white'
                     }`}

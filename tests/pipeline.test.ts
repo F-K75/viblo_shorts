@@ -4,6 +4,9 @@ import {
   estimateWordTimings,
   assignBeatTimings,
   chunkWords,
+  chunkCaptionPhrases,
+  pickDistinctAssets,
+  retimeBeatsToNarration,
   recalculateWordsFromBeats,
   autoAlignBeatTimelines,
   applyCaptionOffset,
@@ -146,4 +149,37 @@ test('Pipeline: chunkWords never joins words across a sentence end, beat change 
   const w = (word: string, start_s: number, beatId = 'b1') => ({ word, start_s, end_s: start_s + 0.3, beatId });
   const chunks = chunkWords([w('not', 0), w('lazy.', 0.35), w('The', 0.7), w('real', 1.05), w('reason', 2.5), w('next', 2.85, 'b2')], 3);
   assert.deepEqual(chunks.map((c) => c.text), ['NOT LAZY', 'THE REAL', 'REASON', 'NEXT']);
+});
+
+test('Pipeline: phrase captions keep every word, end on clause/sentence boundaries, fit, and never orphan a word', () => {
+  const text = 'Why does your to-do list never actually get done? It is not because you are lazy. The real reason is simple, and it changes everything.';
+  const words = text.split(' ').map((word, i) => ({ word, start_s: i * 0.3, end_s: i * 0.3 + 0.25, beatId: 'b1' }));
+  const chunks = chunkCaptionPhrases(words, { maxWords: 7, maxChars: 28 });
+  assert.equal(chunks.flatMap((c) => c.words).length, words.length, 'no word dropped');
+  assert.deepEqual(chunks.flatMap((c) => c.words.map((w) => w.word)), words.map((w) => w.word), 'order kept');
+  for (const c of chunks) {
+    assert.ok(c.words.length <= 8);
+    const chars = c.words.map((w) => w.word).join(' ').length;
+    assert.ok(chars <= Math.round(28 * 1.15), `fits: ${chars}`);
+    assert.ok(!(c.words.length === 1 && !/[.!?,]$/.test(c.words[0].word)), `orphan: ${c.text}`);
+  }
+  assert.ok(chunks.some((c) => /DONE$/.test(c.text)) && chunks.every((c) => !/DONE IT/.test(c.text)), 'sentence end respected');
+  const avg = words.length / chunks.length;
+  assert.ok(avg >= 3, `phrases, not 2-word fragments (avg ${avg})`);
+});
+
+test('Pipeline: pickDistinctAssets never repeats a clip while unused results exist', () => {
+  const r = (...urls: string[]) => urls.map((url) => ({ url }));
+  assert.deepEqual(pickDistinctAssets([r('a', 'b'), r('a', 'b', 'c'), r('a', 'c'), []]), [0, 1, 1, -1]);
+  // All results taken: reuse the least-used one, but not the clip shown immediately before.
+  const picks = pickDistinctAssets([r('a'), r('b'), r('a', 'b')]);
+  assert.deepEqual(picks, [0, 0, 0]);
+  const urls = pickDistinctAssets([r('x', 'y'), r('x', 'y'), r('x', 'y')]).map((p, i) => [['x', 'y'], ['x', 'y'], ['x', 'y']][i][p]);
+  assert.notEqual(urls[1], urls[2]);
+});
+
+test('Pipeline: retimeBeatsToNarration gives each beat its real voice length plus a pause, back to back', () => {
+  const beats = [0, 1, 2].map((i) => ({ id: `b${i}`, text: `Line ${i}.`, visual_keywords: '', start_s: i * 2, end_s: i * 2 + 2, video_url: '' }));
+  const out = retimeBeatsToNarration(beats, [3.1, null, 1.5], 0.25);
+  assert.deepEqual(out.map((b) => [b.start_s, b.end_s]), [[0, 3.35], [3.35, 5.35], [5.35, 7.1]]);
 });

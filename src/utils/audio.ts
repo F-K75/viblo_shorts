@@ -366,6 +366,37 @@ class AudioManager {
    * Attempts to play studio-quality Google Neural TTS from /api/tts with automatic memory caching,
    * seamlessly falling back to browser SpeechSynthesis if offline or when using system voices.
    */
+  private ttsDurations = new Map<string, number>();
+
+  /**
+   * Fetches (and caches) the neural TTS line ahead of time and returns its real duration in seconds, so beats and
+   * captions can be timed to the actual voice. Null when neural TTS is unavailable (no key / error).
+   */
+  public async prefetchTts(text: string, voiceName: string = 'Kore'): Promise<number | null> {
+    const cacheKey = `${voiceName}:${text.trim()}`;
+    if (!text.trim()) return null;
+    const known = this.ttsDurations.get(cacheKey);
+    if (known !== undefined && this.ttsCache.has(cacheKey)) return known;
+    try {
+      const res = await apiFetch('/api/tts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text, voice: voiceName }),
+      });
+      if (!res.ok) return null;
+      const data = await res.json();
+      if (!data.success || !data.audioData) return null;
+      const sampleRate = data.sampleRate || 24000;
+      const bytes = Math.floor((data.audioData.length * 3) / 4); // base64 → bytes (16-bit mono PCM)
+      const seconds = bytes / 2 / sampleRate;
+      this.setTtsCache(cacheKey, URL.createObjectURL(pcmToWavBlob(data.audioData, sampleRate)));
+      this.ttsDurations.set(cacheKey, seconds);
+      return seconds;
+    } catch {
+      return null;
+    }
+  }
+
   public async speakNeuralOrFallback(text: string, voiceName: string = 'Kore') {
     const isGoogleVoice = ['Kore', 'Puck', 'Fenrir', 'Zephyr', 'Charon'].includes(voiceName);
     if (isGoogleVoice && text.trim()) {

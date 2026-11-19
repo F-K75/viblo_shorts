@@ -23,12 +23,23 @@ import {
   ScanFace,
 } from 'lucide-react';
 import { Beat, CaptionStyle, WordTiming, VisualSourceMode, AudioSourceMode } from '../types';
-import { chunkWords, applyCaptionOffset } from '../utils/pipeline';
+import { chunkWords, chunkCaptionPhrases, applyCaptionOffset } from '../utils/pipeline';
 import { audioManager, MusicMood } from '../utils/audio';
 import { apiFetch, apiErrorMessage } from '../utils/api';
+import {
+  MAX_REMEDIATION,
+  MIME_ORDERS,
+  downloadBlob,
+  measureBlob,
+  needsReRecord,
+  type QualityReport,
+  type QualityResult,
+  type RecordedExport,
+  type TimelineKind,
+} from '../utils/quality';
 import type { SourceFootage } from '../utils/useSourceFootage';
 import { getSafeThumbnail, getSafeVideoUrl, isPlaceholderImage } from '../utils/visualPlaceholders';
-import { drawCaptionChunk, drawMotionBackground, drawSourceFrame } from '../utils/exportCanvas';
+import { drawCaptionChunk, drawMotionBackground, drawSourceFrame, captionMaxChars, captionLineCount } from '../utils/exportCanvas';
 import { analyzeSubjectTrack, cropCenterAt, cropXAt, objectPositionPercent, type CropPath } from '../utils/smartCrop';
 
 function formatSecondsToTimestamp(sec: number): string {
@@ -440,9 +451,28 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
     return applyCaptionOffset(allWords, captionOffsetSeconds || 0);
   }, [allWords, captionOffsetSeconds]);
 
+  // Phrase captions by default: whole clauses, grouped with the renderer's own line layout so each fits two lines.
+  // Re-measured once web fonts have loaded (a fallback font has different widths).
+  const [fontsReady, setFontsReady] = useState(0);
+  useEffect(() => {
+    let alive = true;
+    // Fonts only start loading when first used, so request the caption font explicitly before measuring with it.
+    const font = `${captionStyle.fontWeight || '900'} ${captionStyle.fontSize}px '${captionStyle.fontFamily || 'Montserrat'}'`;
+    Promise.resolve(document.fonts?.load(font))
+      .catch(() => undefined)
+      .then(() => document.fonts?.ready)
+      .then(() => alive && setFontsReady((n) => n + 1))
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [captionStyle.fontFamily, captionStyle.fontWeight, captionStyle.fontSize]);
+  const measureCtx = useMemo(() => (typeof document !== 'undefined' ? document.createElement('canvas').getContext('2d') : null), []);
   const captionChunks = useMemo(() => {
-    return chunkWords(effectiveWords, captionStyle.wordsPerChunk);
-  }, [effectiveWords, captionStyle.wordsPerChunk]);
+    if (captionStyle.grouping === 'words') return chunkWords(effectiveWords, captionStyle.wordsPerChunk);
+    const fits = measureCtx ? (ws: string[]) => captionLineCount(measureCtx, ws, captionStyle) <= 2 : undefined;
+    return chunkCaptionPhrases(effectiveWords, { maxWords: 7, maxChars: captionMaxChars(captionStyle.fontSize), fits });
+  }, [effectiveWords, captionStyle, measureCtx, fontsReady]);
 
   const activeChunk = useMemo(() => {
     if (captionChunks.length === 0) return null;
@@ -482,6 +512,96 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
   }, [activeBeat, isPlaying, currentTimestamp]);
 
   // Video Export Handler using Canvas + MediaRecorder with mixed audio
+  // ---- Post-export quality gate ----
+  const [quality, setQuality] = useState<QualityReport | null>(null);
+  const [qualityStage, setQualityStage] = useState<string | null>(null);
+  const [pendingDelivery, setPendingDelivery] = useState<{ blob: Blob; name: string } | null>(null);
+  // Punch-ins: a single continuous talking-head shot gets a tighter framing on every other sentence.
+  const [punchIn, setPunchIn] = useState(true);
+  const punchInZoom = (beatIndex: number) =>
+    punchIn && useSourceFile && visualMode === 'youtube-crop' && beats.length > 1 && beatIndex % 2 === 1 ? 1.12 : 1;
+
+  /** What the reel was supposed to contain, so the server can check captions, scenes and audio against it. */
+  const buildTimeline = (rec: RecordedExport, canvasW: number, canvasH: number) => {
+    const narrate = aiVoiceEnabled && !(isYouTubeSource && audioSourceMode === 'youtube');
+    const sourceAudible = useSourceFile && audioMode === 'youtube' && !isYoutubeMuted;
+    return {
+      durationS: totalDuration,
+      scriptText: beats.map((b) => b.text).join(' '),
+      beats: beats.map((b, i) => ({
+        text: b.text,
+        start_s: b.start_s,
+        end_s: b.end_s,
+        visual_keywords: b.visual_keywords,
+        asset: rec.shownByBeat[i]?.asset,
+        kind: rec.shownByBeat[i]?.kind,
+        role: (b as { role?: string }).role,
+      })),
+      captions: {
+        enabled: captionStyle.showCaptions !== false,
+        maxLines: 2,
+        chunks: captionChunks.map((c, i) => ({
+          text: c.words.map((w) => w.word).join(' '),
+          start_s: c.start_s,
+          end_s: c.end_s,
+          words: c.words.length,
+          lines: rec.linesByChunk.get(i),
+        })),
+      },
+      audio: {
+        required: musicEnabled || narrate || sourceAudible,
+        narration: narrate,
+        sourceSpeech: sourceAudible,
+        music: musicEnabled,
+        musicVolume: sourceAudible ? musicVolume * 0.3 : musicVolume,
+      },
+      target: { width: canvasW, height: canvasH, fps: 30 },
+    };
+  };
+
+  /** Uploads the exported reel (only the reel, never source footage) and gets it conformed + evaluated. */
+  const verifyExport = async (rec: RecordedExport, canvasW: number, canvasH: number): Promise<{ result?: QualityResult; error?: string }> => {
+    try {
+      setQualityStage('Checking quality: uploading the export…');
+      const up = await apiFetch('/api/quality/uploads', { method: 'POST', headers: { 'Content-Type': rec.mime.split(';')[0] }, body: rec.blob });
+      if (!up.ok) return { error: await apiErrorMessage(up, 'The quality check is unavailable.') };
+      const { uploadId } = await up.json();
+      setQualityStage('Checking quality: conforming to 1080×1920 H.264/AAC and measuring…');
+      const ev = await apiFetch('/api/quality/evaluate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ uploadId, timeline: buildTimeline(rec, canvasW, canvasH) }),
+      });
+      if (!ev.ok) return { error: await apiErrorMessage(ev, 'The quality check failed.') };
+      return { result: await ev.json() };
+    } catch (e: any) {
+      return { error: e?.message || 'The quality check is unavailable.' };
+    }
+  };
+
+  /** Delivers the verified file under its measured spec; a REJECTED reel is not downloaded automatically. */
+  const deliverExport = async (rec: RecordedExport, report: { result?: QualityResult; error?: string }, attempts: string[]) => {
+    const r = report.result;
+    if (r?.downloadId) {
+      const res = await apiFetch(`/api/quality/download/${r.downloadId}`);
+      if (res.ok) {
+        const file = await res.blob();
+        const name = r.fileName || `forge_short_${r.evaluation.spec.label}_${Date.now()}.mp4`;
+        const delivered = r.evaluation.status !== 'REJECTED';
+        setQuality({ verified: true, result: r, attempts, fileName: name, delivered });
+        setPendingDelivery(delivered ? null : { blob: file, name });
+        if (delivered) downloadBlob(file, name);
+        return;
+      }
+    }
+    // The server check was unavailable: deliver the recording, named only by what we could measure here.
+    const local = await measureBlob(rec.blob);
+    const ext = rec.mime.includes('mp4') ? 'mp4' : 'webm';
+    const name = `forge_short_${local ? `${local.width}x${local.height}` : 'unknown-size'}_unverified_${Date.now()}.${ext}`;
+    setQuality({ verified: false, result: r, error: report.error || 'Quality check unavailable.', attempts, fileName: name, local, delivered: true });
+    downloadBlob(rec.blob, name);
+  };
+
   const handleExportVideo = async () => {
     if (beats.length === 0 || isExporting) return;
     if (typeof MediaRecorder === 'undefined') {
@@ -491,20 +611,48 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
     setIsExporting(true);
     setExportProgress(0);
     setExportError(null);
-
+    setQuality(null);
     const canvasW = exportResolution === '720p' ? 720 : 1080;
     const canvasH = exportResolution === '720p' ? 1280 : 1920;
 
+    try {
+      // Record → verify on the server (conform + evaluate) → at most MAX_REMEDIATION re-records when the recording
+      // itself is broken (wrong size, cut short, silent) → deliver the verified file under its MEASURED spec.
+      const attempts: string[] = [];
+      let rec = await recordOnce(canvasW, canvasH, MIME_ORDERS[0]);
+      attempts.push(rec.mime);
+      let report = await verifyExport(rec, canvasW, canvasH);
+      for (let i = 1; i <= MAX_REMEDIATION && report.result && needsReRecord(report.result.evaluation); i++) {
+        setQualityStage(`Re-recording (attempt ${i + 1}): ${report.result.evaluation.criticalDefects.map((c) => c.message).join(' ')}`);
+        rec = await recordOnce(canvasW, canvasH, MIME_ORDERS[Math.min(i, MIME_ORDERS.length - 1)]);
+        attempts.push(rec.mime);
+        report = await verifyExport(rec, canvasW, canvasH);
+      }
+      await deliverExport(rec, report, attempts);
+    } catch (err: any) {
+      console.error('Video export error:', err);
+      setExportError(`Export failed: ${err?.message || 'unknown error'}. Please try again, or use 720p.`);
+    } finally {
+      if (!isPlaying) {
+        audioManager.stopBackgroundMusic();
+      }
+      setIsExporting(false);
+      setExportProgress(0);
+      setQualityStage(null);
+    }
+  };
+
+  /** One real-time recording of the timeline. Returns the file plus the evidence the quality check needs. */
+  const recordOnce = async (canvasW: number, canvasH: number, mimeOrder: string[]): Promise<RecordedExport> => {
     const canvas = document.createElement('canvas');
     canvas.width = canvasW;
     canvas.height = canvasH;
     const ctx = canvas.getContext('2d');
-    if (!ctx) {
-      setIsExporting(false);
-      return;
-    }
-
-    try {
+    if (!ctx) throw new Error('canvas 2D is not available');
+    const linesByChunk = new Map<number, number>();
+    const shownByBeat: Array<{ kind: TimelineKind; asset: string } | undefined> = [];
+    setQualityStage(null);
+    {
       const audioRunning = await audioManager.ensureRunning();
       // The user's own source video: real footage + original speech. Music is ducked under the speech.
       let sourceVideo: HTMLVideoElement | null = null;
@@ -546,20 +694,8 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
         ? new MediaStream([videoTrack, audioTrack])
         : new MediaStream([videoTrack]);
 
-      // Prefer H.264: it is hardware-accelerated almost everywhere, YouTube's preferred upload codec, and
-      // in testing it was the only codec that kept up with real-time 1080p capture on a 4-core machine
-      // (VP8/VP9 software encoders dropped most frames).
-      const mimeTypes = [
-        'video/mp4;codecs=avc1.42E028,mp4a.40.2',
-        'video/mp4;codecs=avc1.42E028',
-        'video/mp4;codecs=avc1',
-        'video/webm;codecs=h264,opus',
-        'video/webm;codecs=h264',
-        'video/mp4',
-        'video/webm;codecs=vp9',
-        'video/webm',
-      ];
-      const supportedMime = mimeTypes.find((m) => MediaRecorder.isTypeSupported(m)) || 'video/webm';
+      // Order chosen by the caller: H.264 first (fastest real-time encoder); a re-record tries another encoder path.
+      const supportedMime = mimeOrder.find((m) => MediaRecorder.isTypeSupported(m)) || 'video/webm';
 
       const recorder = new MediaRecorder(combinedStream, {
         mimeType: supportedMime,
@@ -588,6 +724,10 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
         return v;
       });
 
+      // A still image repeated by consecutive scenes (e.g. every beat of a link-only clip inherits the video's
+      // thumbnail) would sit on screen for the whole reel; only its first scene shows it, the rest get motion scenes.
+      const imageKeys = beats.map((b) => getSafeThumbnail(b.visual_keywords, b.thumbnail));
+      const repeatedImage = imageKeys.map((k, i) => i > 0 && imageKeys.slice(0, i).includes(k) && !isPlaceholderImage(k));
       const imageElements: HTMLImageElement[] = beats.map((b) => {
         const img = new Image();
         img.crossOrigin = 'anonymous';
@@ -657,8 +797,11 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
             const want = sourceStartSec + t;
             if (Math.abs(sourceVideo.currentTime - want) > 0.35 && !sourceVideo.seeking) sourceVideo.currentTime = want;
             const cropCenter = exportCropPath ? cropCenterAt(exportCropPath, sourceVideo.currentTime) : 0.5;
-            drawSourceFrame(ctx, sourceVideo, visualMode === 'youtube-fit' ? 'fit' : 'fill', canvasW, canvasH, cropCenter);
+            const zoom = punchInZoom(activeIdx);
+            drawSourceFrame(ctx, sourceVideo, visualMode === 'youtube-fit' ? 'fit' : 'fill', canvasW, canvasH, cropCenter, zoom);
+            shownByBeat[activeIdx] = { kind: 'source', asset: `source@${zoom}` };
           } else if (currentV && currentV.videoWidth) {
+            shownByBeat[activeIdx] = { kind: 'broll', asset: (currentBeat?.video_url || '').split('?')[0] };
             const vw = currentV.videoWidth;
             const vh = currentV.videoHeight;
             const targetRatio = canvasW / canvasH;
@@ -673,7 +816,8 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
               sy = (vh - sh) / 2;
             }
             ctx.drawImage(currentV, sx, sy, sw, sh, 0, 0, canvasW, canvasH);
-          } else if (currentImg && currentImg.naturalWidth && !isPlaceholderImage(currentImg.src)) {
+          } else if (currentImg && currentImg.naturalWidth && !isPlaceholderImage(currentImg.src) && !repeatedImage[activeIdx]) {
+            shownByBeat[activeIdx] = { kind: 'image', asset: currentImg.src.split('?')[0].slice(0, 200) };
             const iw = currentImg.naturalWidth;
             const ih = currentImg.naturalHeight;
             const targetRatio = canvasW / canvasH;
@@ -701,15 +845,19 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
             ctx.restore();
           } else {
             drawMotion();
+            shownByBeat[activeIdx] = { kind: 'motion', asset: `motion:${activeIdx}` };
           }
         } catch {
           // CORS-tainted or undecodable media: keep the frame alive with the motion background
           drawMotion();
+          shownByBeat[activeIdx] = { kind: 'motion', asset: `motion:${activeIdx}` };
         }
 
         const chunk = captionChunks.find((c) => t >= c.start_s && t <= c.end_s);
         if (captionStyle.showCaptions !== false && chunk) {
-          drawCaptionChunk(ctx, { words: chunk.words, t, style: captionStyle, w: canvasW, h: canvasH });
+          const lines = drawCaptionChunk(ctx, { words: chunk.words, t, style: captionStyle, w: canvasW, h: canvasH });
+          const ci = captionChunks.indexOf(chunk);
+          linesByChunk.set(ci, Math.max(linesByChunk.get(ci) || 0, lines));
         }
 
         videoTrack.requestFrame?.();
@@ -729,25 +877,7 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
       }
 
       const blob = await exportPromise;
-      const downloadUrl = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = downloadUrl;
-      const extension = supportedMime.includes('mp4') ? 'mp4' : 'webm';
-      a.download = `forge_short_${exportResolution}_${Date.now()}.${extension}`;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      // Revoking immediately can cancel the download in some browsers.
-      setTimeout(() => URL.revokeObjectURL(downloadUrl), 60_000);
-    } catch (err: any) {
-      console.error('Video export error:', err);
-      setExportError(`Export failed: ${err?.message || 'unknown error'}. Please try again, or use 720p.`);
-    } finally {
-      if (!isPlaying) {
-        audioManager.stopBackgroundMusic();
-      }
-      setIsExporting(false);
-      setExportProgress(0);
+      return { blob, mime: supportedMime, linesByChunk, shownByBeat };
     }
   };
 
@@ -829,11 +959,13 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
                 e.currentTarget.currentTime = sourceStartSec + currentTimestamp;
               }}
               className={`w-full h-full pointer-events-none ${visualMode === 'youtube-fit' ? 'object-contain' : 'object-cover'}`}
-              style={
-                cropPath && visualMode === 'youtube-crop'
+              style={{
+                ...(cropPath && visualMode === 'youtube-crop'
                   ? { objectPosition: `${objectPositionPercent(cropXAt(cropPath, sourceStartSec + currentTimestamp), cropPath.cropFrac)}% 50%` }
-                  : undefined
-              }
+                  : {}),
+                // Same punch-in as the export (tighter framing on alternate sentences).
+                ...(punchInZoom(activeBeat ? beats.indexOf(activeBeat) : 0) > 1 ? { transform: 'scale(1.12)', transformOrigin: '50% 35%' } : {}),
+              }}
             />
           </div>
         ) : sourceYouTubeId && visualMode !== 'b-roll' ? (
@@ -1075,6 +1207,10 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
               <input type="checkbox" checked={autoFrame} onChange={(e) => setAutoFrame(e.target.checked)} className="accent-rose-500" />
               <ScanFace className="w-3.5 h-3.5" />
               <span>Auto-frame speaker</span>
+            </label>
+            <label className="flex items-center gap-1.5 text-neutral-300 cursor-pointer" title="Tighter framing on every other sentence, so a single talking-head shot doesn't sit unchanged">
+              <input type="checkbox" checked={punchIn} onChange={(e) => setPunchIn(e.target.checked)} className="accent-rose-500" />
+              <span>Punch-ins</span>
             </label>
             {smartCropOn && (
               <span className="flex items-center gap-1 text-neutral-500" aria-live="polite">
@@ -1357,7 +1493,7 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
             {isExporting ? (
               <>
                 <Loader2 className="w-4 h-4 animate-spin" />
-                <span>Rendering {exportResolution} Short... {exportProgress}%</span>
+                <span>{qualityStage ? 'Checking quality…' : `Rendering ${exportResolution} Short... ${exportProgress}%`}</span>
               </>
             ) : (
               <>
@@ -1366,8 +1502,95 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
               </>
             )}
           </button>
+          {qualityStage && (
+            <p className="text-[11px] text-neutral-400 px-1" aria-live="polite">
+              {qualityStage}
+            </p>
+          )}
+          {quality && <QualityReportCard report={quality} onDownloadAnyway={pendingDelivery ? () => downloadBlob(pendingDelivery.blob, pendingDelivery.name) : undefined} />}
         </div>
       </div>
     </div>
   );
 };
+
+const STATUS_STYLE: Record<string, string> = {
+  PASS: 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30',
+  NEEDS_IMPROVEMENT: 'bg-amber-500/15 text-amber-200 border-amber-500/30',
+  REJECTED: 'bg-rose-500/15 text-rose-200 border-rose-500/30',
+};
+const STATUS_TEXT: Record<string, string> = { PASS: 'Pass', NEEDS_IMPROVEMENT: 'Needs improvement', REJECTED: 'Rejected' };
+
+/** Quality report for the last export: status, score, dimensions, problems, what was fixed, and the measured spec. */
+const QualityReportCard: React.FC<{ report: QualityReport; onDownloadAnyway?: () => void }> = ({ report, onDownloadAnyway }) => {
+  const e = report.result?.evaluation;
+  const a = e?.spec.actual;
+  const status = report.verified && e ? e.status : 'UNVERIFIED';
+  return (
+    <div data-testid="quality-report" className="rounded-xl border border-white/10 bg-black/30 p-3 text-[11px] text-neutral-300 space-y-2">
+      <div className="flex items-center justify-between gap-2">
+        <span className="font-semibold text-white text-xs">Quality check</span>
+        <span className={`px-2 py-0.5 rounded-md border font-semibold ${STATUS_STYLE[status] || 'bg-white/5 text-neutral-300 border-white/10'}`} data-testid="quality-status">
+          {STATUS_TEXT[status] || 'Not verified'}
+          {e && report.verified ? ` · ${Math.round(e.score)}/100` : ''}
+        </span>
+      </div>
+      {a ? (
+        <p data-testid="quality-spec">
+          Delivered: <span className="font-mono text-white">{a.width}×{a.height}</span> · {a.fps} fps · {a.videoCodec.toUpperCase()} · {a.pixFmt} ·{' '}
+          {a.audioCodec ? a.audioCodec.toUpperCase() : 'no audio'}
+          {a.faststart ? ' · fast start' : ''} · {(a.sizeBytes / 1048576).toFixed(1)} MB
+          {e && !e.spec.meetsSpec && (
+            <span className="block text-rose-300">
+              Requested {e.spec.requested.width}×{e.spec.requested.height}; the file does not meet the export spec.
+            </span>
+          )}
+        </p>
+      ) : (
+        <p>
+          {report.error}
+          {report.local ? ` Measured in the browser: ${report.local.width}×${report.local.height}.` : ''} Saved as <span className="font-mono">{report.fileName}</span>.
+        </p>
+      )}
+      {e && report.verified && (
+        <>
+          <div className="grid grid-cols-1 gap-1">
+            {e.dimensions.map((d) => {
+              const measured = d.checks.some((c) => c.measured !== false);
+              return (
+                <div key={d.key} className="flex items-center gap-2">
+                  <span className="w-36 shrink-0 truncate">{d.label}</span>
+                  <div className="flex-1 h-1.5 rounded bg-white/10 overflow-hidden">
+                    {measured && <div className={`h-full ${d.score >= 0.85 ? 'bg-emerald-400' : d.score >= 0.6 ? 'bg-amber-400' : 'bg-rose-400'}`} style={{ width: `${Math.round(d.score * 100)}%` }} />}
+                  </div>
+                  <span className="w-12 text-right font-mono tabular-nums">{measured ? `${d.points}/${d.weight}` : 'n/a'}</span>
+                </div>
+              );
+            })}
+          </div>
+          {e.problems.length > 0 && (
+            <ul className="space-y-0.5" data-testid="quality-problems">
+              {e.problems.slice(0, 6).map((p) => (
+                <li key={p.id} className={p.severity === 'critical' ? 'text-rose-300' : p.severity === 'major' ? 'text-amber-200' : 'text-neutral-400'}>
+                  <span className="uppercase text-[9px] font-bold mr-1">{p.severity}</span>
+                  {p.message}
+                  {p.suggestion && <span className="text-neutral-500"> {p.suggestion}</span>}
+                </li>
+              ))}
+            </ul>
+          )}
+          <p className="text-neutral-500" data-testid="quality-remediation">
+            {report.attempts.length > 1 ? `Re-recorded automatically (${report.attempts.length} attempts). ` : 'Recorded once. '}
+            {(report.result?.remediation || []).map((r) => (r.ok ? r.detail : `${r.action} failed: ${r.detail}`)).join(' ')}
+          </p>
+          {onDownloadAnyway && (
+            <button type="button" onClick={onDownloadAnyway} className="w-full py-1.5 rounded-lg border border-white/15 text-neutral-200 hover:bg-white/5">
+              Download anyway (not recommended)
+            </button>
+          )}
+        </>
+      )}
+    </div>
+  );
+};
+
