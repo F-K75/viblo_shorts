@@ -113,9 +113,68 @@ export function parseXmlCaptions(xml: string): CaptionSegment[] {
   return segments;
 }
 
-/** Parses transcripts pasted from YouTube's "Show transcript" panel, or inline-timestamp formats. */
+// SRT uses "00:00:01,000", WebVTT "00:01.000" or "00:00:01.000" (hours optional).
+const CUE_TIME = String.raw`(?:(\d{1,2}):)?(\d{1,2}):(\d{2})[,.](\d{1,3})`;
+const CUE_TIMING_RE = new RegExp(`^${CUE_TIME}\\s*-->\\s*${CUE_TIME}`);
+
+const cueSeconds = (h: string | undefined, m: string, s: string, frac: string) =>
+  (h ? Number(h) * 3600 : 0) + Number(m) * 60 + Number(s) + Number(frac.padEnd(3, '0')) / 1000;
+
+/** True when the text looks like an SRT or WebVTT subtitle file (has at least one "a --> b" cue timing line). */
+export function isSubtitleFile(rawText: string): boolean {
+  if (!rawText || typeof rawText !== 'string') return false;
+  return /^﻿?WEBVTT/.test(rawText.trimStart()) || rawText.split('\n').some((l) => CUE_TIMING_RE.test(l.trim()));
+}
+
+/**
+ * Parses SRT and WebVTT subtitle files (e.g. downloaded from YouTube Studio, or exported by an editor) into timed
+ * segments. Cue numbers, NOTE/STYLE/REGION blocks, cue settings and markup (<v Speaker>, <c>, <00:00:01.000>, <i>)
+ * are dropped. YouTube's auto-generated VTT repeats the previous caption line at the top of each cue ("rolling"
+ * captions) and adds ~10 ms bridge cues; both are removed so the text is not duplicated.
+ */
+export function parseSubtitleFile(rawText: string): CaptionSegment[] {
+  if (!rawText || typeof rawText !== 'string') return [];
+  const blocks = rawText.replace(/^﻿/, '').replace(/\r\n?/g, '\n').split(/\n[ \t]*\n/);
+  const segments: CaptionSegment[] = [];
+  let prevLines: string[] = [];
+  for (const block of blocks) {
+    const lines = block.split('\n').map((l) => l.trim()).filter(Boolean);
+    const timingIdx = lines.findIndex((l) => CUE_TIMING_RE.test(l));
+    if (timingIdx < 0) continue; // header, NOTE, STYLE, REGION, or stray text
+    const m = CUE_TIMING_RE.exec(lines[timingIdx])!;
+    const start = cueSeconds(m[1], m[2], m[3], m[4]);
+    const end = cueSeconds(m[5], m[6], m[7], m[8]);
+    if (end - start < 0.05) continue; // zero-length bridge cue
+    const textLines = lines
+      .slice(timingIdx + 1)
+      .map((l) => decodeEntities(l.replace(/<[^>]*>/g, '').replace(/\{\\[^}]*\}/g, '')).replace(/\s+/g, ' ').trim())
+      .filter(Boolean);
+    // Rolling captions: drop lines already shown in the previous cue.
+    const fresh = textLines.filter((l) => !prevLines.includes(l));
+    if (textLines.length) prevLines = textLines;
+    const text = fresh.join(' ').trim();
+    if (!text || isNoise(text)) continue;
+    segments.push({ start_s: +start.toFixed(2), end_s: +Math.max(end, start + 0.1).toFixed(2), text });
+  }
+  return segments.sort((a, b) => a.start_s - b.start_s);
+}
+
+/** "[m:ss.xx] text" lines: a compact, unambiguous timed form of any transcript (e.g. to hand to a model). */
+export function segmentsToTimedText(segments: CaptionSegment[]): string {
+  const fmt = (t: number) => `${Math.floor(t / 60)}:${(t % 60).toFixed(2).padStart(5, '0')}`;
+  return segments.map((s) => `[${fmt(s.start_s)}] ${s.text}`).join('\n');
+}
+
+/**
+ * Parses transcripts pasted from YouTube's "Show transcript" panel, inline-timestamp formats, or the contents of an
+ * SRT / WebVTT subtitle file.
+ */
 export function parsePastedTranscriptToSegments(rawText: string): CaptionSegment[] {
   if (!rawText || typeof rawText !== 'string') return [];
+  if (isSubtitleFile(rawText)) {
+    const subs = parseSubtitleFile(rawText);
+    if (subs.length > 0) return subs;
+  }
   const lines = rawText.split('\n').map((l) => l.trim()).filter(Boolean);
   if (lines.length === 0) return [];
   const segments: CaptionSegment[] = [];

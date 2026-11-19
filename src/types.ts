@@ -18,6 +18,8 @@ export interface ShortScript {
   sourceYouTubeId?: string;
   sourceYouTubeTitle?: string;
   sourceYouTubeAuthor?: string;
+  /** Clip cut from the user's own video file (no YouTube link). Only its name is saved; the file stays in the browser. */
+  sourceLocalVideo?: { name: string; durationSeconds?: number };
   viralScore?: number;
   clipReasoning?: string;
   clipStartSeconds?: number;
@@ -92,13 +94,15 @@ export interface YouTubeClipCandidate {
 
 export type VisualSourceMode = 'youtube-crop' | 'youtube-fit' | 'b-roll' | 'split';
 export type AudioSourceMode = 'youtube' | 'tts';
+/** Where a Short starts: a YouTube link, an idea prompt, or the user's own video file + transcript. */
+export type CreationMode = 'youtube' | 'prompt' | 'local';
 
 export interface Project {
   id: string;
   userId?: string;
   title: string;
   topic: string;
-  creationMode: 'youtube' | 'prompt';
+  creationMode: CreationMode;
   script: ShortScript;
   captionStyle: CaptionStyle;
   visualMode: VisualSourceMode;

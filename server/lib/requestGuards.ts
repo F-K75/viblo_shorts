@@ -28,7 +28,7 @@ export interface BodyLimits {
 }
 
 const PROJECT_ROUTES = new Set(['/api/projects', '/api/publish/generate-pack', '/api/gemini/optimize-metadata', '/api/render/video', '/api/jobs/create']);
-const TRANSCRIPT_ROUTES = new Set(['/api/youtube/parse-transcript', '/api/youtube/generate-clips']);
+const TRANSCRIPT_ROUTES = new Set(['/api/youtube/parse-transcript', '/api/youtube/generate-clips', '/api/clips/from-transcript']);
 const MEDIUM_ROUTES = new Set(['/api/voice-to-text/transcribe-clip', '/api/voice-to-text/align-words']);
 /** Routes that start renders: refused under memory pressure whatever their body size. */
 const RENDER_ROUTE = /^\/api\/(render\/video|jobs\/create|jobs\/[^/]+\/retry)$/;

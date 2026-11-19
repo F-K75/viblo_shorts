@@ -25,6 +25,7 @@ import { Beat, CaptionStyle, WordTiming, VisualSourceMode, AudioSourceMode } fro
 import { chunkWords, applyCaptionOffset } from '../utils/pipeline';
 import { audioManager, MusicMood } from '../utils/audio';
 import { apiFetch, apiErrorMessage } from '../utils/api';
+import type { SourceFootage } from '../utils/useSourceFootage';
 import { getSafeThumbnail, getSafeVideoUrl, isPlaceholderImage } from '../utils/visualPlaceholders';
 import { drawCaptionChunk, drawMotionBackground, drawSourceFrame } from '../utils/exportCanvas';
 
@@ -63,6 +64,11 @@ interface ShortsPlayerProps {
   onUpdateCaptionStyle?: (updates: Partial<CaptionStyle>) => void;
   visualMode?: VisualSourceMode;
   onChangeVisualMode?: (mode: VisualSourceMode) => void;
+  /** The user's own copy of the source video, held by the parent so it survives step changes and reloads. */
+  sourceFile?: SourceFootage | null;
+  onChangeSourceFile?: (next: SourceFootage | null) => void;
+  /** Set when the clip is cut from the user's own video file (no YouTube link): its file name. */
+  localSourceName?: string;
 }
 
 export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
@@ -94,6 +100,9 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
   onUpdateCaptionStyle,
   visualMode: propVisualMode,
   onChangeVisualMode,
+  sourceFile: propSourceFile,
+  onChangeSourceFile,
+  localSourceName,
 }) => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -113,12 +122,13 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
   const [exportProgress, setExportProgress] = useState(0);
   const [exportResolution, setExportResolution] = useState<'1080p' | '720p'>('1080p');
   const [exportError, setExportError] = useState<string | null>(null);
-  const isYouTubeSource = Boolean(sourceYouTubeId);
+  // A clip cut from a source video: a YouTube link, or the user's own file (localSourceName, no YouTube UI).
+  const isYouTubeSource = Boolean(sourceYouTubeId) || Boolean(localSourceName);
   const [musicMood, setMusicMood] = useState<MusicMood>('lofi');
   const [videoLoaded, setVideoLoaded] = useState(false);
   const [videoError, setVideoError] = useState(false);
   const [visualMode, setVisualMode] = useState<VisualSourceMode>(
-    propVisualMode || (sourceYouTubeId ? 'youtube-crop' : 'split')
+    propVisualMode || (isYouTubeSource ? 'youtube-crop' : 'split')
   );
   const [showSafeZones, setShowSafeZones] = useState(false);
 
@@ -132,7 +142,11 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
   // recorded, so this is what puts the real footage and the speaker's audio into exported clips.
   // `offset`: source time at which the file starts (a downloaded YouTube section starts before the clip; a full
   // local copy starts at 0). Source time for playhead t = clip start + t, so file time = that minus offset.
-  const [sourceFile, setSourceFile] = useState<{ url: string; name: string; offset: number; end?: number } | null>(null);
+  // Held by the parent when it passes onChangeSourceFile (kept across steps, stored in this browser); else local.
+  const [ownSourceFile, setOwnSourceFile] = useState<SourceFootage | null>(null);
+  const isSourceFileLifted = onChangeSourceFile !== undefined;
+  const sourceFile = isSourceFileLifted ? propSourceFile ?? null : ownSourceFile;
+  const setSourceFile = isSourceFileLifted ? onChangeSourceFile : setOwnSourceFile;
   const sourceOffset = sourceFile?.offset ?? 0;
   const sourceStartSec = Math.max(0, clipStartSec - sourceOffset);
   const [ytDownloadEnabled, setYtDownloadEnabled] = useState(false);
@@ -170,7 +184,7 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
       const fileRes = await apiFetch(`/api/youtube/download/${d.downloadId}`);
       if (!fileRes.ok) throw new Error(await apiErrorMessage(fileRes, 'Could not load the downloaded footage.'));
       const blob = await fileRes.blob();
-      setSourceFile({ url: URL.createObjectURL(blob), name: `YouTube footage (${Math.round(d.offsetSeconds)}s–${Math.round(d.endSeconds)}s)`, offset: d.offsetSeconds, end: d.endSeconds });
+      setSourceFile({ url: URL.createObjectURL(blob), name: `YouTube footage (${Math.round(d.offsetSeconds)}s–${Math.round(d.endSeconds)}s)`, offset: d.offsetSeconds, end: d.endSeconds, blob });
     } catch (e: any) {
       setExportError(e?.message || 'YouTube download failed.');
     } finally {
@@ -180,8 +194,9 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
   const sourceVideoRef = useRef<HTMLVideoElement>(null);
   const useSourceFile = Boolean(sourceFile) && visualMode !== 'b-roll';
   useEffect(() => () => {
-    if (sourceFile) URL.revokeObjectURL(sourceFile.url);
-  }, [sourceFile]);
+    // A lifted file outlives this component (the parent revokes it when it is replaced or removed).
+    if (sourceFile && !isSourceFileLifted) URL.revokeObjectURL(sourceFile.url);
+  }, [sourceFile, isSourceFileLifted]);
   const handlePickSourceFile = (file: File | undefined) => {
     if (!file) return;
     if (!file.type.startsWith('video/') && !/\.(mp4|webm|mov|m4v|mkv)$/i.test(file.name)) {
@@ -189,7 +204,7 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
       return;
     }
     setExportError(null);
-    setSourceFile({ url: URL.createObjectURL(file), name: file.name, offset: 0 });
+    setSourceFile({ url: URL.createObjectURL(file), name: file.name, offset: 0, blob: file });
   };
 
   // A downloaded section only covers the range it was fetched for; if the clip moves outside it, drop it.
@@ -225,11 +240,11 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
   };
 
   useEffect(() => {
-    if (sourceYouTubeId) {
+    if (sourceYouTubeId || localSourceName) {
       setVisualMode('youtube-crop');
       setAudioMode('youtube');
     }
-  }, [sourceYouTubeId]);
+  }, [sourceYouTubeId, localSourceName]);
 
   useEffect(() => {
     setClipStartSec(clipStartSeconds);
@@ -706,12 +721,12 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
           <span className="font-semibold text-white">9:16 Canvas</span>
           <span aria-hidden="true">·</span>
           <span className="font-mono text-[11px] text-neutral-400">
-            {sourceYouTubeId ? (visualMode === 'youtube-crop' ? 'YT Fill' : visualMode === 'youtube-fit' ? 'YT Fit' : 'B-Roll') : 'HD B-Roll'}
+            {isYouTubeSource ? `${sourceYouTubeId ? 'YT ' : ''}${visualMode === 'youtube-crop' ? 'Fill' : visualMode === 'youtube-fit' ? 'Fit' : 'B-Roll'}` : 'HD B-Roll'}
           </span>
         </div>
 
         <div className="flex items-center gap-1.5">
-          {sourceYouTubeId && (
+          {isYouTubeSource && (
             <div className="flex items-center bg-black/40 border border-white/8 rounded-lg p-0.5 text-[10px]">
               <button
                 type="button"
@@ -980,8 +995,8 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
           </div>
         </div>
 
-        {/* Framing Selector for YouTube Clip */}
-        {sourceYouTubeId && (
+        {/* Framing Selector for a clip from a source video (YouTube or the user's own file) */}
+        {isYouTubeSource && (
           <div className="grid grid-cols-3 gap-1.5 p-1 bg-[#0f141c] border border-white/8 rounded-xl text-xs">
             <button
               onClick={() => handleSetVisualMode('youtube-crop')}
@@ -1010,13 +1025,14 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
           </div>
         )}
 
-        {sourceYouTubeId && (
+        {isYouTubeSource && (
           <div className="p-2.5 bg-[#0f141c] border border-white/8 rounded-xl text-xs flex flex-col gap-1.5">
             {sourceFile ? (
               <div className="flex items-center justify-between gap-2">
                 <div className="flex items-center gap-1.5 min-w-0 text-emerald-300">
                   <FileVideo className="w-3.5 h-3.5 shrink-0" />
                   <span className="truncate" title={sourceFile.name}>{sourceFile.name}</span>
+                  {sourceFile.restored && <span className="shrink-0 text-[10px] text-neutral-400">· restored from this browser</span>}
                 </div>
                 <button
                   type="button"
@@ -1067,8 +1083,11 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
             <p className="text-[10px] leading-snug text-neutral-500">
               {sourceFile
                 ? 'Export uses this file from the clip start, with its original audio. It stays on your device.'
+                : localSourceName
+                ? `Add ${localSourceName} again (the video the transcript belongs to) to preview and export it. It stays on your device.`
                 : 'Use a copy of the full video you have the rights to (e.g. your own upload from YouTube Studio). It stays on your device.'}
             </p>
+            {sourceFile?.storageNote && <p className="text-[10px] leading-snug text-amber-300">{sourceFile.storageNote}</p>}
           </div>
         )}
 
@@ -1093,7 +1112,7 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
           </div>
 
           <div className="flex items-center gap-1.5">
-            {sourceYouTubeId && (
+            {isYouTubeSource && (
               <div className="flex items-center gap-1 bg-black/40 border border-white/8 px-2 py-1.5 rounded-xl">
                 <button
                   type="button"
@@ -1118,7 +1137,7 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
               </div>
             )}
 
-            {!sourceYouTubeId && onToggleAiVoice && (
+            {!isYouTubeSource && onToggleAiVoice && (
               <button
                 type="button"
                 onClick={onToggleAiVoice}
@@ -1247,7 +1266,7 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
             {isYouTubeSource && useSourceFile
               ? 'Exports in real time with your video file\'s footage and original audio (a 30s clip takes ~30s). Keep this tab in the foreground.'
               : isYouTubeSource
-              ? 'Without your video file the export is a captions-only clip on animated backgrounds (no speaker footage or voice). YouTube\'s embedded player cannot be recorded.'
+              ? `Without your video file the export is a captions-only clip on animated backgrounds (no speaker footage or voice).${sourceYouTubeId ? ' YouTube\'s embedded player cannot be recorded.' : ''}`
               : 'Exports render in real time (a 30s Short takes ~30s). Keep this tab in the foreground. Narration is included when server AI voice is available; browser system voices cannot be recorded.'}
           </p>
           {isYouTubeSource && !sourceFile && visualMode !== 'b-roll' && (

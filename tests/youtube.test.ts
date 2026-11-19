@@ -9,6 +9,9 @@ import {
   estimateWordTimeline,
   estimateSentenceBeats,
   pickTranscriptClips,
+  isSubtitleFile,
+  parseSubtitleFile,
+  segmentsToTimedText,
 } from '../server/lib/youtube.ts';
 import fs from 'node:fs';
 
@@ -130,4 +133,86 @@ test('pickTranscriptClips: unpunctuated auto-captions and tiny inputs', () => {
   const clips = pickTranscriptClips(auto);
   assert.ok(clips.length >= 1 && clips.length <= 3);
   for (const c of clips) assert.ok(c.end_s - c.start_s >= 18 && c.end_s - c.start_s <= 50);
+});
+
+// ---------------------------------------------------------------------------------------------
+// Subtitle files (SRT / WebVTT) as transcript input
+// ---------------------------------------------------------------------------------------------
+
+/** Turns the talk fixture into an SRT / VTT file with the same cue timings. */
+function fixtureAsSubtitles(kind: 'srt' | 'vtt'): string {
+  const segs = parsePastedTranscriptToSegments(fs.readFileSync(new URL('./fixtures/talk.transcript.txt', import.meta.url), 'utf8'));
+  const ts = (t: number, sep: string) => {
+    const ms = Math.round(t * 1000);
+    const h = Math.floor(ms / 3600000);
+    const m = Math.floor((ms % 3600000) / 60000);
+    const s = Math.floor((ms % 60000) / 1000);
+    return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}${sep}${String(ms % 1000).padStart(3, '0')}`;
+  };
+  const cues = segs.map((s, i) =>
+    kind === 'srt'
+      ? `${i + 1}\r\n${ts(s.start_s, ',')} --> ${ts(s.end_s, ',')}\r\n${s.text}\r\n`
+      : `${ts(s.start_s, '.')} --> ${ts(s.end_s, '.')} align:start position:0%\n<v Speaker>${s.text.replace(/&/g, '&amp;')}</v>\n`,
+  );
+  return kind === 'srt' ? cues.join('\r\n') : `WEBVTT\nKind: captions\n\nNOTE exported by an editor\n\n${cues.join('\n')}`;
+}
+
+test('parseSubtitleFile: SRT (CRLF, cue numbers, multi-line cues, markup)', () => {
+  const srt = [
+    '1', '00:00:01,000 --> 00:00:04,250', 'Why does your <i>to-do</i> list', 'never get done?', '',
+    '2', '00:00:04,250 --> 00:00:07,000', '{\\an8}It&#39;s not because you are lazy.', '',
+    '3', '01:02:03,500 --> 01:02:05,000', 'An hour in.', '',
+  ].join('\r\n');
+  assert.equal(isSubtitleFile(srt), true);
+  assert.deepEqual(parseSubtitleFile(srt), [
+    { start_s: 1, end_s: 4.25, text: 'Why does your to-do list never get done?' },
+    { start_s: 4.25, end_s: 7, text: "It's not because you are lazy." },
+    { start_s: 3723.5, end_s: 3725, text: 'An hour in.' },
+  ]);
+});
+
+test('parseSubtitleFile: WebVTT (header, NOTE/STYLE, cue ids, settings, short timestamps, voice tags)', () => {
+  const vtt = [
+    'WEBVTT - my talk', '', 'STYLE', '::cue { color: yellow }', '', 'NOTE this is a comment', '',
+    'intro-1', '00:01.500 --> 00:03.000 line:90%', '<v Ana>Hello there.</v>', '',
+    '00:00:03.000 --> 00:00:05.000', '<c.yellow>Second</c> <00:00:04.000><c>line</c>', '',
+    '00:05.000 --> 00:06.000', '[Music]', '',
+  ].join('\n');
+  assert.equal(isSubtitleFile(vtt), true);
+  assert.deepEqual(parseSubtitleFile(vtt), [
+    { start_s: 1.5, end_s: 3, text: 'Hello there.' },
+    { start_s: 3, end_s: 5, text: 'Second line' },
+  ]);
+});
+
+test('parseSubtitleFile: YouTube auto-caption VTT rolling lines and 10 ms bridge cues are not duplicated', () => {
+  const vtt = [
+    'WEBVTT', 'Kind: captions', 'Language: en', '',
+    '00:00:00.000 --> 00:00:02.000', 'so the first thing', '',
+    '00:00:02.000 --> 00:00:02.010', 'so the first thing', '',
+    '00:00:02.010 --> 00:00:04.000', 'so the first thing', 'you need to know', '',
+    '00:00:04.000 --> 00:00:06.000', 'you need to know', 'is this', '',
+  ].join('\n');
+  assert.deepEqual(parseSubtitleFile(vtt).map((s) => s.text), ['so the first thing', 'you need to know', 'is this']);
+});
+
+test('parsePastedTranscriptToSegments accepts SRT and VTT; clip picking matches the plain transcript', () => {
+  const plain = parsePastedTranscriptToSegments(fs.readFileSync(new URL('./fixtures/talk.transcript.txt', import.meta.url), 'utf8'));
+  for (const kind of ['srt', 'vtt'] as const) {
+    const segs = parsePastedTranscriptToSegments(fixtureAsSubtitles(kind));
+    assert.equal(segs.length, plain.length, kind);
+    assert.deepEqual(segs.map((s) => s.text), plain.map((s) => s.text), kind);
+    for (let i = 0; i < segs.length; i++) assert.ok(Math.abs(segs[i].start_s - plain[i].start_s) < 0.01, kind);
+    assert.equal(pickTranscriptClips(segs)[0].title, 'Why does your to-do list never actually get done?', kind);
+  }
+  // Plain timed formats are not mistaken for subtitle files.
+  assert.equal(isSubtitleFile('0:12 hello\n0:15 world'), false);
+  assert.equal(isSubtitleFile('[0:12] hello'), false);
+  assert.deepEqual(parseSubtitleFile('no cues here'), []);
+});
+
+test('segmentsToTimedText: compact "[m:ss.xx] text" lines that parse back to the same timings', () => {
+  const text = segmentsToTimedText([{ start_s: 65.5, end_s: 70, text: 'Hi.' }, { start_s: 3, end_s: 4, text: 'Yo.' }]);
+  assert.equal(text, '[1:05.50] Hi.\n[0:03.00] Yo.');
+  assert.deepEqual(parsePastedTranscriptToSegments(text).map((s) => s.start_s), [65.5, 3]);
 });
