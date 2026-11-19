@@ -20,6 +20,7 @@ import {
   ShieldAlert,
   FileVideo,
   X,
+  ScanFace,
 } from 'lucide-react';
 import { Beat, CaptionStyle, WordTiming, VisualSourceMode, AudioSourceMode } from '../types';
 import { chunkWords, applyCaptionOffset } from '../utils/pipeline';
@@ -27,6 +28,7 @@ import { audioManager, MusicMood } from '../utils/audio';
 import { apiFetch, apiErrorMessage } from '../utils/api';
 import { getSafeThumbnail, getSafeVideoUrl, isPlaceholderImage } from '../utils/visualPlaceholders';
 import { drawCaptionChunk, drawMotionBackground, drawSourceFrame } from '../utils/exportCanvas';
+import { analyzeSubjectTrack, cropCenterAt, cropXAt, objectPositionPercent, type CropPath } from '../utils/smartCrop';
 
 function formatSecondsToTimestamp(sec: number): string {
   const m = Math.floor(sec / 60);
@@ -377,6 +379,37 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
     return Math.max(...beats.map((b) => b.end_s), 10);
   }, [beats]);
 
+  // Speaker-aware Vertical Fill: a centre crop cuts off speakers who stand left or right of centre, so the clip range
+  // of the source file is analysed (in the background; playback isn't blocked) and the 9:16 window follows the subject.
+  const [autoFrame, setAutoFrame] = useState(true);
+  const [cropTrack, setCropTrack] = useState<{ key: string; path: CropPath } | null>(null);
+  const [isFindingSpeaker, setIsFindingSpeaker] = useState(false);
+  const cropAnalysisRef = useRef<Promise<{ key: string; path: CropPath } | null> | null>(null);
+  const smartCropOn = useSourceFile && autoFrame && visualMode === 'youtube-crop';
+  const cropKey = sourceFile ? `${sourceFile.url}|${sourceStartSec.toFixed(2)}|${totalDuration.toFixed(2)}` : '';
+  const cropPath = smartCropOn && cropTrack?.key === cropKey ? cropTrack.path : null;
+  useEffect(() => {
+    if (!smartCropOn || !sourceFile || cropTrack?.key === cropKey) return;
+    const ac = new AbortController();
+    const key = cropKey;
+    setIsFindingSpeaker(true);
+    cropAnalysisRef.current = analyzeSubjectTrack(sourceFile.url, sourceStartSec, sourceStartSec + totalDuration, { signal: ac.signal })
+      .then(({ path }) => {
+        if (ac.signal.aborted) return null;
+        setCropTrack({ key, path });
+        return { key, path };
+      })
+      .catch(() => null) // a nicety, never a blocker: on failure the centre crop stays
+      .finally(() => {
+        if (!ac.signal.aborted) setIsFindingSpeaker(false);
+      });
+    // A new file, range or mode cancels the running analysis.
+    return () => {
+      ac.abort();
+      setIsFindingSpeaker(false);
+    };
+  }, [smartCropOn, cropKey]);
+
   const activeBeat = useMemo(() => {
     if (beats.length === 0) return null;
     const found = beats.find((b) => currentTimestamp >= b.start_s && currentTimestamp < b.end_s);
@@ -462,6 +495,12 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
       let sourceVideo: HTMLVideoElement | null = null;
       let disconnectSource: (() => void) | null = null;
       const sourceAudible = useSourceFile && audioMode === 'youtube' && !isYoutubeMuted;
+      // Export follows the speaker too; if analysis is still running, wait for it rather than export a centre crop.
+      let exportCropPath: CropPath | null = cropPath;
+      if (!exportCropPath && smartCropOn && cropAnalysisRef.current) {
+        const done = await cropAnalysisRef.current;
+        if (done?.key === cropKey) exportCropPath = done.path;
+      }
       if (useSourceFile && sourceFile) {
         sourceVideo = document.createElement('video');
         sourceVideo.src = sourceFile.url;
@@ -602,7 +641,8 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
             // Keep footage on the wall clock (the recorder is real time): resync only on real drift.
             const want = sourceStartSec + t;
             if (Math.abs(sourceVideo.currentTime - want) > 0.35 && !sourceVideo.seeking) sourceVideo.currentTime = want;
-            drawSourceFrame(ctx, sourceVideo, visualMode === 'youtube-fit' ? 'fit' : 'fill', canvasW, canvasH);
+            const cropCenter = exportCropPath ? cropCenterAt(exportCropPath, sourceVideo.currentTime) : 0.5;
+            drawSourceFrame(ctx, sourceVideo, visualMode === 'youtube-fit' ? 'fit' : 'fill', canvasW, canvasH, cropCenter);
           } else if (currentV && currentV.videoWidth) {
             const vw = currentV.videoWidth;
             const vh = currentV.videoHeight;
@@ -774,6 +814,11 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
                 e.currentTarget.currentTime = sourceStartSec + currentTimestamp;
               }}
               className={`w-full h-full pointer-events-none ${visualMode === 'youtube-fit' ? 'object-contain' : 'object-cover'}`}
+              style={
+                cropPath && visualMode === 'youtube-crop'
+                  ? { objectPosition: `${objectPositionPercent(cropXAt(cropPath, sourceStartSec + currentTimestamp), cropPath.cropFrac)}% 50%` }
+                  : undefined
+              }
             />
           </div>
         ) : sourceYouTubeId && visualMode !== 'b-roll' ? (
@@ -1007,6 +1052,27 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
             >
               <span>Stock B-Roll</span>
             </button>
+          </div>
+        )}
+        {sourceYouTubeId && visualMode === 'youtube-crop' && (
+          <div className="flex items-center justify-between gap-2 px-1 text-[11px]">
+            <label className="flex items-center gap-1.5 text-neutral-300 cursor-pointer">
+              <input type="checkbox" checked={autoFrame} onChange={(e) => setAutoFrame(e.target.checked)} className="accent-rose-500" />
+              <ScanFace className="w-3.5 h-3.5" />
+              <span>Auto-frame speaker</span>
+            </label>
+            {smartCropOn && (
+              <span className="flex items-center gap-1 text-neutral-500" aria-live="polite">
+                {isFindingSpeaker ? (
+                  <>
+                    <Loader2 className="w-3 h-3 animate-spin" />
+                    Finding the speaker…
+                  </>
+                ) : cropPath ? (
+                  'Speaker framed'
+                ) : null}
+              </span>
+            )}
           </div>
         )}
 
