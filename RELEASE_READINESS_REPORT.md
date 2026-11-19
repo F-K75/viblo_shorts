@@ -35,7 +35,7 @@ no features beyond what the code already promised.
 | Frontend and UX | 50 | 68 | Silent failures replaced by error/notice states; Escape on modals; mobile header fixed; misleading claims removed |
 | Backend engineering | 30 | 70 | Validation, error handler, atomic storage, real job queue, timeouts, graceful shutdown, server typechecked in CI |
 | AI engineering | 20 | 55 | Timeouts, bounded retries, schema validation, labelled fallbacks, no hallucinated transcripts, token/latency metrics. No real-model evaluation |
-| Security | 5 | 72 | P0/P1 fixed (below). Remaining: no CSP, free guest minting, single-tenant JSON store |
+| Security | 5 | 72 | P0/P1 fixed (below). Remaining: free guest minting, single-tenant JSON store |
 | Performance | 45 | 62 | Measured (§6). Vendor chunk split. Export is real-time by design |
 | Testing | 15 | 70 | 55 passing + 2 explicitly skipped + 1 browser E2E. Tests import real code. Load script |
 | DevOps | 10 | 62 | Dockerfile, compose, CI, readiness probe, env docs, fail-fast secrets. CI and Docker image build + smoke test green on GitHub; no deploy pipeline, monitoring or backups |
@@ -93,7 +93,7 @@ Initial scores reflect the measured baseline: header-spoofable admin access, sil
 | **P1** | Exports of YouTube-sourced clips cannot contain the original footage/audio (iframe capture is impossible; downloading conflicts with YouTube ToS). Disclosed in UI; needs a product decision |
 | **P1** | Single-process JSON storage + in-memory limiter/queue: no horizontal scaling, no backups/PITR |
 | **P1** | No payment integration (billing intentionally disabled) |
-| P2 | No Content-Security-Policy |
+| P2 | Content-Security-Policy is enforced (FS-013, `server/lib/csp.ts`) and verified with zero violations in the browser E2E journeys; real Firebase/Google sign-in, Drive export and the live Turnstile widget are not exercised (blocked network) — roll out with `CSP_REPORT_ONLY=true` first |
 | P2 | Guest sessions can be minted freely (bounded by per-IP limits/caps); add App Check/CAPTCHA |
 | P2 | No log shipping/alerting/uptime monitoring wired up |
 | P2 | Client export takes ~1× video duration and needs the tab in the foreground; measured effective 18.6 fps at 1080p in headless sandbox (target 30) |
@@ -107,6 +107,7 @@ Breakdown of remaining: **P0: 0 · P1: 4 · P2: 5 · P3: 3** (details in `docs/T
 * AuthZ: every resource owner-checked; 404 on foreign ids (no enumeration).
 * Injection: ffmpeg spawned with argument arrays (no shell); drawtext text stripped of quote/escape/`%`/`:`; user text delimited in prompts; strict id formats.
 * SSRF: caption URLs from YouTube responses pass an allowlist + private-range/IPv6/decimal-IP blocklist.
+* Browser hardening (FS-013): enforced CSP with an exact host allow-list (no `unsafe-eval`, no inline scripts, `object-src 'none'`, `base-uri`/`form-action 'self'`, `frame-ancestors 'self'`, `upgrade-insecure-requests` on HTTPS requests); `Cross-Origin-Opener-Policy: same-origin-allow-popups` (keeps Firebase sign-in popups working); Permissions-Policy allows only microphone (voice dictation). `style-src` keeps `'unsafe-inline'` (third-party widgets, Vite dev); scripts stay strict. Extra hosts / report-only / report-uri via `CSP_*` env.
 * Secrets: keys only read from env; `/api/config` exposes presence booleans only; `.dev.env.json` ignored in production. The Firebase web config in the repo is a public client identifier, not a secret.
 * CORS: same-origin in production unless `ALLOWED_ORIGINS` is set (preflight from a foreign origin returns no ACAO — verified).
 * Container: non-root user, tini, healthcheck — image built and smoke-tested in CI. Compose read-only root FS + tmpfs + resource limits not yet exercised.
