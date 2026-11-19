@@ -34,7 +34,7 @@ async function rows(db: TestDb, sql: string, params: any[] = []) {
 const ai = (s: TestServer, token: string, path = '/api/gemini/suggest-hooks') =>
   fetch(`${s.baseUrl}${path}`, { method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' }, body: JSON.stringify({ topic: 'sleep' }) });
 /** Refunds settle when the response socket closes; wait until counters stop changing. */
-async function settled(db: TestDb) {
+async function settled(db: TestDb): Promise<Array<{ key: string; count: number }>> {
   let prev = '';
   for (let i = 0; i < 40; i++) {
     const cur = JSON.stringify(await rows(db, 'SELECT key, count FROM ai_usage_daily ORDER BY key'));

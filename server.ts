@@ -46,6 +46,7 @@ import { registerHealthRoutes } from './server/routes/health.ts';
 import { registerAuthRoutes } from './server/routes/auth.ts';
 import { registerProjectRoutes } from './server/routes/projects.ts';
 import { registerYouTubeDownloadRoutes } from './server/routes/youtubeDownload.ts';
+import { buildContentSecurityPolicy, cspHeaderName, parseCspEnv, PERMISSIONS_POLICY, CROSS_ORIGIN_OPENER_POLICY } from './server/lib/csp.ts';
 
 dotenv.config();
 
@@ -327,27 +328,42 @@ if (trustProxy.value === false) {
   });
 }
 
-// Security headers
-const CONTENT_SECURITY_POLICY = [
-  "default-src 'self'",
-  "base-uri 'self'",
-  "object-src 'none'",
-  "frame-ancestors 'self'",
-  "script-src 'self' 'unsafe-inline' https://challenges.cloudflare.com https://apis.google.com https://accounts.google.com https://www.gstatic.com https://www.youtube.com",
-  "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
-  "font-src 'self' data: https://fonts.gstatic.com",
-  "img-src 'self' data: blob: https://i.ytimg.com https://images.pexels.com https://*.pexels.com https://lh3.googleusercontent.com https://api.dicebear.com",
-  "media-src 'self' data: blob: https://videos.pexels.com https://*.pexels.com https://assets.mixkit.co",
-  "frame-src 'self' https://challenges.cloudflare.com https://www.youtube.com https://www.youtube-nocookie.com https://*.firebaseapp.com https://accounts.google.com https://apis.google.com",
-  `connect-src 'self' data: blob:${IS_PROD ? '' : ' ws: wss:'} https://*.googleapis.com https://*.firebaseapp.com https://accounts.google.com https://challenges.cloudflare.com https://api.pexels.com https://*.pexels.com https://assets.mixkit.co`,
-].join('; ');
+// Security headers (FS-013). The CSP allow-list and its rationale live in server/lib/csp.ts.
+const cspEnv = parseCspEnv(process.env);
+if (!cspEnv.ok) {
+  console.error(`[Config] ${cspEnv.error}`);
+  process.exit(1);
+}
+function loadFirebaseAuthDomain(): string | undefined {
+  try {
+    const cfg = JSON.parse(fs.readFileSync(path.join(__dirname, 'firebase-applet-config.json'), 'utf8'));
+    return typeof cfg.authDomain === 'string' && /^[a-z0-9.-]+$/i.test(cfg.authDomain) ? cfg.authDomain : undefined;
+  } catch {
+    return undefined;
+  }
+}
+// The relaxed development policy is only for the Vite dev server (inline React Refresh preamble, HMR websocket).
+// Production, and test servers (which serve the production build with SERVE_DIST=1), get the strict policy.
+const cspOptions = {
+  mode: IS_PROD || IS_TEST ? ('production' as const) : ('development' as const),
+  firebaseAuthDomain: loadFirebaseAuthDomain(),
+  extra: cspEnv.extra,
+  reportUri: cspEnv.reportUri,
+  reportOnly: cspEnv.reportOnly,
+};
+const CSP_HEADER = cspHeaderName(cspEnv.reportOnly);
+const CSP_HTTP = buildContentSecurityPolicy(cspOptions);
+// upgrade-insecure-requests only for requests that arrived over HTTPS (req.secure honours X-Forwarded-Proto from
+// the TRUST_PROXY hops only), so a plain-HTTP deployment is not pushed onto an HTTPS origin it does not serve.
+const CSP_HTTPS = buildContentSecurityPolicy({ ...cspOptions, upgradeInsecureRequests: true });
 
-app.use((_req, res, next) => {
+app.use((req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('X-Frame-Options', 'SAMEORIGIN');
   res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
-  res.setHeader('Permissions-Policy', 'camera=(), geolocation=(), microphone=(self)');
-  res.setHeader('Content-Security-Policy', CONTENT_SECURITY_POLICY);
+  res.setHeader('Permissions-Policy', PERMISSIONS_POLICY);
+  res.setHeader('Cross-Origin-Opener-Policy', CROSS_ORIGIN_OPENER_POLICY);
+  res.setHeader(CSP_HEADER, req.secure ? CSP_HTTPS : CSP_HTTP);
   if (IS_PROD) res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
   next();
 });

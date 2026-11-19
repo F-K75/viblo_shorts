@@ -9,6 +9,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import { execFileSync } from 'node:child_process';
+import { watchCspViolations, formatViolations } from '../helpers/cspWatch.ts';
 import { startTestServer, TEST_BACKEND, type TestServer } from '../helpers/server.ts';
 
 const require = createRequire(import.meta.url);
@@ -83,6 +84,7 @@ test('E2E: Vertical Fill auto-frames an off-centre speaker (centre crop would cu
   const page = await (await browser.newContext({ viewport: { width: 1366, height: 900 }, acceptDownloads: true })).newPage();
   const pageErrors: string[] = [];
   page.on('pageerror', (e: Error) => pageErrors.push(e.message));
+  const cspViolations = await watchCspViolations(page, srv.baseUrl); // the production CSP must not block these flows
   try {
     await page.goto(srv.baseUrl);
     await page.getByRole('button', { name: /Get Started Free/ }).first().click();
@@ -121,6 +123,7 @@ test('E2E: Vertical Fill auto-frames an off-centre speaker (centre crop would cu
       assert.ok(c.coverage < 0.01, `centre crop at ${sec}s cuts the speaker off (coverage ${c.coverage.toFixed(3)})`);
     }
     assert.deepEqual(pageErrors, []);
+    assert.equal(cspViolations.length, 0, `CSP violations:\n${formatViolations(cspViolations)}`);
   } finally {
     await browser.close();
   }

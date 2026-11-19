@@ -8,6 +8,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import { execFileSync, spawnSync } from 'node:child_process';
+import { watchCspViolations, formatViolations } from '../helpers/cspWatch.ts';
 import { startTestServer, TEST_BACKEND, type TestServer } from '../helpers/server.ts';
 
 const require = createRequire(import.meta.url);
@@ -47,6 +48,7 @@ test('E2E: YouTube link + transcript → best clip → own video file → export
   const page = await (await browser.newContext({ viewport: { width: 1366, height: 900 }, acceptDownloads: true })).newPage();
   const pageErrors: string[] = [];
   page.on('pageerror', (e: Error) => pageErrors.push(e.message));
+  const cspViolations = await watchCspViolations(page, srv.baseUrl); // the production CSP must not block these flows
   try {
     await page.goto(srv.baseUrl);
     await page.getByRole('button', { name: /Get Started Free/ }).first().click();
@@ -80,6 +82,7 @@ test('E2E: YouTube link + transcript → best clip → own video file → export
     const mean = Number(/mean_volume: (-?[0-9.]+)/.exec(log)?.[1]);
     assert.ok(mean > -35, `source audio must be in the export (mean ${mean} dB)`);
     assert.deepEqual(pageErrors, []);
+    assert.equal(cspViolations.length, 0, `CSP violations:\n${formatViolations(cspViolations)}`);
   } finally {
     await browser.close();
   }
@@ -90,6 +93,7 @@ test('E2E: YouTube clip → "Get this clip\'s footage from YouTube" (rights conf
   const page = await (await browser.newContext({ viewport: { width: 1366, height: 900 }, acceptDownloads: true })).newPage();
   const pageErrors: string[] = [];
   page.on('pageerror', (e: Error) => pageErrors.push(e.message));
+  const cspViolations = await watchCspViolations(page, srv.baseUrl); // the production CSP must not block these flows
   try {
     await page.goto(srv.baseUrl);
     await page.getByRole('button', { name: /Get Started Free/ }).first().click();
@@ -120,6 +124,7 @@ test('E2E: YouTube clip → "Get this clip\'s footage from YouTube" (rights conf
     const mean = Number(/mean_volume: (-?[0-9.]+)/.exec(log)?.[1]);
     assert.ok(mean > -35, `downloaded audio must be in the export (mean ${mean} dB)`);
     assert.deepEqual(pageErrors, []);
+    assert.equal(cspViolations.length, 0, `CSP violations:\n${formatViolations(cspViolations)}`);
   } finally {
     await browser.close();
   }

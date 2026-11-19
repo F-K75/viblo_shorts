@@ -9,7 +9,7 @@
 | 5 | YouTube-sourced clips cannot be exported with original video/audio | P1 (product) | Browser cannot capture the iframe; downloading YouTube media conflicts with YouTube ToS. Currently disclosed in UI; needs a product decision (creator-uploaded source files) |
 | 6 | Server render is caption-only | P2 | Does not composite footage/narration; documented |
 | 7 | Gemini model ids not verifiable here | P1 | `GEMINI_MODELS` env; run `npm run test:live` with a real key before launch |
-| 8 | No CSP header | P2 | Needs allowlist for Firebase, Google Fonts, YouTube embeds, Unsplash/Mixkit/Pexels media, Drive API |
+| 8 | CSP header | Fixed (verify in prod) | Enforced policy with exact allow-list in `server/lib/csp.ts`; zero violations in browser E2E (`tests/e2e/csp.e2e.test.ts`). Real Firebase popup sign-in, Drive upload and live Turnstile could not be exercised in CI: deploy with `CSP_REPORT_ONLY=true` + `CSP_REPORT_URI` first. `style-src 'unsafe-inline'` remains |
 | 9 | Hard-coded fallback media URLs (Mixkit/Unsplash) | P3 | Some entries have empty `url`; licensing should be re-verified |
 | 10 | `src/components/YouTubeToClips.tsx` is unused | P3 | Dead code; delete or wire up |
 | 11 | Firebase web config committed | Info | Web API keys are public identifiers by design; restrict via Firebase App Check / authorized domains |
