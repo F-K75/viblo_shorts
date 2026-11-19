@@ -203,18 +203,28 @@ export function drawCaptionChunk(
 
 /**
  * Draws a landscape (or any) source video frame into the vertical canvas.
- * fill: centre crop to 9:16. fit: blurred, darkened cover as background + the whole frame centred.
+ * fill: crop to 9:16 around `cropCenter` (normalized 0..1 of the frame width; default 0.5 = centre crop), clamped so
+ * the window stays inside the frame — smartCrop supplies a speaker-following centre.
+ * fit: blurred, darkened cover as background + the whole frame centred.
  */
-export function drawSourceFrame(ctx: CanvasRenderingContext2D, video: HTMLVideoElement, mode: 'fill' | 'fit', w: number, h: number) {
+export function drawSourceFrame(
+  ctx: CanvasRenderingContext2D,
+  video: HTMLVideoElement,
+  mode: 'fill' | 'fit',
+  w: number,
+  h: number,
+  cropCenter = 0.5,
+) {
   const vw = video.videoWidth;
   const vh = video.videoHeight;
-  const cover = () => {
+  const cover = (center: number) => {
     const target = w / h;
     const src = vw / vh;
     let sx = 0, sy = 0, sw = vw, sh = vh;
     if (src > target) {
       sw = vh * target;
-      sx = (vw - sw) / 2;
+      const c = Number.isFinite(center) ? center : 0.5;
+      sx = Math.min(vw - sw, Math.max(0, c * vw - sw / 2));
     } else {
       sh = vw / target;
       sy = (vh - sh) / 2;
@@ -222,12 +232,12 @@ export function drawSourceFrame(ctx: CanvasRenderingContext2D, video: HTMLVideoE
     ctx.drawImage(video, sx, sy, sw, sh, 0, 0, w, h);
   };
   if (mode === 'fill') {
-    cover();
+    cover(cropCenter);
     return;
   }
   ctx.save();
   ctx.filter = 'blur(40px) brightness(0.45)';
-  cover();
+  cover(0.5);
   ctx.restore();
   const scale = Math.min(w / vw, h / vh);
   const dw = vw * scale;
