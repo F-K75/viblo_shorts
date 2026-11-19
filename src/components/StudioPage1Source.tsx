@@ -14,12 +14,14 @@ import {
   Zap,
   AlertCircle,
   X,
+  FileVideo,
+  FileText,
 } from 'lucide-react';
-import { YouTubeVideoInfo, YouTubeClipCandidate } from '../types';
+import { YouTubeVideoInfo, YouTubeClipCandidate, CreationMode } from '../types';
 
 interface StudioPage1SourceProps {
-  creationMode: 'youtube' | 'prompt';
-  onChangeCreationMode: (mode: 'youtube' | 'prompt') => void;
+  creationMode: CreationMode;
+  onChangeCreationMode: (mode: CreationMode) => void;
   topic: string;
   onChangeTopic: (topic: string) => void;
   audience: string;
@@ -30,6 +32,8 @@ interface StudioPage1SourceProps {
   processingStep: string;
   onGenerateFromPrompt: (customTopic?: string) => Promise<void>;
   onAnalyzeYouTubeUrl: (url: string, objective: string, transcript?: string) => Promise<void>;
+  /** "Your Video to Clips": the file stays in the browser; only the transcript is sent to pick the moments. */
+  onAnalyzeLocalVideo?: (file: File, transcript: string, objective: string, durationSeconds?: number) => Promise<void>;
   sampleVideos: Array<{ label: string; url: string; note: string }>;
   quickTopics: string[];
   errorMessage?: string | null;
@@ -49,6 +53,7 @@ export const StudioPage1Source: React.FC<StudioPage1SourceProps> = ({
   processingStep,
   onGenerateFromPrompt,
   onAnalyzeYouTubeUrl,
+  onAnalyzeLocalVideo,
   sampleVideos,
   quickTopics,
   errorMessage,
@@ -63,6 +68,52 @@ export const StudioPage1Source: React.FC<StudioPage1SourceProps> = ({
     if (errorMessage && /Show transcript/.test(errorMessage)) setShowTranscript(true);
   }, [errorMessage]);
   const [showAdvancedPrompt, setShowAdvancedPrompt] = useState(false);
+  // "Your Video to Clips": the user's file (kept in the browser) and its timed transcript or subtitle file.
+  const [localFile, setLocalFile] = useState<File | null>(null);
+  const [localDuration, setLocalDuration] = useState<number | undefined>(undefined);
+  const [localTranscript, setLocalTranscript] = useState('');
+  const [localFileError, setLocalFileError] = useState<string | null>(null);
+  const [subtitleFileName, setSubtitleFileName] = useState<string | null>(null);
+
+  const handlePickLocalVideo = (file: File | undefined) => {
+    if (!file) return;
+    if (!file.type.startsWith('video/') && !/\.(mp4|webm|mov|m4v|mkv)$/i.test(file.name)) {
+      setLocalFileError('Please choose a video file (MP4, WebM or MOV).');
+      return;
+    }
+    setLocalFileError(null);
+    setLocalFile(file);
+    setLocalDuration(undefined);
+    onClearError?.();
+    // Read the duration locally so clips never run past the end of the file (nothing is uploaded).
+    const probe = document.createElement('video');
+    const url = URL.createObjectURL(file);
+    probe.preload = 'metadata';
+    probe.onloadedmetadata = () => {
+      if (Number.isFinite(probe.duration) && probe.duration > 0) setLocalDuration(probe.duration);
+      URL.revokeObjectURL(url);
+    };
+    probe.onerror = () => URL.revokeObjectURL(url);
+    probe.src = url;
+  };
+
+  const handlePickSubtitleFile = async (file: File | undefined) => {
+    if (!file) return;
+    if (file.size > 2 * 1024 * 1024) {
+      setLocalFileError('That transcript file is too large (over 2 MB). Use an .srt, .vtt or plain-text transcript.');
+      return;
+    }
+    setLocalFileError(null);
+    setLocalTranscript(await file.text());
+    setSubtitleFileName(file.name);
+    onClearError?.();
+  };
+
+  const handleLocalSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!localFile || isProcessing || !onAnalyzeLocalVideo) return;
+    onAnalyzeLocalVideo(localFile, localTranscript.trim(), clipObjective, localDuration);
+  };
   const [targetDuration, setTargetDuration] = useState<30 | 45 | 60>(30);
 
   const handlePromptSubmit = (e: React.FormEvent) => {
@@ -89,12 +140,12 @@ export const StudioPage1Source: React.FC<StudioPage1SourceProps> = ({
           Where should your Short begin?
         </h1>
         <p className="text-xs sm:text-sm text-neutral-400">
-          Start from a simple topic idea or paste a YouTube video. Forge Studio will craft retention hooks, script beats, and clip strategies.
+          Start from a simple topic idea, a YouTube video, or your own video file. Forge Studio will craft retention hooks, script beats, and clip strategies.
         </p>
       </div>
 
       {/* Mode Switcher Cards */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 max-w-3xl mx-auto">
+      <div className={`grid grid-cols-1 ${onAnalyzeLocalVideo ? 'sm:grid-cols-3 max-w-4xl' : 'sm:grid-cols-2 max-w-3xl'} gap-4 mx-auto`}>
         {/* Option A: YouTube Link */}
         <button
           type="button"
@@ -150,11 +201,167 @@ export const StudioPage1Source: React.FC<StudioPage1SourceProps> = ({
             Generate a full high-retention script, AI voiceover, kinetic captions, and stock footage from scratch.
           </p>
         </button>
+
+        {/* Option C: The user's own video file + transcript (no YouTube link) */}
+        {onAnalyzeLocalVideo && (
+          <button
+            type="button"
+            onClick={() => onChangeCreationMode('local')}
+            className={`p-5 rounded-2xl border text-left transition-all relative overflow-hidden group ${
+              creationMode === 'local'
+                ? 'bg-[#151c28] border-rose-500 ring-2 ring-rose-500/20 shadow-lg'
+                : 'bg-[#0f141c] border-white/8 hover:border-white/20'
+            }`}
+          >
+            <div className="flex items-center justify-between">
+              <div className="w-10 h-10 rounded-xl bg-sky-500/15 border border-sky-500/20 flex items-center justify-center text-sky-400 group-hover:scale-105 transition-transform">
+                <FileVideo className="w-5 h-5" />
+              </div>
+              {creationMode === 'local' && (
+                <span className="px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider bg-rose-500/20 text-rose-300 border border-rose-500/30">
+                  Active Source
+                </span>
+              )}
+            </div>
+            <h2 className="text-sm font-semibold text-white mt-4 tracking-tight">
+              Your Video to Clips
+            </h2>
+            <p className="text-xs text-neutral-400 mt-1 leading-relaxed">
+              Pick a video file from your device plus its transcript. No YouTube link needed; the video never leaves your browser.
+            </p>
+          </button>
+        )}
       </div>
 
       {/* Main Console Box */}
       <div className="max-w-3xl mx-auto bg-[#0f141c] border border-white/8 rounded-2xl p-6 sm:p-8 shadow-xl">
-        {creationMode === 'youtube' ? (
+        {creationMode === 'local' && onAnalyzeLocalVideo ? (
+          /* Your own video file + transcript */
+          <form onSubmit={handleLocalSubmit} className="space-y-6">
+            {(errorMessage || localFileError) && (
+              <div role="alert" className="p-4 rounded-xl bg-red-950/40 border border-red-500/40 space-y-2 animate-in fade-in">
+                <div className="flex items-start justify-between gap-2">
+                  <div className="flex items-center gap-2 text-xs font-semibold text-red-300">
+                    <AlertCircle className="w-4 h-4 text-red-400 shrink-0" />
+                    <span>Unable to Find Clips in Your Video</span>
+                  </div>
+                  {onClearError && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setLocalFileError(null);
+                        onClearError();
+                      }}
+                      className="text-neutral-400 hover:text-white p-0.5 rounded transition"
+                      title="Dismiss error"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  )}
+                </div>
+                <p className="text-xs text-neutral-300 leading-relaxed">{localFileError || errorMessage}</p>
+              </div>
+            )}
+
+            <div className="space-y-2">
+              <label className="text-xs font-semibold text-white flex items-center gap-1.5">
+                <FileVideo className="w-4 h-4 text-sky-400" />
+                <span>Your video file</span>
+              </label>
+              <label className="flex items-center justify-center gap-2 px-4 py-4 rounded-xl border border-dashed border-white/15 bg-[#090c10] text-xs text-neutral-200 hover:border-rose-400/60 hover:text-white cursor-pointer transition">
+                <FileVideo className="w-4 h-4 shrink-0" />
+                {localFile ? (
+                  <span className="truncate">
+                    <span className="font-medium text-emerald-300">{localFile.name}</span>
+                    {localDuration !== undefined && (
+                      <span className="text-neutral-400"> · {Math.floor(localDuration / 60)}:{String(Math.floor(localDuration % 60)).padStart(2, '0')}</span>
+                    )}
+                  </span>
+                ) : (
+                  <span>Choose a video (MP4, WebM or MOV)</span>
+                )}
+                <input
+                  type="file"
+                  accept="video/*"
+                  className="sr-only"
+                  aria-label="Your video file"
+                  onChange={(e) => handlePickLocalVideo(e.target.files?.[0])}
+                />
+              </label>
+              <p className="text-[11px] text-neutral-500">
+                Stays on your device: it is used for preview and export in this browser, and kept here so it is still attached when you come back.
+              </p>
+            </div>
+
+            <div className="space-y-2">
+              <div className="flex items-center justify-between gap-2">
+                <label htmlFor="local-transcript" className="text-xs font-semibold text-white flex items-center gap-1.5">
+                  <FileText className="w-4 h-4 text-amber-400" />
+                  <span>Transcript with timestamps</span>
+                </label>
+                <label className="text-xs text-rose-400 hover:text-rose-300 cursor-pointer transition">
+                  {subtitleFileName ? `Loaded ${subtitleFileName}` : 'Load .srt / .vtt file'}
+                  <input
+                    type="file"
+                    accept=".srt,.vtt,.txt,text/vtt,application/x-subrip,text/plain"
+                    className="sr-only"
+                    aria-label="Transcript or subtitle file"
+                    onChange={(e) => handlePickSubtitleFile(e.target.files?.[0])}
+                  />
+                </label>
+              </div>
+              <textarea
+                id="local-transcript"
+                value={localTranscript}
+                onChange={(e) => {
+                  setLocalTranscript(e.target.value);
+                  setSubtitleFileName(null);
+                  if (errorMessage && onClearError) onClearError();
+                }}
+                rows={5}
+                placeholder={'Paste your video\'s timed transcript or subtitles, e.g.\n0:12\nWhy does your to-do list never get done?\n\nor [0:12] text lines, or the contents of an .srt / .vtt file'}
+                className="w-full bg-[#090c10] border border-white/10 rounded-xl p-3 text-xs text-white placeholder-neutral-600 focus:outline-none focus:border-rose-500 font-mono resize-y"
+              />
+              <p className="text-[11px] text-neutral-400 leading-relaxed">
+                No transcript yet? In <strong className="text-neutral-200 font-medium">YouTube Studio</strong> open the video → Subtitles and download the .srt/.vtt;
+                on a YouTube page use &quot;...more&quot; → &quot;Show transcript&quot;; export captions from your editor or a transcription tool;
+                or type the key lines yourself as <span className="font-mono">0:12 What you said</span>.
+              </p>
+            </div>
+
+            <div className="pt-2 border-t border-white/6">
+              <label className="text-xs font-semibold text-white block mb-1.5">Target Hook & Strategy</label>
+              <select
+                value={clipObjective}
+                onChange={(e) => setClipObjective(e.target.value)}
+                className="w-full bg-[#090c10] border border-white/10 rounded-xl px-3 py-2.5 text-xs text-neutral-200 focus:outline-none focus:border-rose-500"
+              >
+                <option value="Viral Hook & High Retention">Viral Hook & High Retention (0-3s Grab)</option>
+                <option value="Contrarian Warning / Reality Check">Contrarian Warning / Reality Check</option>
+                <option value="Actionable Step-by-Step Blueprint">Actionable Step-by-Step Blueprint</option>
+                <option value="Inspirational & High Energy">Inspirational & High Energy Moment</option>
+              </select>
+            </div>
+
+            <button
+              type="submit"
+              disabled={isProcessing || !localFile}
+              className="w-full py-3.5 bg-rose-600 hover:bg-rose-500 disabled:opacity-50 text-white font-semibold text-xs sm:text-sm rounded-xl transition flex items-center justify-center gap-2 shadow-lg shadow-rose-950/40"
+            >
+              {isProcessing ? (
+                <>
+                  <RefreshCw className="w-4 h-4 animate-spin" />
+                  <span>{processingStep || 'Finding the strongest moments...'}</span>
+                </>
+              ) : (
+                <>
+                  <Sparkles className="w-4 h-4" />
+                  <span>Find Clips in My Video →</span>
+                </>
+              )}
+            </button>
+          </form>
+        ) : creationMode === 'youtube' ? (
           /* YouTube Link Provider Console */
           <form onSubmit={handleYouTubeSubmit} className="space-y-6">
             {errorMessage && (

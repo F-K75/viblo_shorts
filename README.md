@@ -68,6 +68,17 @@ section (±15 s) is downloaded, files are visible only to their owner and delete
 `YTDLP_MAX_MB` (500), `YTDLP_TIMEOUT_S` (300), `YTDLP_MAX_CONCURRENT` (2), `YTDLP_MAX_SECTION_S` (300); `YTDLP_PATH`
 overrides the binary. YouTube may block downloads from cloud/datacenter IPs ("confirm you're not a bot").
 
+### Your own video, no YouTube link
+
+*Source & Idea → Your Video to Clips*: pick a video file and paste its timed transcript (`m:ss` lines, YouTube's
+"Show transcript" copy, `[0:12] text`) or load an `.srt`/`.vtt` file. Only the transcript is sent
+(`POST /api/clips/from-transcript`); the canvas opens with the file attached as the source.
+
+Attached footage (your file or a downloaded YouTube section) is kept in the browser's IndexedDB per project and source
+video, so it is restored after a reload or when the project is reopened on the same browser. Up to 2 GB is kept
+(`FOOTAGE_STORE_MAX_BYTES` in `src/utils/footageStore.ts`), least recently used first out; if the browser refuses
+(quota, private mode) the file still works until the tab is closed. Video files are never uploaded.
+
 ## Production
 
 ```bash

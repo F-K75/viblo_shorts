@@ -32,6 +32,7 @@ import {
   AudioSourceMode,
   VisualSourceMode,
   Project,
+  CreationMode,
 } from './types';
 import {
   estimateWordTimings,
@@ -53,6 +54,7 @@ import { BillingModal } from './components/BillingModal';
 import { MyProjectsModal } from './components/MyProjectsModal';
 import { PublishingPackModal } from './components/PublishingPackModal';
 import { apiFetch, apiErrorMessage, clearGuestSession, hasGuestSession } from './utils/api';
+import { footageKeyFor, useSourceFootage } from './utils/useSourceFootage';
 import { auth } from './utils/googleDrive';
 import { onAuthStateChanged, signOut } from 'firebase/auth';
 
@@ -116,7 +118,7 @@ export const App: React.FC = () => {
   // Studio Progressive 3-Page Flow: 1: Source & Idea -> 2: Clip Strategies & Trimmer -> 3: Studio Canvas & Timeline
   const [studioStep, setStudioStep] = useState<1 | 2 | 3>(1);
 
-  const [creationMode, setCreationMode] = useState<'youtube' | 'prompt'>('youtube');
+  const [creationMode, setCreationMode] = useState<CreationMode>('youtube');
   const [topic, setTopic] = useState("Steve Jobs' 2005 Stanford Commencement Address");
   const [audience, setAudience] = useState('general YouTube audience');
   const [tone, setTone] = useState('energetic, direct, no fluff');
@@ -174,6 +176,10 @@ export const App: React.FC = () => {
   const [userPlan, setUserPlan] = useState<'free' | 'pro' | 'studio'>('free');
   const [saveError, setSaveError] = useState<string | null>(null);
   const [authSynced, setAuthSynced] = useState(!auth);
+
+  // The user's own source footage lives here (not in the player) so switching steps keeps it, and in this browser's
+  // IndexedDB keyed by project + source video so a reload or reopening the project restores it.
+  const { sourceFile, setSourceFile, moveFootage } = useSourceFootage(footageKeyFor(currentProjectId, script), footageKeyFor(undefined, script));
 
   const currentPageRef = useRef(currentPage);
   currentPageRef.current = currentPage;
@@ -277,6 +283,7 @@ export const App: React.FC = () => {
 
       if (res.ok) {
         const data = await res.json();
+        moveFootage(footageKeyFor(currentProjectId, script), footageKeyFor(data.project.id, script));
         setCurrentProjectId(data.project.id);
         try {
           localStorage.setItem('forge_active_project', JSON.stringify(data.project));
@@ -312,9 +319,8 @@ export const App: React.FC = () => {
     if (proj.visualMode) {
       setVisualMode(proj.visualMode);
     }
-    if (proj.videoInfo) {
-      setVideoInfo(proj.videoInfo);
-    }
+    // A project from the user's own video has no YouTube info; don't keep the previous project's.
+    setVideoInfo(proj.videoInfo ?? null);
     setStudioStep(3);
     setLastSavedMessage(`Loaded "${proj.title.slice(0, 20)}..."`);
     setTimeout(() => setLastSavedMessage(null), 3000);
@@ -466,7 +472,7 @@ export const App: React.FC = () => {
           return 0;
         }
 
-        const isYouTubeVoice = Boolean(currentScript?.sourceYouTubeId && currentScript?.audioSourceMode !== 'tts');
+        const isYouTubeVoice = Boolean((currentScript?.sourceYouTubeId || currentScript?.sourceLocalVideo) && currentScript?.audioSourceMode !== 'tts');
         if (!isYouTubeVoice && aiVoiceEnabledRef.current) {
           const currentBeat = currentScript?.beats.find((b) => prev < b.start_s && next >= b.start_s);
           if (currentBeat) {
@@ -661,9 +667,62 @@ export const App: React.FC = () => {
     }
   };
 
-  const handleSelectYouTubeCandidate = async (clip: YouTubeClipCandidate, infoOverride?: YouTubeVideoInfo) => {
-    const currentInfo = infoOverride || videoInfo;
-    if (!currentInfo) return;
+  // "Your Video to Clips": only the transcript goes to the server; the file is attached in the browser (offset 0,
+  // it is the whole video) and stored locally under this draft, so the canvas opens with real footage + audio.
+  const handleAnalyzeLocalVideo = async (file: File, transcript: string, objective: string, durationSeconds?: number) => {
+    setIsGenerating(true);
+    setIsPlaying(false);
+    audioManager.stopAll();
+    setYoutubeError(null);
+    setAiNotice(null);
+
+    try {
+      setGenerationStep('Finding the strongest clip moments in your transcript...');
+      const genRes = await apiFetch('/api/clips/from-transcript', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ transcript, title: file.name, durationSeconds, clipObjective: objective }),
+      });
+      if (!genRes.ok) {
+        throw new Error(await apiErrorMessage(genRes, 'Could not find clips in this transcript.'));
+      }
+      const genData = await genRes.json();
+      if (!genData.clips || genData.clips.length === 0) {
+        throw new Error(genData.error || 'No clips found in this transcript.');
+      }
+
+      setAiNotice(genData.fallbackMessage ? `${genData.fallbackMessage} ${genData.groundingWarning || ''}`.trim() : genData.groundingWarning || null);
+      setClipCandidates(genData.clips);
+      setCurrentProjectId(undefined);
+      setVideoInfo(null);
+      setCreationMode('local');
+      setVisualMode('youtube-crop');
+
+      const localVideo = { name: file.name, ...(durationSeconds ? { durationSeconds: +durationSeconds.toFixed(2) } : {}) };
+      await handleSelectYouTubeCandidate(genData.clips[0], undefined, localVideo);
+      setSourceFile(
+        { url: URL.createObjectURL(file), name: file.name, offset: 0, blob: file },
+        footageKeyFor(undefined, { sourceLocalVideo: localVideo }),
+      );
+      setStudioStep(2);
+    } catch (err: any) {
+      console.error('Failed to find clips in the local video:', err);
+      setYoutubeError(err?.message || 'Could not find clips in your video. Check the transcript and try again.');
+    } finally {
+      setIsGenerating(false);
+      setGenerationStep('');
+    }
+  };
+
+  const handleSelectYouTubeCandidate = async (
+    clip: YouTubeClipCandidate,
+    infoOverride?: YouTubeVideoInfo,
+    localOverride?: { name: string; durationSeconds?: number },
+  ) => {
+    const currentInfo = infoOverride || (localOverride ? undefined : videoInfo);
+    // A clip from the user's own video file: no YouTube info, the file name identifies the source.
+    const localVideo = currentInfo ? undefined : localOverride || scriptRef.current?.sourceLocalVideo;
+    if (!currentInfo && !localVideo) return;
 
     const startSec = clip.startSeconds ?? 15;
     const endSec = clip.endSeconds ?? (startSec + 30);
@@ -689,19 +748,20 @@ export const App: React.FC = () => {
 
     const finalBeats: Beat[] = timedBeats.map((beat) => ({
       ...beat,
-      video_url: '', // Real YouTube video rendered directly from iframe!
-      thumbnail: currentInfo.thumbnailUrl,
+      video_url: '', // Real YouTube video rendered directly from iframe (or the user's own file)!
+      thumbnail: currentInfo?.thumbnailUrl,
     }));
 
     setScript({
       hook: clip.hook || finalBeats[0]?.text || '',
       title: clip.suggestedTitles?.[0] || `${clip.clipTitle} #shorts`,
-      description: clip.description || `Key moment from "${currentInfo.title}" by ${currentInfo.authorName}.`,
+      description:
+        clip.description || (currentInfo ? `Key moment from "${currentInfo.title}" by ${currentInfo.authorName}.` : `Key moment from ${localVideo!.name}.`),
       hashtags: clip.hashtags || ['#shorts', '#viral'],
       beats: finalBeats,
-      sourceYouTubeId: currentInfo.videoId,
-      sourceYouTubeTitle: currentInfo.title,
-      sourceYouTubeAuthor: currentInfo.authorName,
+      ...(currentInfo
+        ? { sourceYouTubeId: currentInfo.videoId, sourceYouTubeTitle: currentInfo.title, sourceYouTubeAuthor: currentInfo.authorName }
+        : { sourceLocalVideo: localVideo }),
       viralScore: clip.viralScore,
       clipReasoning: clip.reasoning,
       clipStartSeconds: startSec,
@@ -711,7 +771,7 @@ export const App: React.FC = () => {
 
     const accurateWords = recalculateWordsFromBeats(finalBeats);
     setAllWords(accurateWords);
-    setTopic(currentInfo.title);
+    setTopic(currentInfo ? currentInfo.title : localVideo!.name);
     setCurrentTimestamp(0);
   };
 
@@ -1189,6 +1249,7 @@ export const App: React.FC = () => {
             processingStep={generationStep}
             onGenerateFromPrompt={handleGenerateFromPrompt}
             onAnalyzeYouTubeUrl={handleAnalyzeYouTubeUrl}
+            onAnalyzeLocalVideo={handleAnalyzeLocalVideo}
             sampleVideos={SAMPLE_VIDEOS}
             quickTopics={QUICK_TOPICS}
             errorMessage={youtubeError}
@@ -1264,6 +1325,8 @@ export const App: React.FC = () => {
             onApplyWordsAndBeats={handleApplyWordsAndBeats}
             visualMode={visualMode}
             onChangeVisualMode={setVisualMode}
+            sourceFile={sourceFile}
+            onChangeSourceFile={(next) => setSourceFile(next)}
           />
         )}
       </main>
