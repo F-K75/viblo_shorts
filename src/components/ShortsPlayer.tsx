@@ -1069,7 +1069,7 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
             </button>
           </div>
         )}
-        {sourceYouTubeId && visualMode === 'youtube-crop' && (
+        {isYouTubeSource && visualMode === 'youtube-crop' && (
           <div className="flex items-center justify-between gap-2 px-1 text-[11px]">
             <label className="flex items-center gap-1.5 text-neutral-300 cursor-pointer">
               <input type="checkbox" checked={autoFrame} onChange={(e) => setAutoFrame(e.target.checked)} className="accent-rose-500" />

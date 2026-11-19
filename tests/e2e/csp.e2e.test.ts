@@ -65,7 +65,13 @@ test('E2E CSP: Google sign-in attempt, guest onboarding, YouTube clip → editor
     await page.getByRole('heading', { name: 'Idea Prompt to Short' }).waitFor({ timeout: 30000 });
 
     // 2. YouTube clip flow.
-    await page.locator('input').first().fill('https://www.youtube.com/watch?v=UF8uR6Z6KLc');
+    await page.getByRole('heading', { name: 'YouTube Video to Clips' }).click();
+    await page.getByPlaceholder(/Paste YouTube link/).fill('https://www.youtube.com/watch?v=UF8uR6Z6KLc');
+    // Without AI and without reachable captions the server asks for a transcript (it never invents clips).
+    await page.getByRole('button', { name: 'Add custom CC' }).click();
+    await page.getByPlaceholder(/Paste transcript/).fill(
+      fs.readFileSync(new URL('../fixtures/talk.transcript.txt', import.meta.url), 'utf8'),
+    );
     await page.getByRole('button', { name: /^Analyze$/ }).click();
     await page.getByText(/Clip Strategies & Clip Trimmer/).first().waitFor({ timeout: 60000 });
     await page.getByRole('button', { name: /Canvas & Timeline/ }).first().click();

@@ -8,6 +8,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import { execFileSync, spawnSync } from 'node:child_process';
+import { watchCspViolations, formatViolations } from '../helpers/cspWatch.ts';
 import { startTestServer, TEST_BACKEND, type TestServer } from '../helpers/server.ts';
 
 const require = createRequire(import.meta.url);
@@ -47,6 +48,7 @@ async function openStudio(browser: any) {
   const page = await context.newPage();
   const pageErrors: string[] = [];
   page.on('pageerror', (e: Error) => pageErrors.push(e.message));
+  const cspViolations = await watchCspViolations(page, srv.baseUrl); // the production CSP must not block these flows
   // The video must never be sent to the server: record every request body size.
   page.on('request', (r: any) => {
     const body = r.postDataBuffer?.();
@@ -55,7 +57,7 @@ async function openStudio(browser: any) {
   await page.goto(srv.baseUrl);
   await page.getByRole('button', { name: /Get Started Free/ }).first().click();
   await page.getByRole('button', { name: /Guest/ }).click();
-  return { page, pageErrors };
+  return { page, pageErrors, cspViolations };
 }
 
 async function exportAndProbe(page: any, name: string) {
@@ -73,7 +75,7 @@ async function exportAndProbe(page: any, name: string) {
 test('E2E: "Your Video to Clips" — local file + pasted transcript → best clip → canvas with the file → export with real audio', { skip, timeout: 240000 }, async () => {
   const browser = await chromium.launch({ args: ['--autoplay-policy=no-user-gesture-required'] });
   try {
-    const { page, pageErrors } = await openStudio(browser);
+    const { page, pageErrors, cspViolations } = await openStudio(browser);
     await page.getByRole('heading', { name: 'Your Video to Clips' }).click();
     if (screenshotDir) await page.screenshot({ path: path.join(screenshotDir, 'source-page-your-video.png'), fullPage: true });
 
@@ -108,6 +110,7 @@ test('E2E: "Your Video to Clips" — local file + pasted transcript → best cli
     assert.ok(mean > -35, `source audio must be in the export (mean ${mean} dB)`);
     assert.ok(Math.max(...uploadedBodies) < 1024 * 1024, `no request may carry the video (largest body ${Math.max(...uploadedBodies)} B)`);
     assert.deepEqual(pageErrors, []);
+    assert.equal(cspViolations.length, 0, `CSP violations:\n${formatViolations(cspViolations)}`);
   } finally {
     await browser.close();
   }
@@ -116,7 +119,7 @@ test('E2E: "Your Video to Clips" — local file + pasted transcript → best cli
 test('E2E: attached footage survives a reload and reopening the saved project; removing it forgets it', { skip, timeout: 300000 }, async () => {
   const browser = await chromium.launch({ args: ['--autoplay-policy=no-user-gesture-required'] });
   try {
-    const { page, pageErrors } = await openStudio(browser);
+    const { page, pageErrors, cspViolations } = await openStudio(browser);
     await page.getByRole('heading', { name: 'YouTube Video to Clips' }).click();
     await page.getByPlaceholder(/Paste YouTube link/).fill('https://www.youtube.com/watch?v=arj7oStGLkU');
     await page.getByRole('button', { name: 'Add custom CC' }).click();
@@ -178,6 +181,7 @@ test('E2E: attached footage survives a reload and reopening the saved project; r
     assert.equal(stored, 0);
     assert.ok(Math.max(...uploadedBodies) < 1024 * 1024, 'no request may carry the video');
     assert.deepEqual(pageErrors, []);
+    assert.equal(cspViolations.length, 0, `CSP violations:\n${formatViolations(cspViolations)}`);
   } finally {
     await browser.close();
   }
