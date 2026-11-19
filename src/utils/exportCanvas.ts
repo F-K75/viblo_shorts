@@ -4,6 +4,12 @@ import { TOPICS, getTopic } from './visualPlaceholders';
 /** The editor preview is 360 px wide; exported frames are scaled from it so captions look the same as in the editor. */
 export const PREVIEW_WIDTH = 360;
 
+/** Characters that fit in two caption lines at this font size (bold caps average ~0.62em per glyph). */
+export function captionMaxChars(fontSize: number, lines = 2): number {
+  const usable = (PREVIEW_WIDTH - 24) * 0.94 - 28;
+  return Math.max(8, Math.floor((usable / (Math.max(10, fontSize) * 0.62)) * lines));
+}
+
 const easeOut = (x: number) => 1 - Math.pow(1 - Math.min(1, Math.max(0, x)), 3);
 
 /**
@@ -113,13 +119,44 @@ export function drawMotionBackground(
 }
 
 /**
+ * Number of lines drawCaptionChunk will need for these words (same font, word gap, width and active-word reserve),
+ * so captions can be grouped to fit the line limit with the renderer's own layout instead of a character estimate.
+ */
+export function captionLineCount(ctx: CanvasRenderingContext2D, words: string[], style: CaptionStyle, w = PREVIEW_WIDTH): number {
+  const k = w / PREVIEW_WIDTH;
+  const isUpper = style.textTransform !== 'none';
+  const fontPx = style.fontSize * k;
+  ctx.save();
+  ctx.font = `${style.fontWeight || '900'} ${fontPx}px '${style.fontFamily || 'Montserrat'}', 'Poppins', sans-serif`;
+  const gap = fontPx * 0.32;
+  // 3% safety margin: measuring at preview scale and drawing at export scale can differ by a pixel at the wrap point.
+  const maxLineW = ((PREVIEW_WIDTH - 24) * 0.94 * k - 14 * k * 2) * 0.97;
+  const widths = words
+    .map((wd) => (isUpper ? wd.toUpperCase() : wd).replace(/[.,!?;:]/g, ''))
+    .filter(Boolean)
+    .map((t) => ctx.measureText(t).width * 1.12); // any word may be the highlighted (1.12x) one
+  ctx.restore();
+  if (!widths.length) return 0;
+  let lines = 1;
+  let lineW = 0;
+  for (const wd of widths) {
+    const add = (lineW ? gap : 0) + wd;
+    if (lineW && lineW + add > maxLineW) {
+      lines++;
+      lineW = wd;
+    } else lineW += add;
+  }
+  return lines;
+}
+
+/**
  * Draws a kinetic caption chunk exactly like the editor preview (ShortsPlayer overlay), scaled from the 360 px preview:
  * same font size, stroke, pill box, 94% max width with line wrapping, and the 1.12x pop on the active word.
  */
 export function drawCaptionChunk(
   ctx: CanvasRenderingContext2D,
   opts: { words: WordTiming[]; t: number; style: CaptionStyle; w: number; h: number },
-) {
+) : number {
   const { words, t, style, w, h } = opts;
   const k = w / PREVIEW_WIDTH;
   const isUpper = style.textTransform !== 'none';
@@ -142,7 +179,7 @@ export function drawCaptionChunk(
     .map((i) => ({ ...i, width: ctx.measureText(i.text).width * (i.active ? 1.12 : 1) }));
   if (!items.length) {
     ctx.restore();
-    return;
+    return 0;
   }
 
   // Greedy line wrap
@@ -199,6 +236,7 @@ export function drawCaptionChunk(
     });
   });
   ctx.restore();
+  return lines.length; // reported to the quality check (caption overflow evidence)
 }
 
 /**
@@ -214,6 +252,7 @@ export function drawSourceFrame(
   w: number,
   h: number,
   cropCenter = 0.5,
+  zoom = 1,
 ) {
   const vw = video.videoWidth;
   const vh = video.videoHeight;
@@ -223,12 +262,17 @@ export function drawSourceFrame(
     let sx = 0, sy = 0, sw = vw, sh = vh;
     if (src > target) {
       sw = vh * target;
-      const c = Number.isFinite(center) ? center : 0.5;
-      sx = Math.min(vw - sw, Math.max(0, c * vw - sw / 2));
     } else {
       sh = vw / target;
-      sy = (vh - sh) / 2;
     }
+    // Punch-in: a tighter crop of the same frame (a framing change at a sentence boundary). Kept slightly above
+    // centre vertically, where faces usually are.
+    const z = mode === 'fill' && zoom > 1 ? zoom : 1;
+    sw /= z;
+    sh /= z;
+    const c = Number.isFinite(center) ? center : 0.5;
+    sx = Math.min(vw - sw, Math.max(0, c * vw - sw / 2));
+    sy = Math.min(vh - sh, Math.max(0, (vh - sh) * (z > 1 ? 0.35 : 0.5)));
     ctx.drawImage(video, sx, sy, sw, sh, 0, 0, w, h);
   };
   if (mode === 'fill') {

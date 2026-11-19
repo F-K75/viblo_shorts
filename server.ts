@@ -48,6 +48,7 @@ import { registerHealthRoutes } from './server/routes/health.ts';
 import { registerAuthRoutes } from './server/routes/auth.ts';
 import { registerProjectRoutes } from './server/routes/projects.ts';
 import { registerYouTubeDownloadRoutes } from './server/routes/youtubeDownload.ts';
+import { registerQualityRoutes } from './server/routes/quality.ts';
 import { buildContentSecurityPolicy, cspHeaderName, parseCspEnv, PERMISSIONS_POLICY, CROSS_ORIGIN_OPENER_POLICY } from './server/lib/csp.ts';
 
 dotenv.config();
@@ -124,6 +125,8 @@ const BODY_LIMITS: BodyLimits = {
   transcriptBytes: envNum('BODY_LIMIT_TRANSCRIPT_KB', 1024, 16) * 1024,
   mediumBytes: envNum('BODY_LIMIT_MEDIUM_KB', 64, 4) * 1024,
   defaultBytes: envNum('BODY_LIMIT_DEFAULT_KB', 16, 1) * 1024,
+  // Exported reels uploaded for quality checks: streamed to disk by the route (never buffered in memory).
+  uploadBytes: envNum('QUALITY_MAX_UPLOAD_MB', 300, 1) * 1024 * 1024,
 };
 const BODY_CONCURRENCY = Math.floor(envNum('BODY_CONCURRENCY', 16, 1));
 const LARGE_BODY_BYTES = envNum('LARGE_BODY_KB', 64, 1) * 1024;
@@ -1382,6 +1385,8 @@ registerProjectRoutes(app, {
 
 // Optional, off by default (YOUTUBE_DOWNLOAD_ENABLED=true + yt-dlp): real YouTube footage for clips.
 const youTubeDownloads = registerYouTubeDownloadRoutes(app, { dataDir: DATA_DIR, rateLimit, uid, extractYouTubeId, parseRangeHeader });
+// Post-export quality gate: upload the exported reel → conform → evaluate → deliver (server/routes/quality.ts).
+const qualityRoutes = registerQualityRoutes(app, { dataDir: DATA_DIR, rateLimit, uid, maxUploadBytes: BODY_LIMITS.uploadBytes! });
 
 app.post('/api/projects/claim', rateLimit('projects-write', 60), async (req, res) => {
   if (req.identity?.kind !== 'firebase') {
@@ -2905,6 +2910,7 @@ export async function startServer(): Promise<Server> {
   let shuttingDown = false;
   const shutdown = async (signal: string, code = 0) => {
     youTubeDownloads.stop();
+    qualityRoutes.stop();
     if (shuttingDown) return;
     shuttingDown = true;
     console.log(`[Forge Studio] ${signal} received, shutting down...`);

@@ -53,6 +53,8 @@ export interface CaptionStyle {
   backgroundColor?: string;
   positionY: number; // percentage from top, e.g. 68
   wordsPerChunk: number;
+  /** 'phrase' (default): whole clauses up to two lines. 'words': fixed bursts of wordsPerChunk words. */
+  grouping?: 'phrase' | 'words';
   fontFamily?: string;
   fontWeight?: string;
   textTransform?: 'uppercase' | 'none';

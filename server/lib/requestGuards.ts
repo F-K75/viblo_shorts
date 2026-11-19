@@ -25,15 +25,19 @@ export interface BodyLimits {
   mediumBytes: number;
   /** Everything else (small JSON forms). */
   defaultBytes: number;
+  /** Binary uploads streamed to disk by the route itself (exported reels for quality checks). */
+  uploadBytes?: number;
 }
 
-const PROJECT_ROUTES = new Set(['/api/projects', '/api/publish/generate-pack', '/api/gemini/optimize-metadata', '/api/render/video', '/api/jobs/create']);
+const PROJECT_ROUTES = new Set(['/api/projects', '/api/publish/generate-pack', '/api/gemini/optimize-metadata', '/api/render/video', '/api/jobs/create', '/api/quality/evaluate']);
+const UPLOAD_ROUTES = new Set(['/api/quality/uploads']);
 const TRANSCRIPT_ROUTES = new Set(['/api/youtube/parse-transcript', '/api/youtube/generate-clips', '/api/clips/from-transcript']);
 const MEDIUM_ROUTES = new Set(['/api/voice-to-text/transcribe-clip', '/api/voice-to-text/align-words']);
 /** Routes that start renders: refused under memory pressure whatever their body size. */
 const RENDER_ROUTE = /^\/api\/(render\/video|jobs\/create|jobs\/[^/]+\/retry)$/;
 
 export function bodyLimitFor(path: string, limits: BodyLimits): number {
+  if (UPLOAD_ROUTES.has(path)) return limits.uploadBytes ?? limits.defaultBytes;
   if (PROJECT_ROUTES.has(path)) return limits.projectBytes;
   if (TRANSCRIPT_ROUTES.has(path)) return limits.transcriptBytes;
   if (MEDIUM_ROUTES.has(path)) return limits.mediumBytes;

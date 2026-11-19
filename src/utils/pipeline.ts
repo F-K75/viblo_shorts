@@ -157,6 +157,67 @@ export function chunkWords(words: WordTiming[], wordsPerChunk = 3): CaptionChunk
   return chunks;
 }
 
+const SENTENCE_END = /[.!?]["')\]]?$/;
+const CLAUSE_END = /[,;:\u2014-]["')\]]?$/;
+const CONNECTIVES = new Set(['and', 'but', 'so', 'because', 'or', 'which', 'that', 'when', 'while', 'if', 'then', 'before', 'after', 'until', 'like']);
+
+/**
+ * Phrase captions: whole clauses instead of fixed N-word flashes. A caption ends at a sentence or clause end, a beat
+ * change or a real pause; it never exceeds maxWords or maxChars (so it fits the configured lines); a lone trailing
+ * word is merged into its neighbour instead of flashing on its own. Every word is kept: nothing is dropped to fit.
+ */
+export function chunkCaptionPhrases(
+  words: WordTiming[],
+  opts: { maxWords?: number; maxChars?: number; fits?: (words: string[]) => boolean } = {},
+): CaptionChunk[] {
+  const maxWords = Math.max(1, opts.maxWords ?? 6);
+  const maxChars = Math.max(6, opts.maxChars ?? 28);
+  const groups: WordTiming[][] = [];
+  let group: WordTiming[] = [];
+  const chars = (g: WordTiming[]) => g.reduce((n, w) => n + w.word.length, 0) + Math.max(0, g.length - 1);
+  // A measured layout check (the renderer's own line wrapping) wins over the character estimate when provided.
+  const fitsWith = (g: WordTiming[], extra: WordTiming) =>
+    opts.fits ? opts.fits([...g, extra].map((x) => x.word)) : chars(g) + 1 + extra.word.length <= maxChars;
+  words.forEach((w, i) => {
+    const prev = words[i - 1];
+    const hardBreak = prev && (SENTENCE_END.test(prev.word) || prev.beatId !== w.beatId || w.start_s - prev.end_s > 0.5);
+    const softBreak = prev && (CLAUSE_END.test(prev.word) || (CONNECTIVES.has(w.word.toLowerCase()) && group.length >= 3));
+    const tooBig = group.length >= maxWords || (group.length > 0 && !fitsWith(group, w));
+    if (group.length && (hardBreak || softBreak || tooBig)) {
+      groups.push(group);
+      group = [];
+    }
+    group.push(w);
+  });
+  if (group.length) groups.push(group);
+
+  // Orphans: a single word that does not finish a sentence joins its neighbour in the same sentence/beat.
+  for (let i = 0; i < groups.length; i++) {
+    const g = groups[i];
+    if (g.length !== 1 || groups.length === 1) continue;
+    const w = g[0];
+    const prev = groups[i - 1];
+    const next = groups[i + 1];
+    const samePrev = prev && !SENTENCE_END.test(prev[prev.length - 1].word) && prev[prev.length - 1].beatId === w.beatId;
+    const sameNext = next && !SENTENCE_END.test(w.word) && next[0].beatId === w.beatId;
+    const fits = (h: WordTiming[]) =>
+      h.length + 1 <= maxWords + 1 && (opts.fits ? opts.fits([...h, w].map((x) => x.word)) : chars(h) + 1 + w.word.length <= Math.round(maxChars * 1.15));
+    if (samePrev && fits(prev)) {
+      prev.push(w);
+      groups.splice(i--, 1);
+    } else if (sameNext && fits(next)) {
+      next.unshift(w);
+      groups.splice(i--, 1);
+    }
+  }
+  return groups.map((g) => ({
+    text: g.map((w) => w.word.toUpperCase().replace(/[.,!?;:]/g, '')).join(' '),
+    start_s: g[0].start_s,
+    end_s: g[g.length - 1].end_s,
+    words: g,
+  }));
+}
+
 /**
  * Recalculates word-level caption timestamps directly from each beat's text and audio CC window [start_s, end_s].
  * Whenever the user edits text, adjusts timestamps, or syncs audio CC in the beat timeline,
@@ -273,3 +334,48 @@ export function generateSrtFromBeats(beats: Beat[]): string {
 }
 
 
+
+/**
+ * Scene-level media selection without repetition: for each beat pick the best-ranked result that no other beat uses;
+ * when every result is taken, reuse the least-used one (never the same clip twice in a row if avoidable).
+ * Returns the chosen index per beat (-1 when a beat has no results).
+ */
+export function pickDistinctAssets<T extends { url?: string }>(resultsPerBeat: T[][]): number[] {
+  const used = new Map<string, number>();
+  const chosen: number[] = [];
+  resultsPerBeat.forEach((results, b) => {
+    const prevUrl = b > 0 && chosen[b - 1] >= 0 ? resultsPerBeat[b - 1][chosen[b - 1]]?.url : undefined;
+    let pick = results.findIndex((r) => r.url && !used.has(r.url));
+    if (pick < 0 && results.length) {
+      let best = Infinity;
+      results.forEach((r, i) => {
+        const n = (used.get(r.url || '') || 0) + (r.url === prevUrl ? 1000 : 0);
+        if (n < best) {
+          best = n;
+          pick = i;
+        }
+      });
+    }
+    chosen.push(pick);
+    const url = pick >= 0 ? results[pick].url : undefined;
+    if (url) used.set(url, (used.get(url) || 0) + 1);
+  });
+  return chosen;
+}
+
+/**
+ * Re-times beats to the real narration: each beat lasts as long as its spoken audio plus a short pause, so a line is
+ * never cut off by the next one and captions follow the voice instead of an estimate. Beats without a measured
+ * duration keep their own length.
+ */
+export function retimeBeatsToNarration(beats: Beat[], durationsS: Array<number | null>, pauseS = 0.25): Beat[] {
+  let t = 0;
+  return beats.map((b, i) => {
+    const own = Math.max(0.5, (b.end_s || 0) - (b.start_s || 0));
+    const d = durationsS[i];
+    const len = d && d > 0 ? d + pauseS : own;
+    const out = { ...b, start_s: +t.toFixed(2), end_s: +(t + len).toFixed(2) };
+    t += len;
+    return out;
+  });
+}
