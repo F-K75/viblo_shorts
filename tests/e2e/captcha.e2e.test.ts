@@ -64,7 +64,7 @@ const FAKE_TURNSTILE = `
 `;
 
 test('E2E: guest onboarding solves Turnstile (site key from /api/config, action guest_mint) and the server verifies it', { skip, timeout: 120000 }, async () => {
-  const browser = await chromium.launch();
+  const browser = await chromium.launch(process.env.PW_CHROMIUM_PATH ? { executablePath: process.env.PW_CHROMIUM_PATH } : {});
   const ctx = await browser.newContext();
   const page = await ctx.newPage();
   const cspViolations = await watchCspViolations(page, srv.baseUrl); // FS-013: the production CSP blocks nothing legitimate

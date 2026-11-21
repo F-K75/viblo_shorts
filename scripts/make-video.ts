@@ -13,7 +13,7 @@ const outDir = path.resolve(process.argv[3] || 'output');
 fs.mkdirSync(outDir, { recursive: true });
 
 const srv = await startTestServer({ NODE_ENV: 'production', TRUST_PROXY: 'none', CAPTCHA_REQUIRED: 'false', STORAGE_BACKEND: 'json' });
-const browser = await chromium.launch({ args: ['--autoplay-policy=no-user-gesture-required'] });
+const browser = await chromium.launch({ ...(process.env.PW_CHROMIUM_PATH ? { executablePath: process.env.PW_CHROMIUM_PATH } : {}), args: ['--autoplay-policy=no-user-gesture-required'] });
 try {
   const page = await (await browser.newContext({ viewport: { width: 1366, height: 900 }, acceptDownloads: true })).newPage();
   await page.goto(srv.baseUrl);

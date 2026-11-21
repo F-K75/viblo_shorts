@@ -9,6 +9,7 @@ import path from 'node:path';
 import { createRequire } from 'node:module';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { watchCspViolations, formatViolations } from '../helpers/cspWatch.ts';
+import { speechLavfi } from '../helpers/speech.ts';
 import { startTestServer, TEST_BACKEND, type TestServer } from '../helpers/server.ts';
 
 const require = createRequire(import.meta.url);
@@ -34,8 +35,8 @@ before(async () => {
   });
   tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-local-'));
   sourceFile = path.join(tmp, 'my-talk.mp4');
-  // 135 s landscape source with a continuous 440 Hz tone standing in for speech.
-  execFileSync('ffmpeg', ['-v', 'error', '-y', '-f', 'lavfi', '-i', 'testsrc2=s=640x360:r=30:d=135', '-f', 'lavfi', '-i', 'sine=f=440:r=48000:d=135',
+  // 135 s landscape source with a real (synthesised) speech.
+  execFileSync('ffmpeg', ['-v', 'error', '-y', '-f', 'lavfi', '-i', 'testsrc2=s=640x360:r=30:d=135', '-f', 'lavfi', '-i', speechLavfi(135),
     '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-shortest', sourceFile]);
 });
 after(async () => {
@@ -73,7 +74,7 @@ async function exportAndProbe(page: any, name: string) {
 }
 
 test('E2E: "Your Video to Clips" — local file + pasted transcript → best clip → canvas with the file → export with real audio', { skip, timeout: 240000 }, async () => {
-  const browser = await chromium.launch({ args: ['--autoplay-policy=no-user-gesture-required'] });
+  const browser = await chromium.launch({ ...(process.env.PW_CHROMIUM_PATH ? { executablePath: process.env.PW_CHROMIUM_PATH } : {}), args: ['--autoplay-policy=no-user-gesture-required'] });
   try {
     const { page, pageErrors, cspViolations } = await openStudio(browser);
     await page.getByRole('heading', { name: 'Your Video to Clips' }).click();
@@ -117,7 +118,7 @@ test('E2E: "Your Video to Clips" — local file + pasted transcript → best cli
 });
 
 test('E2E: attached footage survives a reload and reopening the saved project; removing it forgets it', { skip, timeout: 300000 }, async () => {
-  const browser = await chromium.launch({ args: ['--autoplay-policy=no-user-gesture-required'] });
+  const browser = await chromium.launch({ ...(process.env.PW_CHROMIUM_PATH ? { executablePath: process.env.PW_CHROMIUM_PATH } : {}), args: ['--autoplay-policy=no-user-gesture-required'] });
   try {
     const { page, pageErrors, cspViolations } = await openStudio(browser);
     await page.getByRole('heading', { name: 'YouTube Video to Clips' }).click();

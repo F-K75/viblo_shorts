@@ -105,7 +105,9 @@ describe('audio', () => {
   test('silent audio when audio is required is a critical defect', async () => {
     const e = evaluate(await probeMedia(f('silent.mp4')), timeline());
     assert.equal(e.status, 'REJECTED');
-    assert.ok(e.criticalDefects.some((c) => c.id === 'audio_present'));
+    assert.ok(e.criticalDefects.some((c) => c.id === 'audio_signal'));
+    assert.equal(e.classification, 'POOR');
+    assert.ok((e.criticalDefects.find((c) => c.id === 'audio_signal')!.evidence as any).digitalSilence, 'decoded samples are all zero');
   });
 });
 
@@ -163,7 +165,10 @@ describe('captions', () => {
     assert.ok(failed.timing_range);
   });
   test('sync: captions must start with the speech in the exported audio', () => {
-    const media = { audio: { codec: 'aac', sampleRate: 48000, channels: 2, durationS: 8 }, analysis: { silenceSegments: [{ start: 0, end: 2 }] } } as unknown as MediaFacts;
+    const media = {
+      audio: { codec: 'aac', sampleRate: 48000, channels: 2, durationS: 8 },
+      analysis: { silenceSegments: [{ start: 0, end: 2 }], audioSignal: { digitalSilence: false, speechSpans: [{ start: 2, end: 8 }], activeSpans: [{ start: 2, end: 8 }] } },
+    } as unknown as MediaFacts;
     const t = timeline({ audio: { required: true, narration: true, sourceSpeech: false, music: false } });
     const r = evaluateCaptions(media, t, th);
     assert.equal(r.find((c) => c.id === 'sync_start')!.passed, false);

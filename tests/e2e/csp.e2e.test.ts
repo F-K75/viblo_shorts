@@ -31,7 +31,7 @@ before(async () => {
 after(async () => srv?.stop());
 
 test('E2E CSP: Google sign-in attempt, guest onboarding, YouTube clip → editor → export with zero CSP violations', { skip, timeout: 240000 }, async () => {
-  const browser = await chromium.launch({ args: ['--autoplay-policy=no-user-gesture-required'] });
+  const browser = await chromium.launch({ ...(process.env.PW_CHROMIUM_PATH ? { executablePath: process.env.PW_CHROMIUM_PATH } : {}), args: ['--autoplay-policy=no-user-gesture-required'] });
   const ctx = await browser.newContext({ viewport: { width: 1366, height: 900 }, acceptDownloads: true });
   const page = await ctx.newPage();
   const violations = await watchCspViolations(page, srv.baseUrl);
@@ -78,9 +78,18 @@ test('E2E CSP: Google sign-in attempt, guest onboarding, YouTube clip → editor
     await page.locator('iframe[src^="https://www.youtube.com/embed/"]').first().waitFor({ state: 'attached', timeout: 15000 });
     await page.waitForTimeout(1500);
 
-    // Export: canvas + MediaRecorder + blob: download.
-    const dl = page.waitForEvent('download', { timeout: 180000 });
+    // Export: precheck, TTS audio (blob), canvas + MediaRecorder, quality job, blob: download.
+    // A link-only clip cannot record the speaker's voice: the export is blocked BEFORE recording (it used to ship a
+    // silent reel). The offered fix (narration with a recordable voice) is part of the journey checked for CSP.
     await page.getByRole('button', { name: /Export & Download Finished Short/ }).click();
+    await page.getByTestId('quality-report').waitFor({ timeout: 60000 });
+    assert.match(await page.getByTestId('quality-status').innerText(), /Blocked/);
+    await page.getByRole('button', { name: 'Use AI voice' }).click();
+    await page.waitForTimeout(3000);
+    const dl = page.waitForEvent('download', { timeout: 300000 });
+    await page.getByRole('button', { name: /Export & Download Finished Short/ }).click();
+    await page.getByTestId('quality-dimensions').waitFor({ timeout: 300000 });
+    if (/Poor/.test(await page.getByTestId('quality-status').innerText())) await page.getByRole('button', { name: /Download anyway/ }).click();
     const download = await dl;
     assert.ok(download.suggestedFilename());
 

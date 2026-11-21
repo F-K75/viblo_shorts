@@ -9,6 +9,7 @@ import path from 'node:path';
 import { createRequire } from 'node:module';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { watchCspViolations, formatViolations } from '../helpers/cspWatch.ts';
+import { speechLavfi } from '../helpers/speech.ts';
 import { startTestServer, TEST_BACKEND, type TestServer } from '../helpers/server.ts';
 
 const require = createRequire(import.meta.url);
@@ -34,8 +35,8 @@ before(async () => {
   });
   tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-clip-'));
   sourceFile = path.join(tmp, 'source.mp4');
-  // 135 s landscape source with a continuous 440 Hz tone standing in for speech.
-  execFileSync('ffmpeg', ['-v', 'error', '-y', '-f', 'lavfi', '-i', 'testsrc2=s=640x360:r=30:d=135', '-f', 'lavfi', '-i', 'sine=f=440:r=48000:d=135',
+  // 135 s landscape source with a real (synthesised) speech.
+  execFileSync('ffmpeg', ['-v', 'error', '-y', '-f', 'lavfi', '-i', 'testsrc2=s=640x360:r=30:d=135', '-f', 'lavfi', '-i', speechLavfi(135),
     '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-shortest', sourceFile]);
 });
 after(async () => {
@@ -44,7 +45,7 @@ after(async () => {
 });
 
 test('E2E: YouTube link + transcript → best clip → own video file → export with real audio', { skip, timeout: 240000 }, async () => {
-  const browser = await chromium.launch({ args: ['--autoplay-policy=no-user-gesture-required'] });
+  const browser = await chromium.launch({ ...(process.env.PW_CHROMIUM_PATH ? { executablePath: process.env.PW_CHROMIUM_PATH } : {}), args: ['--autoplay-policy=no-user-gesture-required'] });
   const page = await (await browser.newContext({ viewport: { width: 1366, height: 900 }, acceptDownloads: true })).newPage();
   const pageErrors: string[] = [];
   page.on('pageerror', (e: Error) => pageErrors.push(e.message));
@@ -89,7 +90,7 @@ test('E2E: YouTube link + transcript → best clip → own video file → export
 });
 
 test('E2E: YouTube clip → "Get this clip\'s footage from YouTube" (rights confirmed) → export with footage + audio', { skip, timeout: 240000 }, async () => {
-  const browser = await chromium.launch({ args: ['--autoplay-policy=no-user-gesture-required'] });
+  const browser = await chromium.launch({ ...(process.env.PW_CHROMIUM_PATH ? { executablePath: process.env.PW_CHROMIUM_PATH } : {}), args: ['--autoplay-policy=no-user-gesture-required'] });
   const page = await (await browser.newContext({ viewport: { width: 1366, height: 900 }, acceptDownloads: true })).newPage();
   const pageErrors: string[] = [];
   page.on('pageerror', (e: Error) => pageErrors.push(e.message));

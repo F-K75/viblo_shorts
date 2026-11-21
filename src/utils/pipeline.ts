@@ -159,6 +159,9 @@ export function chunkWords(words: WordTiming[], wordsPerChunk = 3): CaptionChunk
 
 const SENTENCE_END = /[.!?]["')\]]?$/;
 const CLAUSE_END = /[,;:\u2014-]["')\]]?$/;
+/** Words a caption should not END on when it was split for size: they lead into the next words. */
+const WEAK_END = new Set(['a', 'an', 'the', 'of', 'to', 'in', 'on', 'at', 'by', 'for', 'with', 'from', 'into', 'and', 'or', 'but', 'so', 'your', 'my', 'our', 'their', 'his', 'her', 'its', 'this', 'that', 'these', 'those', 'is', 'are', 'was', 'be', 'than', 'as', 'if', 'when', 'just', 'very', 'more', 'most']);
+const bare = (w: string) => w.toLowerCase().replace(/[^a-z']/g, '');
 const CONNECTIVES = new Set(['and', 'but', 'so', 'because', 'or', 'which', 'that', 'when', 'while', 'if', 'then', 'before', 'after', 'until', 'like']);
 
 /**
@@ -184,8 +187,14 @@ export function chunkCaptionPhrases(
     const softBreak = prev && (CLAUSE_END.test(prev.word) || (CONNECTIVES.has(w.word.toLowerCase()) && group.length >= 3));
     const tooBig = group.length >= maxWords || (group.length > 0 && !fitsWith(group, w));
     if (group.length && (hardBreak || softBreak || tooBig)) {
+      // A size-forced split must not leave a dangling function word ("BRAIN FOG BY" | "SLEEP"): carry trailing weak
+      // words ("by", "the", "and", "your"…) over to start the next caption with the words they belong to.
+      const carry: WordTiming[] = [];
+      if (tooBig && !hardBreak && !softBreak) {
+        while (group.length > 1 && WEAK_END.has(bare(group[group.length - 1].word)) && !CLAUSE_END.test(group[group.length - 1].word)) carry.unshift(group.pop()!);
+      }
       groups.push(group);
-      group = [];
+      group = carry;
     }
     group.push(w);
   });

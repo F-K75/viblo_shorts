@@ -1,4 +1,5 @@
-import test from 'node:test';
+import { sceneHeadline } from '../src/utils/exportCanvas.ts';
+import test, { describe } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   estimateWordTimings,
@@ -182,4 +183,21 @@ test('Pipeline: retimeBeatsToNarration gives each beat its real voice length plu
   const beats = [0, 1, 2].map((i) => ({ id: `b${i}`, text: `Line ${i}.`, visual_keywords: '', start_s: i * 2, end_s: i * 2 + 2, video_url: '' }));
   const out = retimeBeatsToNarration(beats, [3.1, null, 1.5], 0.25);
   assert.deepEqual(out.map((b) => [b.start_s, b.end_s]), [[0, 3.35], [3.35, 5.35], [5.35, 7.1]]);
+});
+
+describe('caption splits and offline scene headlines', () => {
+  const timed = (text: string) => text.split(' ').map((word, i) => ({ word, start_s: i * 0.3, end_s: i * 0.3 + 0.25, beatId: 'b' }));
+  test('a size-forced caption split never ends on a function word ("BRAIN FOG BY" | "SLEEP")', () => {
+    const chunks = chunkCaptionPhrases(timed('Too little rest causes irreversible brain fog by the end of every single week'), { maxWords: 4, maxChars: 22 });
+    const weak = /^(a|an|the|of|to|in|on|at|by|for|with|and|or|your)$/i;
+    for (const c of chunks.slice(0, -1)) assert.doesNotMatch(c.words[c.words.length - 1].word, weak, c.text);
+    assert.equal(chunks.flatMap((c) => c.words).length, 14, 'no word dropped');
+  });
+  test('scene headlines carry the scene\'s own key idea (numbers first, then a phrase)', () => {
+    assert.equal(sceneHeadline('Keep your bedroom at 65 degrees Fahrenheit for deeper sleep.'), '65°F');
+    assert.equal(sceneHeadline('Stop screens 30 minutes before bed.'), '30 MINUTES');
+    assert.equal(sceneHeadline('Why does your to-do list never get done?'), 'TO-DO LIST');
+    assert.equal(sceneHeadline('It is not because you are lazy.'), 'LAZY');
+    assert.equal(sceneHeadline('During deep REM sleep your brain flushes out waste.'), 'DEEP REM');
+  });
 });

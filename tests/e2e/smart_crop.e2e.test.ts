@@ -10,6 +10,7 @@ import path from 'node:path';
 import { createRequire } from 'node:module';
 import { execFileSync } from 'node:child_process';
 import { watchCspViolations, formatViolations } from '../helpers/cspWatch.ts';
+import { speechLavfi } from '../helpers/speech.ts';
 import { startTestServer, TEST_BACKEND, type TestServer } from '../helpers/server.ts';
 
 const require = createRequire(import.meta.url);
@@ -37,7 +38,7 @@ before(async () => {
   // box centred ~250 px from the left edge that sways ±40 px, like someone talking and gesturing.
   execFileSync('ffmpeg', ['-v', 'error', '-y',
     '-f', 'lavfi', '-i', 'color=c=0x203040:s=1280x720:r=30:d=62',
-    '-f', 'lavfi', '-i', 'sine=f=440:r=48000:d=62',
+    '-f', 'lavfi', '-i', speechLavfi(62),
     '-vf', "drawbox=x='150+40*sin(2*t)':y=200:w=200:h=320:color=0xE0AC69@1:t=fill",
     '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-shortest', sourceFile]);
 });
@@ -80,7 +81,7 @@ async function exportShort(page: any, name: string) {
 }
 
 test('E2E: Vertical Fill auto-frames an off-centre speaker (centre crop would cut them off)', { skip, timeout: 420000 }, async () => {
-  const browser = await chromium.launch({ args: ['--autoplay-policy=no-user-gesture-required'] });
+  const browser = await chromium.launch({ ...(process.env.PW_CHROMIUM_PATH ? { executablePath: process.env.PW_CHROMIUM_PATH } : {}), args: ['--autoplay-policy=no-user-gesture-required'] });
   const page = await (await browser.newContext({ viewport: { width: 1366, height: 900 }, acceptDownloads: true })).newPage();
   const pageErrors: string[] = [];
   page.on('pageerror', (e: Error) => pageErrors.push(e.message));

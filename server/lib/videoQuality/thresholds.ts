@@ -6,10 +6,23 @@ import type { DimensionKey } from './models.ts';
  */
 export interface Thresholds {
   weights: Record<DimensionKey, number>;
-  passScore: number;
-  /** PASS also requires no MAJOR defect (stricter than score alone). QUALITY_PASS_ALLOW_MAJOR=true relaxes it. */
+  /** Classification bands: >= excellent → EXCELLENT, >= good → GOOD, >= improve → NEEDS_IMPROVEMENT, else POOR. */
+  excellentScore: number;
+  passScore: number; // = good
+  /** GOOD/EXCELLENT also require no MAJOR defect ("ready with MINOR warnings"). QUALITY_PASS_ALLOW_MAJOR=true relaxes it. */
   passRequiresNoMajor: boolean;
   improveScore: number;
+  /** Effective-detail factor (upscale) at which the picture is judged soft / badly upscaled. */
+  minorUpscale: number;
+  majorUpscale: number;
+  /** Minimum share of expected speech time that must actually contain speech-like audio. */
+  minVoiceoverCoverage: number;
+  minRmsDb: number; // whole-mix RMS below this is "barely audible"
+  maxStaticS: { source: number; broll: number; image: number; motion: number };
+  minLuma: number;
+  maxLuma: number;
+  minContrast: number;
+  safeArea: { top: number; bottom: number; side: number };
   spec: { width: number; height: number; fps: number; fpsTolerance: number; videoCodec: string; pixFmt: string; audioCodec: string };
   durationToleranceS: number;
   minEffectiveFpsRatio: number; // effective (distinct) fps / spec fps
@@ -38,8 +51,9 @@ const num = (env: NodeJS.ProcessEnv, name: string, def: number) => {
 
 export function loadThresholds(env: NodeJS.ProcessEnv = process.env): Thresholds {
   return {
-    weights: { captions: 20, visual: 20, diversity: 15, story: 15, audio: 10, editing: 10, export: 10 },
-    passScore: num(env, 'PASS_SCORE', 85),
+    weights: { audio: 15, export: 15, visual: 20, captions: 15, story: 15, pacing: 10, technical: 10 },
+    excellentScore: num(env, 'EXCELLENT_SCORE', 90),
+    passScore: num(env, 'PASS_SCORE', 80),
     passRequiresNoMajor: env.QUALITY_PASS_ALLOW_MAJOR !== 'true',
     improveScore: num(env, 'IMPROVE_SCORE', 70),
     spec: {
@@ -74,5 +88,20 @@ export function loadThresholds(env: NodeJS.ProcessEnv = process.env): Thresholds
     maxRepeatRatio: num(env, 'MAX_REPEAT_RATIO', 0.2),
     idealShotS: [num(env, 'IDEAL_SHOT_MIN_S', 1.5), num(env, 'IDEAL_SHOT_MAX_S', 6)],
     speechWpsRange: [num(env, 'SPEECH_WPS_MIN', 1.6), num(env, 'SPEECH_WPS_MAX', 4.0)],
+    minorUpscale: num(env, 'MINOR_UPSCALE', 3),
+    majorUpscale: num(env, 'MAJOR_UPSCALE', 4),
+    minVoiceoverCoverage: num(env, 'MIN_VOICEOVER_COVERAGE', 0.6),
+    minRmsDb: num(env, 'MIN_RMS_DB', -40),
+    maxStaticS: {
+      source: num(env, 'MAX_STATIC_SOURCE_S', 12),
+      broll: num(env, 'MAX_STATIC_BROLL_S', 8),
+      image: num(env, 'MAX_STATIC_IMAGE_S', 6),
+      motion: num(env, 'MAX_STATIC_MOTION_S', 8),
+    },
+    minLuma: num(env, 'MIN_LUMA', 30),
+    maxLuma: num(env, 'MAX_LUMA', 225),
+    minContrast: num(env, 'MIN_CONTRAST', 18),
+    // YouTube Shorts overlays: title/channel at the bottom ~20%, top bar ~8%, action buttons on the right edge.
+    safeArea: { top: num(env, 'SAFE_TOP', 0.08), bottom: num(env, 'SAFE_BOTTOM', 0.8), side: num(env, 'SAFE_SIDE', 0.04) },
   };
 }

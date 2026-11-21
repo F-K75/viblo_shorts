@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import type { MediaFacts } from './models.ts';
+import { analyzeSpeech, s16leToFloat } from './speech.ts';
 
 /**
  * Measures a media file with ffprobe and ffmpeg analysis filters (no shell: argument arrays only, with a timeout).
@@ -87,6 +88,158 @@ export function dHashFrames(raw: Buffer): string[] {
   return hashes;
 }
 
+const STAB_W = 32;
+const STAB_H = 56;
+
+/**
+ * Splits 2 fps thumbnails (32x56 gray) into visual states using mean absolute luma difference (MAD). Calibrated on
+ * real files: hard cuts jump 40-75 between samples, a slow zoom on a still drifts ≤ 2 per sample (≤ 20 in total), the
+ * failed reel's per-scene zoom reset jumps 12.6. A new state starts on a cut (> cutThreshold) or after a large drift.
+ * States whose anchors look alike are clustered, so "the same picture again later" is counted once.
+ */
+export function visualStates(raw: Buffer, stepS: number, cutThreshold = 15, driftThreshold = 30, clusterThreshold = 25): NonNullable<MediaFacts['analysis']['stability']> {
+  const size = STAB_W * STAB_H;
+  const frames: Uint8Array[] = [];
+  for (let o = 0; o + size <= raw.length; o += size) frames.push(raw.subarray(o, o + size));
+  const mad = (a: Uint8Array, b: Uint8Array) => {
+    let d = 0;
+    for (let i = 0; i < size; i++) d += Math.abs(a[i] - b[i]);
+    return d / size;
+  };
+  let lumaSum = 0;
+  let varSum = 0;
+  let dark = 0;
+  for (const f of frames) {
+    let m = 0;
+    for (let i = 0; i < size; i++) m += f[i];
+    m /= size;
+    let v = 0;
+    for (let i = 0; i < size; i++) v += (f[i] - m) ** 2;
+    lumaSum += m;
+    varSum += Math.sqrt(v / size);
+    if (m < 25) dark++;
+  }
+  const states: Array<{ start: number; end: number; cluster: number; anchor: Uint8Array }> = [];
+  const anchors: Uint8Array[] = [];
+  frames.forEach((f, i) => {
+    const cur = states[states.length - 1];
+    // Same state unless the picture CUTS (jumps between consecutive samples) or has drifted far from the state's
+    // first frame (a long pan). A slow zoom changes a little each sample and never cuts: it stays one state.
+    if (cur && mad(frames[i - 1], f) <= cutThreshold && mad(cur.anchor, f) <= driftThreshold) {
+      cur.end = (i + 1) * stepS;
+      return;
+    }
+    let cluster = anchors.findIndex((a) => mad(a, f) <= clusterThreshold);
+    if (cluster < 0) {
+      anchors.push(f);
+      cluster = anchors.length - 1;
+    }
+    states.push({ start: i * stepS, end: (i + 1) * stepS, cluster, anchor: f });
+  });
+  const n = Math.max(1, frames.length);
+  return {
+    states: states.map(({ start, end, cluster }) => ({ start, end, cluster })),
+    distinctVisuals: anchors.length,
+    longestStaticS: states.reduce((m, s) => Math.max(m, s.end - s.start), 0),
+    meanLuma: Math.round((lumaSum / n) * 10) / 10,
+    contrast: Math.round((varSum / n) * 10) / 10,
+    darkRatio: Math.round((dark / n) * 1000) / 1000,
+  };
+}
+
+/** Video packet timestamps: monotonic decode order, largest gap between frames and frame-interval jitter. */
+export function packetTiming(csv: string, videoStartS: number, audioStartS: number | null, declaredFps: number): NonNullable<MediaFacts['analysis']['timing']> {
+  const rows = csv.split('\n').map((l) => l.split(',')).filter((r) => r.length >= 2 && r[0] !== 'N/A');
+  const pts = rows.map((r) => Number(r[0])).filter(Number.isFinite).sort((a, b) => a - b);
+  const dts = rows.map((r) => Number(r[1]));
+  let nonMono = 0;
+  for (let i = 1; i < dts.length; i++) if (Number.isFinite(dts[i]) && Number.isFinite(dts[i - 1]) && dts[i] < dts[i - 1]) nonMono++;
+  const gaps = pts.slice(1).map((p, i) => p - pts[i]);
+  const mean = gaps.length ? gaps.reduce((a, b) => a + b, 0) / gaps.length : 0;
+  const sd = gaps.length ? Math.sqrt(gaps.reduce((a, g) => a + (g - mean) ** 2, 0) / gaps.length) : 0;
+  return {
+    videoStartS: Math.round(videoStartS * 1000) / 1000,
+    audioStartS: audioStartS === null ? null : Math.round(audioStartS * 1000) / 1000,
+    declaredFps: Math.round(declaredFps * 100) / 100,
+    packets: rows.length,
+    nonMonotonicDts: nonMono,
+    maxFrameGapS: Math.round((gaps.length ? Math.max(...gaps) : 0) * 1000) / 1000,
+    frameIntervalJitterMs: Math.round(sd * 10000) / 10,
+  };
+}
+
+/**
+ * Detail retained when a W×H gray frame is scaled down by k (box average) and back up (bilinear), per tile.
+ * Returns the MEDIAN tile PSNR, so small sharp overlays (burned-in captions, progress bars) do not hide an upscaled
+ * picture: they occupy a few tiles, the picture occupies most of them.
+ */
+export function tileRoundTripPsnr(frame: Uint8Array, W: number, H: number, k: number, tiles = 8): number[] {
+  const w = Math.floor(W / k);
+  const h = Math.floor(H / k);
+  if (w < 2 || h < 2) return [];
+  const small = new Float32Array(w * h);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      let s = 0;
+      for (let dy = 0; dy < k; dy++) for (let dx = 0; dx < k; dx++) s += frame[(y * k + dy) * W + x * k + dx];
+      small[y * w + x] = s / (k * k);
+    }
+  }
+  const tw = Math.floor(W / tiles);
+  const th = Math.floor(H / tiles);
+  const mse = new Float64Array(tiles * tiles);
+  for (let y = 0; y < th * tiles; y++) {
+    const sy = Math.min(h - 1.001, Math.max(0, (y + 0.5) / k - 0.5));
+    const y0 = Math.floor(sy);
+    const fy = sy - y0;
+    for (let x = 0; x < tw * tiles; x++) {
+      const sx = Math.min(w - 1.001, Math.max(0, (x + 0.5) / k - 0.5));
+      const x0 = Math.floor(sx);
+      const fx = sx - x0;
+      const a = small[y0 * w + x0];
+      const b = small[y0 * w + x0 + 1];
+      const c = small[(y0 + 1) * w + x0];
+      const d = small[(y0 + 1) * w + x0 + 1];
+      const v = (a * (1 - fx) + b * fx) * (1 - fy) + (c * (1 - fx) + d * fx) * fy;
+      const e = frame[y * W + x] - v;
+      mse[Math.floor(y / th) * tiles + Math.floor(x / tw)] += e * e;
+    }
+  }
+  return Array.from(mse, (m) => {
+    const mm = m / (tw * th);
+    return mm <= 1e-6 ? 99 : 10 * Math.log10((255 * 255) / mm);
+  });
+}
+
+/** Largest factor whose round trip keeps the picture (median tile PSNR >= 43 dB) = how much the frame was upscaled. */
+export function effectiveDetail(frames: Uint8Array[], W: number, H: number) {
+  const factors = [2, 3, 4];
+  const psnrByFactor: Record<string, number> = {};
+  // Only tiles with real structure are judged: a tile that survives even a 16x round trip is flat (sky, gradient,
+  // plain background) and says nothing about resolution.
+  const coarse = frames.map((f) => tileRoundTripPsnr(f, W, H, 16));
+  const informative = coarse.map((tilesP) => tilesP.map((p) => p < 38));
+  const informativeShare = informative.flat().filter(Boolean).length / Math.max(1, informative.flat().length);
+  if (informativeShare < 0.2) return null; // too smooth to judge
+  for (const k of factors) {
+    const vals = frames.flatMap((f, i) => tileRoundTripPsnr(f, W, H, k).filter((_, t) => informative[i][t])).sort((a, b) => a - b);
+    psnrByFactor[String(k)] = Math.round((vals[Math.floor(vals.length / 2)] ?? 0) * 10) / 10;
+  }
+  let effectiveFactor = 1;
+  // 43 dB: genuinely detailed frames measured ≤ 40.8 dB even at k=2; stretched images ≥ 43.9 dB at their factor.
+  for (const k of factors) if (psnrByFactor[String(k)] >= 43) effectiveFactor = k;
+  return { psnrByFactor, effectiveFactor, effectiveWidth: Math.round(W / effectiveFactor), effectiveHeight: Math.round(H / effectiveFactor), frames: frames.length };
+}
+
+async function measureDetail(ffmpeg: string, file: string, W: number, H: number, durationS: number, timeoutMs: number) {
+  const every = Math.max(1, durationS / 8); // ~8 frames per reel, full resolution, gray
+  const { stdout } = await run(ffmpeg, ['-hide_banner', '-nostdin', '-v', 'error', '-i', file, '-an', '-vf', `fps=1/${every.toFixed(3)},format=gray`, '-frames:v', '10', '-f', 'rawvideo', '-'], timeoutMs);
+  const size = W * H;
+  const frames: Uint8Array[] = [];
+  for (let o = 0; o + size <= stdout.length; o += size) frames.push(new Uint8Array(stdout.buffer, stdout.byteOffset + o, size));
+  return frames.length ? effectiveDetail(frames, W, H) : null;
+}
+
 export async function probeMedia(
   file: string,
   opts: { ffprobe?: string; ffmpeg?: string; timeoutMs?: number } = {},
@@ -149,6 +302,10 @@ export async function probeMedia(
       clippedSamples: null,
       silenceSegments: [],
       frameHashes: [],
+      audioSignal: null,
+      detail: null,
+      stability: null,
+      timing: null,
     },
   };
 
@@ -177,8 +334,44 @@ export async function probeMedia(
         }),
     );
   }
+  if (vs) {
+    const W = Number(vs.width) || 0;
+    const H = Number(vs.height) || 0;
+    jobs.push(
+      run(ffmpeg, ['-hide_banner', '-nostdin', '-v', 'error', '-i', file, '-an', '-vf', `fps=2,scale=${STAB_W}:${STAB_H}:flags=area,format=gray`, '-f', 'rawvideo', '-'], timeoutMs)
+        .then(({ stdout }) => {
+          facts.analysis.stability = visualStates(stdout, 0.5);
+        }),
+      run(ffprobe, ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'packet=pts_time,dts_time', '-of', 'csv=p=0', file], timeoutMs)
+        .then(({ stdout }) => {
+          facts.analysis.timing = packetTiming(stdout.toString('utf8'), Number(vs.start_time) || 0, as ? Number(as.start_time) || 0 : null, rate(vs.r_frame_rate));
+        }),
+    );
+    if (W >= 64 && H >= 64) jobs.push(measureDetail(ffmpeg, file, W, H, durationS, timeoutMs).then((d) => { facts.analysis.detail = d; }));
+  }
   if (as) {
     jobs.push(
+      // Decoded signal in the voice band (200-3800 Hz), 16 kHz mono: digital silence, activity and speech-likeness.
+      run(ffmpeg, ['-hide_banner', '-nostdin', '-v', 'error', '-i', file, '-vn', '-ac', '1', '-ar', '16000', '-af', 'highpass=f=200,lowpass=f=3800', '-f', 's16le', '-'], timeoutMs)
+        .then(({ stdout }) => {
+          const samples = s16leToFloat(stdout);
+          // Peak/RMS on the full band would differ slightly; zero samples are zero in every band, which is what matters.
+          let peak = 0;
+          for (let i = 0; i < samples.length; i++) peak = Math.max(peak, Math.abs(samples[i]));
+          const sp = analyzeSpeech(samples, 16000);
+          const fin = (x: number) => (Number.isFinite(x) ? Math.round(x * 10) / 10 : null);
+          facts.analysis.audioSignal = {
+            peakDb: fin(sp.peakDb),
+            rmsDb: fin(sp.rmsDb),
+            digitalSilence: peak < 1 / 32768 * 2, // every sample within ±1 LSB of zero
+            activeSpans: sp.activeSpans,
+            activeRatio: Math.round(sp.activeRatio * 1000) / 1000,
+            speechSpans: sp.speechSpans,
+            speechRatio: Math.round(sp.speechRatio * 1000) / 1000,
+            modulationIndex: Math.round(sp.modulationIndex * 1000) / 1000,
+            method: 'voice-band energy + 2-8 Hz syllabic modulation (heuristic, not speech recognition)',
+          };
+        }),
       run(ffmpeg, ['-hide_banner', '-nostdin', '-i', file, '-vn', '-af',
         'volumedetect,ebur128=peak=true,silencedetect=n=-45dB:d=0.6', '-f', 'null', '-'], timeoutMs)
         .then(({ stderr }) => {

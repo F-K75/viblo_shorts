@@ -36,10 +36,13 @@ import {
   type QualityResult,
   type RecordedExport,
   type TimelineKind,
+  type RepairAction,
+  type SpeechSource,
 } from '../utils/quality';
+import { QualityReportCard } from './QualityReportCard';
 import type { SourceFootage } from '../utils/useSourceFootage';
 import { getSafeThumbnail, getSafeVideoUrl, isPlaceholderImage } from '../utils/visualPlaceholders';
-import { drawCaptionChunk, drawMotionBackground, drawSourceFrame, captionMaxChars, captionLineCount } from '../utils/exportCanvas';
+import { drawCaptionChunk, drawMotionBackground, drawSourceFrame, captionMaxChars, captionLineCount, sampleSubject } from '../utils/exportCanvas';
 import { analyzeSubjectTrack, cropCenterAt, cropXAt, objectPositionPercent, type CropPath } from '../utils/smartCrop';
 
 function formatSecondsToTimestamp(sec: number): string {
@@ -82,6 +85,10 @@ interface ShortsPlayerProps {
   onChangeSourceFile?: (next: SourceFootage | null) => void;
   /** Set when the clip is cut from the user's own video file (no YouTube link): its file name. */
   localSourceName?: string;
+  /** How caption word times were obtained (reported to the quality check). */
+  wordTimingSource?: 'aligned' | 'transcript' | 'estimated';
+  /** Applies a quality recommendation that needs the editor state (voice, scenes, alignment). */
+  onQualityAction?: (action: RepairAction) => void;
 }
 
 export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
@@ -116,6 +123,8 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
   sourceFile: propSourceFile,
   onChangeSourceFile,
   localSourceName,
+  wordTimingSource = 'estimated',
+  onQualityAction,
 }) => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -511,7 +520,6 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
     wasPlayingRef.current = isPlaying;
   }, [activeBeat, isPlaying, currentTimestamp]);
 
-  // Video Export Handler using Canvas + MediaRecorder with mixed audio
   // ---- Post-export quality gate ----
   const [quality, setQuality] = useState<QualityReport | null>(null);
   const [qualityStage, setQualityStage] = useState<string | null>(null);
@@ -520,11 +528,29 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
   const [punchIn, setPunchIn] = useState(true);
   const punchInZoom = (beatIndex: number) =>
     punchIn && useSourceFile && visualMode === 'youtube-crop' && beats.length > 1 && beatIndex % 2 === 1 ? 1.12 : 1;
+  const sourceInputRef = useRef<HTMLInputElement>(null);
+
+  /**
+   * Who speaks in this reel, and can the recorder capture it? A clip's words are the speaker's: they are only in the
+   * export when the user's own file plays them. YouTube's embedded player and the browser's system voices play in
+   * the page but are NOT recordable — this is how reels were exported with an audio stream of pure zeros.
+   */
+  const speechPlan = (ttsEngines?: string[], ttsMissing = 0): { speechExpected: boolean; speechSource: SpeechSource; narrate: boolean } => {
+    const clipSpeech = isYouTubeSource && audioSourceMode === 'youtube';
+    const narrate = aiVoiceEnabled && !clipSpeech;
+    const sourceAudible = useSourceFile && audioMode === 'youtube' && !isYoutubeMuted;
+    if (clipSpeech) return { speechExpected: true, speechSource: sourceAudible ? 'source-file' : useSourceFile ? 'none' : 'youtube-embed', narrate: false };
+    if (narrate) {
+      const src: SpeechSource = !ttsEngines || ttsMissing > 0 || !ttsEngines.length ? 'browser-tts' : ttsEngines.includes('neural') ? 'neural-tts' : 'offline-tts';
+      return { speechExpected: true, speechSource: src, narrate: true };
+    }
+    return { speechExpected: false, speechSource: 'none', narrate: false };
+  };
 
   /** What the reel was supposed to contain, so the server can check captions, scenes and audio against it. */
-  const buildTimeline = (rec: RecordedExport, canvasW: number, canvasH: number) => {
-    const narrate = aiVoiceEnabled && !(isYouTubeSource && audioSourceMode === 'youtube');
+  const buildTimeline = (rec: RecordedExport | null, canvasW: number, canvasH: number, plan: ReturnType<typeof speechPlan>) => {
     const sourceAudible = useSourceFile && audioMode === 'youtube' && !isYoutubeMuted;
+    const words = captionChunks.flatMap((c) => c.words.map((w) => ({ start_s: w.start_s, end_s: w.end_s })));
     return {
       durationS: totalDuration,
       scriptText: beats.map((b) => b.text).join(' '),
@@ -533,25 +559,31 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
         start_s: b.start_s,
         end_s: b.end_s,
         visual_keywords: b.visual_keywords,
-        asset: rec.shownByBeat[i]?.asset,
-        kind: rec.shownByBeat[i]?.kind,
+        asset: rec ? rec.shownByBeat[i]?.asset : undefined,
+        kind: rec ? rec.shownByBeat[i]?.kind : useSourceFile ? 'source' : b.video_url ? 'broll' : undefined,
         role: (b as { role?: string }).role,
       })),
       captions: {
         enabled: captionStyle.showCaptions !== false,
         maxLines: 2,
+        wordTiming: wordTimingSource,
+        words,
+        box: rec?.captionBox,
+        subjectOverlap: rec?.subjectOverlap,
         chunks: captionChunks.map((c, i) => ({
           text: c.words.map((w) => w.word).join(' '),
           start_s: c.start_s,
           end_s: c.end_s,
           words: c.words.length,
-          lines: rec.linesByChunk.get(i),
+          lines: rec?.linesByChunk.get(i),
         })),
       },
       audio: {
-        required: musicEnabled || narrate || sourceAudible,
-        narration: narrate,
-        sourceSpeech: sourceAudible,
+        required: musicEnabled || plan.narrate || sourceAudible,
+        narration: plan.narrate,
+        sourceSpeech: plan.speechSource === 'source-file',
+        speechExpected: plan.speechExpected,
+        speechSource: plan.speechSource,
         music: musicEnabled,
         musicVolume: sourceAudible ? musicVolume * 0.3 : musicVolume,
       },
@@ -559,27 +591,38 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
     };
   };
 
-  /** Uploads the exported reel (only the reel, never source footage) and gets it conformed + evaluated. */
-  const verifyExport = async (rec: RecordedExport, canvasW: number, canvasH: number): Promise<{ result?: QualityResult; error?: string }> => {
+  /** Uploads the exported reel (only the reel, never source footage) and gets it conformed + evaluated (async job). */
+  const verifyExport = async (rec: RecordedExport, canvasW: number, canvasH: number, plan: ReturnType<typeof speechPlan>): Promise<{ result?: QualityResult; error?: string }> => {
     try {
       setQualityStage('Checking quality: uploading the export…');
       const up = await apiFetch('/api/quality/uploads', { method: 'POST', headers: { 'Content-Type': rec.mime.split(';')[0] }, body: rec.blob });
       if (!up.ok) return { error: await apiErrorMessage(up, 'The quality check is unavailable.') };
       const { uploadId } = await up.json();
-      setQualityStage('Checking quality: conforming to 1080×1920 H.264/AAC and measuring…');
+      setQualityStage('Checking quality: measuring sound, picture, captions and timing…');
       const ev = await apiFetch('/api/quality/evaluate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ uploadId, timeline: buildTimeline(rec, canvasW, canvasH) }),
+        body: JSON.stringify({ uploadId, async: true, timeline: buildTimeline(rec, canvasW, canvasH, plan) }),
       });
       if (!ev.ok) return { error: await apiErrorMessage(ev, 'The quality check failed.') };
-      return { result: await ev.json() };
+      const { jobId } = await ev.json();
+      // Poll the job: heavy measurement runs on the server without holding a request open.
+      for (let i = 0; i < 600; i++) {
+        await new Promise((r) => setTimeout(r, i < 5 ? 400 : 1000));
+        const st = await apiFetch(`/api/quality/jobs/${jobId}`);
+        if (!st.ok) return { error: await apiErrorMessage(st, 'The quality check failed.') };
+        const job = await st.json();
+        if (job.state === 'done') return { result: job.result };
+        if (job.state === 'error') return { error: job.error || 'The quality check failed.' };
+        setQualityStage(`Checking quality: ${String(job.stage || '').toLowerCase()}…`);
+      }
+      return { error: 'The quality check timed out.' };
     } catch (e: any) {
       return { error: e?.message || 'The quality check is unavailable.' };
     }
   };
 
-  /** Delivers the verified file under its measured spec; a REJECTED reel is not downloaded automatically. */
+  /** Delivers the verified file under its measured spec; a POOR reel is not downloaded automatically. */
   const deliverExport = async (rec: RecordedExport, report: { result?: QualityResult; error?: string }, attempts: string[]) => {
     const r = report.result;
     if (r?.downloadId) {
@@ -588,7 +631,7 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
         const file = await res.blob();
         const name = r.fileName || `forge_short_${r.evaluation.spec.label}_${Date.now()}.mp4`;
         const delivered = r.evaluation.status !== 'REJECTED';
-        setQuality({ verified: true, result: r, attempts, fileName: name, delivered });
+        setQuality({ phase: 'final', verified: true, result: r, attempts, fileName: name, delivered });
         setPendingDelivery(delivered ? null : { blob: file, name });
         if (delivered) downloadBlob(file, name);
         return;
@@ -598,11 +641,20 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
     const local = await measureBlob(rec.blob);
     const ext = rec.mime.includes('mp4') ? 'mp4' : 'webm';
     const name = `forge_short_${local ? `${local.width}x${local.height}` : 'unknown-size'}_unverified_${Date.now()}.${ext}`;
-    setQuality({ verified: false, result: r, error: report.error || 'Quality check unavailable.', attempts, fileName: name, local, delivered: true });
+    setQuality({ phase: 'final', verified: false, result: r, error: report.error || 'Quality check unavailable.', attempts, fileName: name, local, delivered: true });
     downloadBlob(rec.blob, name);
   };
 
-  const handleExportVideo = async () => {
+  /** Fetches every narration line up front (recordable voices only) so the plan knows what will really be heard. */
+  const prepareNarration = async (plan: ReturnType<typeof speechPlan>) => {
+    if (!plan.narrate) return plan;
+    setQualityStage('Preparing the voiceover…');
+    const lines = await audioManager.prefetchLines(beats.map((b) => b.text), voiceName);
+    const engines = [...new Set(lines.filter(Boolean).map((l) => l!.engine))];
+    return speechPlan(engines, lines.filter((l) => !l).length);
+  };
+
+  const handleExportVideo = async (opts: { force?: boolean } = {}) => {
     if (beats.length === 0 || isExporting) return;
     if (typeof MediaRecorder === 'undefined') {
       setExportError('Your browser does not support in-browser video recording. Please use a recent Chrome, Edge or Firefox.');
@@ -612,21 +664,44 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
     setExportProgress(0);
     setExportError(null);
     setQuality(null);
+    setPendingDelivery(null);
     const canvasW = exportResolution === '720p' ? 720 : 1080;
     const canvasH = exportResolution === '720p' ? 1280 : 1920;
 
     try {
-      // Record → verify on the server (conform + evaluate) → at most MAX_REMEDIATION re-records when the recording
-      // itself is broken (wrong size, cut short, silent) → deliver the verified file under its MEASURED spec.
+      const plan = await prepareNarration(speechPlan());
+      // 1. Pre-render check: a reel whose voice cannot be recorded (or is missing scenes/captions) is stopped HERE,
+      //    before a real-time recording, with the fix — not after, as a silent file.
+      if (!opts.force) {
+        setQualityStage('Checking the plan before recording…');
+        try {
+          const pre = await apiFetch('/api/quality/precheck', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ timeline: buildTimeline(null, canvasW, canvasH, plan) }),
+          });
+          if (pre.ok) {
+            const { evaluation } = await pre.json();
+            if (evaluation?.criticalDefects?.length) {
+              setQuality({ phase: 'precheck', verified: true, result: { evaluation, before: evaluation, remediation: [], downloadId: null }, attempts: [], fileName: '', delivered: false });
+              return;
+            }
+          }
+        } catch {
+          // precheck unavailable: the post-export check still runs
+        }
+      }
+      // 2. Record → verify on the server (conform + evaluate) → at most MAX_REMEDIATION re-records when the recording
+      //    itself is broken (wrong size, cut short, silent despite a recordable source) → deliver the verified file.
       const attempts: string[] = [];
-      let rec = await recordOnce(canvasW, canvasH, MIME_ORDERS[0]);
+      let rec = await recordOnce(canvasW, canvasH, MIME_ORDERS[0], plan);
       attempts.push(rec.mime);
-      let report = await verifyExport(rec, canvasW, canvasH);
+      let report = await verifyExport(rec, canvasW, canvasH, plan);
       for (let i = 1; i <= MAX_REMEDIATION && report.result && needsReRecord(report.result.evaluation); i++) {
         setQualityStage(`Re-recording (attempt ${i + 1}): ${report.result.evaluation.criticalDefects.map((c) => c.message).join(' ')}`);
-        rec = await recordOnce(canvasW, canvasH, MIME_ORDERS[Math.min(i, MIME_ORDERS.length - 1)]);
+        rec = await recordOnce(canvasW, canvasH, MIME_ORDERS[Math.min(i, MIME_ORDERS.length - 1)], plan);
         attempts.push(rec.mime);
-        report = await verifyExport(rec, canvasW, canvasH);
+        report = await verifyExport(rec, canvasW, canvasH, plan);
       }
       await deliverExport(rec, report, attempts);
     } catch (err: any) {
@@ -642,8 +717,20 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
     }
   };
 
+  /** Applies a recommendation the editor can perform; returns false when it needs the parent (App). */
+  const handleQualityAction = (action: RepairAction) => {
+    if (action === 'attach_source') {
+      sourceInputRef.current?.click();
+      return;
+    }
+    if (action === 'regroup_captions') onUpdateCaptionStyle?.({ grouping: 'phrase' });
+    else if (action === 'reposition_captions') onUpdateCaptionStyle?.({ positionY: 62 });
+    else onQualityAction?.(action);
+    setQuality(null);
+  };
+
   /** One real-time recording of the timeline. Returns the file plus the evidence the quality check needs. */
-  const recordOnce = async (canvasW: number, canvasH: number, mimeOrder: string[]): Promise<RecordedExport> => {
+  const recordOnce = async (canvasW: number, canvasH: number, mimeOrder: string[], plan: ReturnType<typeof speechPlan>): Promise<RecordedExport> => {
     const canvas = document.createElement('canvas');
     canvas.width = canvasW;
     canvas.height = canvasH;
@@ -683,7 +770,7 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
         if (sourceAudible && audioRunning) disconnectSource = audioManager.connectElementToExport(sourceVideo);
       }
       if (musicEnabled) {
-        audioManager.startBackgroundMusic(sourceAudible ? musicVolume * 0.3 : musicVolume, musicMood);
+        audioManager.startBackgroundMusic(sourceAudible || plan.narrate ? musicVolume * 0.3 : musicVolume, musicMood);
       }
       // Only attach an audio track when the audio graph is running; a dead track stalls the muxer.
       const audioTrack = audioRunning ? audioManager.getExportAudioStream() : null;
@@ -712,8 +799,6 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
           resolve(new Blob(chunks, { type: supportedMime }));
         };
       });
-
-      recorder.start(1000); // timeslice: stream chunks out instead of buffering the whole video in the encoder
 
       const videoElements: HTMLVideoElement[] = beats.map((b) => {
         const v = document.createElement('video');
@@ -749,6 +834,16 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
       ]);
 
       videoElements.forEach((v) => v.play().catch(() => {}));
+
+      // Narration is scheduled on the AUDIO clock before recording starts (every line already fetched): each line
+      // starts exactly at its beat, nothing is fetched mid-recording, and no line is cut off by the next.
+      const actx = audioManager.initContext();
+      const narration = plan.narrate && audioRunning ? await audioManager.scheduleNarration(beats.map((b) => ({ text: b.text, start_s: b.start_s })), voiceName) : null;
+      if (narration && actx) {
+        while (actx.currentTime < narration.t0 - 0.01) await new Promise((r) => setTimeout(r, 5));
+      }
+      const stopMeter = audioTrack ? audioManager.startExportMeter() : null;
+      recorder.start(1000); // timeslice: stream chunks out instead of buffering the whole video in the encoder
       if (sourceVideo) await sourceVideo.play().catch(() => {});
 
       // MediaRecorder captures in WALL-CLOCK time, so frames must be drawn in real time.
@@ -756,9 +851,14 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
       const fps = 30;
       const frameMs = 1000 / fps;
       const startWall = performance.now();
-      const narrate = aiVoiceEnabled && !(isYouTubeSource && audioSourceMode === 'youtube');
-      let lastSpokenBeat = -1;
       let frame = 0;
+      // Captions vs. subject: sampled once a second (before captions are drawn) on scenes with footage.
+      const captionBox = { top: 1, bottom: 0, left: 1, right: 0 };
+      const layout = { top: 0, bottom: 0, left: 0, right: 0 };
+      const beatCaptionY = new Map<number, number>();
+      let captionTicks = 0;
+      let coveredTicks = 0;
+      let lastSubjectSample = -1;
 
       while (true) {
         const t = (performance.now() - startWall) / 1000;
@@ -770,11 +870,6 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
         const currentV = videoElements[activeIdx];
         const currentImg = imageElements[activeIdx];
         const currentBeat = beats[activeIdx];
-        if (narrate && bIndex !== -1 && bIndex !== lastSpokenBeat) {
-          lastSpokenBeat = bIndex;
-          // Neural TTS audio is routed into the export stream by audioManager.
-          void audioManager.speakNeuralOrFallback(currentBeat.text, voiceName);
-        }
 
         ctx.fillStyle = '#0a0a0a';
         ctx.fillRect(0, 0, canvasW, canvasH);
@@ -855,9 +950,44 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
 
         const chunk = captionChunks.find((c) => t >= c.start_s && t <= c.end_s);
         if (captionStyle.showCaptions !== false && chunk) {
-          const lines = drawCaptionChunk(ctx, { words: chunk.words, t, style: captionStyle, w: canvasW, h: canvasH });
+          // Keep captions off the subject: on footage scenes, sample the picture (before captions) once a second and,
+          // at the first sample of a scene, choose the caption height that covers the least of the subject.
+          let subject: ReturnType<typeof sampleSubject> | null = null;
+          const kind = shownByBeat[activeIdx]?.kind;
+          if (kind !== 'motion' && Math.floor(t) !== lastSubjectSample) {
+            lastSubjectSample = Math.floor(t);
+            try {
+              subject = sampleSubject(canvas);
+            } catch {
+              subject = null; // tainted canvas (cross-origin media without CORS): cannot read pixels
+            }
+          }
+          const boxH = Math.max(0.04, layout.bottom - layout.top) || 0.1;
+          if (subject && !beatCaptionY.has(activeIdx)) {
+            const candidates = [captionStyle.positionY, 72, 62, 30];
+            let best = captionStyle.positionY;
+            let bestShare = Infinity;
+            for (const y of candidates) {
+              const share = subject.skinShare >= 0.01 ? subject.inBand(y / 100 - boxH / 2, y / 100 + boxH / 2) : 0;
+              if (share < bestShare - 0.05) {
+                bestShare = share;
+                best = y;
+              }
+            }
+            beatCaptionY.set(activeIdx, best);
+          }
+          const y = beatCaptionY.get(activeIdx) ?? captionStyle.positionY;
+          const lines = drawCaptionChunk(ctx, { words: chunk.words, t, style: y === captionStyle.positionY ? captionStyle : { ...captionStyle, positionY: y }, w: canvasW, h: canvasH, layout });
           const ci = captionChunks.indexOf(chunk);
           linesByChunk.set(ci, Math.max(linesByChunk.get(ci) || 0, lines));
+          captionBox.top = Math.min(captionBox.top, layout.top);
+          captionBox.bottom = Math.max(captionBox.bottom, layout.bottom);
+          captionBox.left = Math.min(captionBox.left, layout.left);
+          captionBox.right = Math.max(captionBox.right, layout.right);
+          if (subject) {
+            captionTicks++;
+            if (subject.skinShare >= 0.01 && subject.inBand(layout.top, layout.bottom) >= 0.25) coveredTicks++;
+          }
         }
 
         videoTrack.requestFrame?.();
@@ -867,6 +997,8 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
       }
 
       recorder.stop();
+      narration?.stop();
+      const meter = stopMeter?.() ?? undefined;
       audioManager.stopSpeech();
       videoElements.forEach((v) => v.pause());
       if (sourceVideo) {
@@ -877,7 +1009,16 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
       }
 
       const blob = await exportPromise;
-      return { blob, mime: supportedMime, linesByChunk, shownByBeat };
+      return {
+        blob,
+        mime: supportedMime,
+        linesByChunk,
+        shownByBeat,
+        captionBox: captionBox.bottom > captionBox.top ? captionBox : undefined,
+        subjectOverlap: captionTicks ? coveredTicks / captionTicks : undefined,
+        meter,
+        narrationMissing: narration?.missing,
+      };
     }
   };
 
@@ -1277,6 +1418,7 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
                   accept="video/*"
                   className="sr-only"
                   aria-label="Source video file"
+                  ref={sourceInputRef}
                   onChange={(e) => handlePickSourceFile(e.target.files?.[0])}
                 />
               </label>
@@ -1486,7 +1628,7 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
             </div>
           )}
           <button
-            onClick={handleExportVideo}
+            onClick={() => void handleExportVideo()}
             disabled={isExporting || beats.length === 0}
             className="w-full py-3 px-4 bg-rose-600 hover:bg-rose-500 text-white font-semibold text-xs rounded-xl shadow-lg shadow-rose-950/40 transition flex items-center justify-center gap-2 disabled:opacity-50"
           >
@@ -1507,90 +1649,18 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
               {qualityStage}
             </p>
           )}
-          {quality && <QualityReportCard report={quality} onDownloadAnyway={pendingDelivery ? () => downloadBlob(pendingDelivery.blob, pendingDelivery.name) : undefined} />}
+          {quality && (
+            <QualityReportCard
+              report={quality}
+              busy={isExporting}
+              onAction={handleQualityAction}
+              onRecheck={() => void handleExportVideo()}
+              onExportAnyway={quality.phase === 'precheck' ? () => void handleExportVideo({ force: true }) : undefined}
+              onDownloadAnyway={pendingDelivery ? () => downloadBlob(pendingDelivery.blob, pendingDelivery.name) : undefined}
+            />
+          )}
         </div>
       </div>
     </div>
   );
 };
-
-const STATUS_STYLE: Record<string, string> = {
-  PASS: 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30',
-  NEEDS_IMPROVEMENT: 'bg-amber-500/15 text-amber-200 border-amber-500/30',
-  REJECTED: 'bg-rose-500/15 text-rose-200 border-rose-500/30',
-};
-const STATUS_TEXT: Record<string, string> = { PASS: 'Pass', NEEDS_IMPROVEMENT: 'Needs improvement', REJECTED: 'Rejected' };
-
-/** Quality report for the last export: status, score, dimensions, problems, what was fixed, and the measured spec. */
-const QualityReportCard: React.FC<{ report: QualityReport; onDownloadAnyway?: () => void }> = ({ report, onDownloadAnyway }) => {
-  const e = report.result?.evaluation;
-  const a = e?.spec.actual;
-  const status = report.verified && e ? e.status : 'UNVERIFIED';
-  return (
-    <div data-testid="quality-report" className="rounded-xl border border-white/10 bg-black/30 p-3 text-[11px] text-neutral-300 space-y-2">
-      <div className="flex items-center justify-between gap-2">
-        <span className="font-semibold text-white text-xs">Quality check</span>
-        <span className={`px-2 py-0.5 rounded-md border font-semibold ${STATUS_STYLE[status] || 'bg-white/5 text-neutral-300 border-white/10'}`} data-testid="quality-status">
-          {STATUS_TEXT[status] || 'Not verified'}
-          {e && report.verified ? ` · ${Math.round(e.score)}/100` : ''}
-        </span>
-      </div>
-      {a ? (
-        <p data-testid="quality-spec">
-          Delivered: <span className="font-mono text-white">{a.width}×{a.height}</span> · {a.fps} fps · {a.videoCodec.toUpperCase()} · {a.pixFmt} ·{' '}
-          {a.audioCodec ? a.audioCodec.toUpperCase() : 'no audio'}
-          {a.faststart ? ' · fast start' : ''} · {(a.sizeBytes / 1048576).toFixed(1)} MB
-          {e && !e.spec.meetsSpec && (
-            <span className="block text-rose-300">
-              Requested {e.spec.requested.width}×{e.spec.requested.height}; the file does not meet the export spec.
-            </span>
-          )}
-        </p>
-      ) : (
-        <p>
-          {report.error}
-          {report.local ? ` Measured in the browser: ${report.local.width}×${report.local.height}.` : ''} Saved as <span className="font-mono">{report.fileName}</span>.
-        </p>
-      )}
-      {e && report.verified && (
-        <>
-          <div className="grid grid-cols-1 gap-1">
-            {e.dimensions.map((d) => {
-              const measured = d.checks.some((c) => c.measured !== false);
-              return (
-                <div key={d.key} className="flex items-center gap-2">
-                  <span className="w-36 shrink-0 truncate">{d.label}</span>
-                  <div className="flex-1 h-1.5 rounded bg-white/10 overflow-hidden">
-                    {measured && <div className={`h-full ${d.score >= 0.85 ? 'bg-emerald-400' : d.score >= 0.6 ? 'bg-amber-400' : 'bg-rose-400'}`} style={{ width: `${Math.round(d.score * 100)}%` }} />}
-                  </div>
-                  <span className="w-12 text-right font-mono tabular-nums">{measured ? `${d.points}/${d.weight}` : 'n/a'}</span>
-                </div>
-              );
-            })}
-          </div>
-          {e.problems.length > 0 && (
-            <ul className="space-y-0.5" data-testid="quality-problems">
-              {e.problems.slice(0, 6).map((p) => (
-                <li key={p.id} className={p.severity === 'critical' ? 'text-rose-300' : p.severity === 'major' ? 'text-amber-200' : 'text-neutral-400'}>
-                  <span className="uppercase text-[9px] font-bold mr-1">{p.severity}</span>
-                  {p.message}
-                  {p.suggestion && <span className="text-neutral-500"> {p.suggestion}</span>}
-                </li>
-              ))}
-            </ul>
-          )}
-          <p className="text-neutral-500" data-testid="quality-remediation">
-            {report.attempts.length > 1 ? `Re-recorded automatically (${report.attempts.length} attempts). ` : 'Recorded once. '}
-            {(report.result?.remediation || []).map((r) => (r.ok ? r.detail : `${r.action} failed: ${r.detail}`)).join(' ')}
-          </p>
-          {onDownloadAnyway && (
-            <button type="button" onClick={onDownloadAnyway} className="w-full py-1.5 rounded-lg border border-white/15 text-neutral-200 hover:bg-white/5">
-              Download anyway (not recommended)
-            </button>
-          )}
-        </>
-      )}
-    </div>
-  );
-};
-

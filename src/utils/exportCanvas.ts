@@ -1,3 +1,4 @@
+import { isSkin } from './smartCrop';
 import type { CaptionStyle, WordTiming } from '../types';
 import { TOPICS, getTopic } from './visualPlaceholders';
 
@@ -17,6 +18,30 @@ const easeOut = (x: number) => 1 - Math.pow(1 - Math.min(1, Math.max(0, x)), 3);
  * or blocked media). Drifting colour orbs in the beat's topic palette, a floating topic icon that pops in on every cut,
  * and story-style progress segments.
  */
+const HEADLINE_STOP = new Set(
+  'the a an and or but so of to in on at for with is are was be it this that you your i we they my our me us do does did not no if as just than then there their them its by from into can will would should could have has had more most very really about what why how when which who because get got make made keep put take also even still here during while after before until through'.split(' '),
+);
+
+/**
+ * The scene's key idea for an offline (no-footage) scene: a number with its unit first ("65°F", "20 MINUTES", "8 HOURS"),
+ * else the two most informative words of the line. Pure; shown as the scene's headline so each scene says something
+ * different instead of repeating one abstract background.
+ */
+export function sceneHeadline(text?: string): string {
+  const t = (text || '').replace(/[“”"]/g, '');
+  const num = t.match(/(\d+(?:[.,]\d+)?\s*(?:%|°\s?[fc]?|degrees?(?:\s+fahrenheit|\s+celsius)?|minutes?|hours?|seconds?|days?|weeks?|times?|x\b|percent)?)/i);
+  if (num && num[1].trim().length > 0) return num[1].trim().replace(/\s*degrees?\s*fahrenheit/i, '°F').replace(/\s*degrees?\s*celsius/i, '°C').replace(/\s+°/, '°').toUpperCase();
+  // First run of consecutive informative words (a phrase, not words picked out of order): "TO-DO LIST", "LAZY".
+  const runs: string[][] = [[]];
+  for (const raw of t.split(/\s+/)) {
+    const w = raw.replace(/[^A-Za-z'-]/g, '');
+    if (w.length > 2 && !HEADLINE_STOP.has(w.toLowerCase())) runs[runs.length - 1].push(w);
+    else if (runs[runs.length - 1].length) runs.push([]);
+  }
+  const phrase = runs.find((r) => r.length >= 2) || runs.filter((r) => r.length).sort((a, b) => b[0].length - a[0].length)[0] || [];
+  return phrase.slice(0, 2).join(' ').toUpperCase();
+}
+
 export function drawMotionBackground(
   ctx: CanvasRenderingContext2D,
   opts: { t: number; beatIndex: number; beatCount: number; beatProgress: number; beatElapsed: number; text?: string; keywords?: string; w: number; h: number },
@@ -25,9 +50,12 @@ export function drawMotionBackground(
   // The beat's own words pick the icon (varies per beat); the visual keywords are the fallback.
   const byText = getTopic(text);
   const topic = TOPICS[byText !== 'default' ? byText : getTopic(keywords)];
-  const hue = (topic.hue + beatIndex * 28) % 360;
+  // Golden-angle hue steps and a per-scene layout: consecutive scenes look clearly different (they used to differ by a
+  // 28° hue shift only, which measured as ONE unchanging picture for a whole reel).
+  const hue = (topic.hue + beatIndex * 137.5) % 360;
+  const layout = beatIndex % 3;
 
-  const base = ctx.createLinearGradient(0, 0, w * 0.4, h);
+  const base = layout === 1 ? ctx.createLinearGradient(w, 0, 0, h) : layout === 2 ? ctx.createRadialGradient(w / 2, h * 0.3, 0, w / 2, h * 0.3, h * 0.8) : ctx.createLinearGradient(0, 0, w * 0.4, h);
   base.addColorStop(0, `hsl(${hue}, 55%, 9%)`);
   base.addColorStop(1, `hsl(${(hue + 40) % 360}, 60%, 18%)`);
   ctx.fillStyle = base;
@@ -70,22 +98,43 @@ export function drawMotionBackground(
   // Topic icon: pops in on each cut, then floats
   const pop = easeOut(beatElapsed / 0.35);
   const scale = (0.6 + 0.4 * pop) * (1 + beatProgress * 0.06);
-  const iconY = h * 0.36 + Math.sin(t * 1.6) * h * 0.008;
-  const ringR = w * 0.2 * scale;
+  const iconX = layout === 1 ? w * 0.27 : layout === 2 ? w * 0.73 : w / 2;
+  const iconY = (layout === 0 ? h * 0.2 : h * 0.17) + Math.sin(t * 1.6) * h * 0.008;
+  const ringR = w * 0.16 * scale;
   ctx.save();
   ctx.globalAlpha = pop;
-  const ring = ctx.createRadialGradient(w / 2, iconY, ringR * 0.2, w / 2, iconY, ringR * 1.4);
+  const ring = ctx.createRadialGradient(iconX, iconY, ringR * 0.2, iconX, iconY, ringR * 1.4);
   ring.addColorStop(0, 'rgba(255,255,255,0.22)');
   ring.addColorStop(1, 'rgba(255,255,255,0)');
   ctx.fillStyle = ring;
   ctx.beginPath();
-  ctx.arc(w / 2, iconY, ringR * 1.4, 0, Math.PI * 2);
+  ctx.arc(iconX, iconY, ringR * 1.4, 0, Math.PI * 2);
   ctx.fill();
-  ctx.font = `${Math.round(w * 0.2 * scale)}px "Noto Color Emoji", "Apple Color Emoji", "Segoe UI Emoji", sans-serif`;
+  ctx.font = `${Math.round(w * 0.16 * scale)}px "Noto Color Emoji", "Apple Color Emoji", "Segoe UI Emoji", sans-serif`;
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
-  ctx.fillText(topic.icon, w / 2, iconY);
+  ctx.fillText(topic.icon, iconX, iconY);
   ctx.restore();
+
+  // The scene's own key idea as a headline (numbers first), slides in on each cut. Kept above the caption area.
+  const headline = sceneHeadline(text);
+  if (headline) {
+    ctx.save();
+    ctx.globalAlpha = pop;
+    const size = Math.round(w * (headline.length <= 6 ? 0.2 : headline.length <= 12 ? 0.12 : 0.085));
+    ctx.font = `900 ${size}px 'Montserrat', 'Poppins', sans-serif`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    const hy = h * 0.36 + (1 - pop) * h * 0.03;
+    const tw = Math.min(ctx.measureText(headline).width, w * 0.86);
+    ctx.fillStyle = `hsla(${(hue + 180) % 360}, 90%, 60%, 0.9)`;
+    ctx.beginPath();
+    ctx.roundRect(w / 2 - tw / 2 - w * 0.04, hy - size * 0.7, tw + w * 0.08, size * 1.4, size * 0.25);
+    ctx.fill();
+    ctx.fillStyle = '#0b0b0f';
+    ctx.fillText(headline, w / 2, hy, w * 0.86);
+    ctx.restore();
+  }
 
   // Story-style progress segments (inside the top safe zone)
   if (beatCount > 1) {
@@ -116,6 +165,52 @@ export function drawMotionBackground(
   vig.addColorStop(1, 'rgba(0,0,0,0.55)');
   ctx.fillStyle = vig;
   ctx.fillRect(0, 0, w, h);
+}
+
+export interface CaptionBox {
+  top: number;
+  bottom: number;
+  left: number;
+  right: number;
+}
+
+const SUBJECT_W = 27;
+const SUBJECT_H = 48;
+let subjectCanvas: HTMLCanvasElement | null = null;
+
+/**
+ * Where is the subject (skin-tone pixels: faces, hands) in the frame just drawn, BEFORE captions are drawn on top?
+ * Reads a 27x48 copy (cheap enough to run once a second during a real-time export). Returns the share of the frame that
+ * is skin and a function giving the share of that skin inside a vertical band (e.g. a caption box).
+ */
+export function sampleSubject(source: CanvasImageSource): { skinShare: number; inBand: (top: number, bottom: number) => number } {
+  subjectCanvas ??= document.createElement('canvas');
+  subjectCanvas.width = SUBJECT_W;
+  subjectCanvas.height = SUBJECT_H;
+  const c = subjectCanvas.getContext('2d', { willReadFrequently: true });
+  if (!c) return { skinShare: 0, inBand: () => 0 };
+  c.drawImage(source, 0, 0, SUBJECT_W, SUBJECT_H);
+  const { data } = c.getImageData(0, 0, SUBJECT_W, SUBJECT_H);
+  const rows = new Float32Array(SUBJECT_H);
+  let total = 0;
+  for (let y = 0; y < SUBJECT_H; y++) {
+    for (let x = 0; x < SUBJECT_W; x++) {
+      const i = (y * SUBJECT_W + x) * 4;
+      if (isSkin(data[i], data[i + 1], data[i + 2])) {
+        rows[y]++;
+        total++;
+      }
+    }
+  }
+  return {
+    skinShare: total / (SUBJECT_W * SUBJECT_H),
+    inBand: (top, bottom) => {
+      if (!total) return 0;
+      let n = 0;
+      for (let y = Math.max(0, Math.floor(top * SUBJECT_H)); y < Math.min(SUBJECT_H, Math.ceil(bottom * SUBJECT_H)); y++) n += rows[y];
+      return n / total;
+    },
+  };
 }
 
 /**
@@ -155,7 +250,7 @@ export function captionLineCount(ctx: CanvasRenderingContext2D, words: string[],
  */
 export function drawCaptionChunk(
   ctx: CanvasRenderingContext2D,
-  opts: { words: WordTiming[]; t: number; style: CaptionStyle; w: number; h: number },
+  opts: { words: WordTiming[]; t: number; style: CaptionStyle; w: number; h: number; layout?: CaptionBox },
 ) : number {
   const { words, t, style, w, h } = opts;
   const k = w / PREVIEW_WIDTH;
@@ -200,6 +295,13 @@ export function drawCaptionChunk(
   const boxW = Math.min(Math.max(...lineWidths), maxLineW) + padX * 2;
   const boxH = lineH * lines.length + padY * 2;
   const cy = h * (style.positionY / 100);
+  if (opts.layout) {
+    // Reported to the quality check (safe area) as fractions of the frame, before any rotation.
+    opts.layout.top = (cy - boxH / 2) / h;
+    opts.layout.bottom = (cy + boxH / 2) / h;
+    opts.layout.left = (w / 2 - boxW / 2) / w;
+    opts.layout.right = (w / 2 + boxW / 2) / w;
+  }
 
   ctx.translate(w / 2, cy);
   if (style.rotation) ctx.rotate((style.rotation * Math.PI) / 180);

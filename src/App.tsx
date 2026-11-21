@@ -44,6 +44,8 @@ import {
   shiftAllBeats,
 } from './utils/pipeline';
 import { audioManager } from './utils/audio';
+import { alignWordsToAudio } from './utils/alignment';
+import type { RepairAction } from './utils/quality';
 import { getSafeThumbnail } from './utils/visualPlaceholders';
 import { HomePage } from './components/HomePage';
 import { AuthPage, AuthUser } from './components/AuthPage';
@@ -537,32 +539,7 @@ export const App: React.FC = () => {
       setGenerationStep('Matching vertical footage to Gemini visual prompts...');
       const timedBeats = assignBeatTimings(scriptData.beats, words);
 
-      // Search per scene, then choose per scene WITHOUT repeating a clip another scene already uses (results[0] for
-      // every beat showed the same clip again whenever queries were similar or the fallback library answered).
-      const searchResults: Array<Array<{ url?: string; thumbnail?: string }>> = await Promise.all(
-        timedBeats.map(async (beat) => {
-          try {
-            const fRes = await apiFetch('/api/stock-footage', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ query: beat.visual_keywords }),
-            });
-            const fData = await fRes.json();
-            return Array.isArray(fData.results) ? fData.results : [];
-          } catch {
-            return [];
-          }
-        })
-      );
-      const picks = pickDistinctAssets(searchResults);
-      const finalBeats: Beat[] = timedBeats.map((beat, i) => {
-        const chosen = picks[i] >= 0 ? searchResults[i][picks[i]] : undefined;
-        return {
-          ...beat,
-          video_url: chosen?.url || '',
-          thumbnail: getSafeThumbnail(beat.visual_keywords, chosen?.thumbnail),
-        };
-      });
+      const finalBeats = await withSceneMedia(timedBeats);
 
       const newScript: ShortScript = {
         hook: scriptData.hook || finalBeats[0]?.text || '',
@@ -778,6 +755,42 @@ export const App: React.FC = () => {
     setAllWords(accurateWords);
     setTopic(currentInfo ? currentInfo.title : localVideo!.name);
     setCurrentTimestamp(0);
+
+    // A YouTube link alone gives us no footage (the embedded player cannot be recorded) — only one low-resolution
+    // thumbnail, which used to fill the whole reel. Give every scene its own footage matched to what is said; the
+    // creator's own copy of the video (when attached) still takes precedence over it in the export.
+    if (currentInfo) {
+      const withMedia = await withSceneMedia(finalBeats);
+      setScript((prev) =>
+        prev && prev.sourceYouTubeId === currentInfo.videoId
+          ? { ...prev, beats: prev.beats.map((b) => {
+              const m = withMedia.find((x) => x.id === b.id);
+              return m && !b.video_url ? { ...b, video_url: m.video_url } : b;
+            }) }
+          : prev,
+      );
+    }
+  };
+
+  /** Applies a quality-report recommendation that needs editor state (voice, scenes, alignment). */
+  const handleQualityAction = async (action: RepairAction) => {
+    if (!script) return;
+    if (action === 'regenerate_voiceover' || action === 'realign_captions') {
+      const isClip = Boolean(script.sourceYouTubeId || script.sourceLocalVideo);
+      if (isClip && script.audioSourceMode !== 'tts') {
+        // The speaker cannot be recorded: narrate the transcript instead (the creator can still attach the file).
+        scriptRef.current = { ...script, audioSourceMode: 'tts' };
+        setScript((prev) => (prev ? { ...prev, audioSourceMode: 'tts' } : prev));
+      }
+      setAiVoiceEnabled(true);
+      await syncBeatsToNarration(voiceName);
+      return;
+    }
+    if (action === 'replace_scenes' || action === 'retrieve_assets') {
+      const shown = new Set(script.beats.map((b) => b.video_url).filter(Boolean));
+      const beats = await withSceneMedia(script.beats.map((b) => ({ ...b, video_url: '' })), shown);
+      setScript((prev) => (prev ? { ...prev, beats: prev.beats.map((b) => ({ ...b, video_url: beats.find((x) => x.id === b.id)?.video_url || b.video_url })) } : prev));
+    }
   };
 
   const handleUpdateClipRange = (startSec: number, endSec: number) => {
@@ -829,6 +842,39 @@ export const App: React.FC = () => {
     }
   };
 
+  /**
+   * Scene-level media: search per scene by its own visual keywords, then choose per scene WITHOUT repeating a clip
+   * another scene already uses (results[0] for every beat showed the same clip whenever queries were similar).
+   * `exclude` skips media already shown (used when replacing static or repeated scenes).
+   */
+  const withSceneMedia = async (beats: Beat[], exclude: Set<string> = new Set()): Promise<Beat[]> => {
+    const searchResults: Array<Array<{ url?: string; thumbnail?: string }>> = await Promise.all(
+      beats.map(async (beat) => {
+        try {
+          const fRes = await apiFetch('/api/stock-footage', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ query: beat.visual_keywords || beat.text.split(/\s+/).slice(0, 6).join(' ') }),
+          });
+          const fData = await fRes.json();
+          const results = Array.isArray(fData.results) ? fData.results : [];
+          const fresh = results.filter((r: { url?: string }) => !r.url || !exclude.has(r.url));
+          return fresh.length ? fresh : results;
+        } catch {
+          return [];
+        }
+      })
+    );
+    const picks = pickDistinctAssets(searchResults);
+    return beats.map((beat, i) => {
+      const chosen = picks[i] >= 0 ? searchResults[i][picks[i]] : undefined;
+      return { ...beat, video_url: chosen?.url || beat.video_url || '', thumbnail: getSafeThumbnail(beat.visual_keywords, chosen?.thumbnail || beat.thumbnail) };
+    });
+  };
+
+  // Caption word timings aligned to the real voiceover (by reference: any edit that rebuilds the words resets it).
+  const alignedWordsRef = useRef<WordTiming[] | null>(null);
+
   const [isSyncingVoice, setIsSyncingVoice] = useState(false);
   /**
    * Times every beat (and its captions) to the real narration: lines are fetched once up front (cached, so playback and
@@ -836,17 +882,34 @@ export const App: React.FC = () => {
    * captions follow the voice. Only for scripted Shorts; clips keep the speaker's own timing.
    */
   const syncBeatsToNarration = async (voice: string) => {
-    if (!script?.beats?.length || script.sourceYouTubeId || script.sourceLocalVideo) return;
+    const script = scriptRef.current; // latest, including changes made earlier in the same event
+    const isClip = Boolean(script?.sourceYouTubeId || script?.sourceLocalVideo);
+    // Clips keep the speaker's own timing unless their audio is switched to narration.
+    if (!script?.beats?.length || (isClip && script.audioSourceMode !== 'tts')) return;
     setIsSyncingVoice(true);
     try {
-      const durations = await Promise.all(script.beats.map((b) => audioManager.prefetchTts(b.text, voice)));
-      if (durations.every((d) => d === null)) {
-        setAiNotice('AI voice is unavailable on this server, so beats keep their estimated timing.');
+      const lines = await audioManager.prefetchLines(script.beats.map((b) => b.text), voice);
+      if (lines.every((l) => l === null)) {
+        setAiNotice('No recordable voice is available on this server, so beats keep their estimated timing and the export check will block a silent reel.');
         return;
       }
-      const beats = retimeBeatsToNarration(script.beats, durations);
+      if (lines.some((l) => l?.engine === 'offline')) setAiNotice('AI voice is unavailable, so the basic offline voice is used for narration.');
+      const beats = retimeBeatsToNarration(script.beats, lines.map((l) => l?.seconds ?? null));
       setScript({ ...script, beats });
-      setAllWords(recalculateWordsFromBeats(beats));
+      // Word-level timing from the REAL audio: each line's words are placed on its measured speech, pauses and dips.
+      const words: WordTiming[] = [];
+      beats.forEach((b, i) => {
+        const tokens = b.text.trim().split(/\s+/).filter(Boolean);
+        const line = lines[i];
+        if (!line) {
+          words.push(...recalculateWordsFromBeats([b]));
+          return;
+        }
+        const al = alignWordsToAudio(line.samples, line.sampleRate, tokens);
+        al.words.forEach((w) => words.push({ word: w.word, start_s: +(b.start_s + w.start_s).toFixed(3), end_s: +(b.start_s + w.end_s).toFixed(3), beatId: b.id }));
+      });
+      alignedWordsRef.current = words;
+      setAllWords(words);
     } finally {
       setIsSyncingVoice(false);
     }
@@ -1355,6 +1418,10 @@ export const App: React.FC = () => {
             onChangeVisualMode={setVisualMode}
             sourceFile={sourceFile}
             onChangeSourceFile={(next) => setSourceFile(next)}
+            wordTimingSource={
+              alignedWordsRef.current === allWords ? 'aligned' : script.sourceYouTubeId || script.sourceLocalVideo ? 'transcript' : 'estimated'
+            }
+            onQualityAction={(a) => void handleQualityAction(a)}
           />
         )}
       </main>

@@ -1,5 +1,10 @@
 # Video Quality Audit & Remediation Plan
 
+> **Superseded in part by [REEL_QUALITY_ENGINE.md](REEL_QUALITY_ENGINE.md)**: the reference reel was later inspected
+> directly (it is 1080×1920 with digital-zero audio and a 4×-upscaled still); the engine was rebuilt around decoded
+> signal, effective detail and visual-state measurements, with a pre-render check and the Excellent/Good/Needs
+> improvement/Poor classification. Dimension names below are the previous ones.
+
 Scope: why exported reels can be low quality, and the controls that stop a defective reel from being delivered as a
 success. Status markers: **CONFIRMED** = proven from code and/or execution; **HYPOTHESIS** = consistent with the
 evidence but not proven.

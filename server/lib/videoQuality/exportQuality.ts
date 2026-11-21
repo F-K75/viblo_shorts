@@ -18,6 +18,12 @@ export function evaluateExport(media: MediaFacts | null, timeline: Timeline | nu
     checks.push(check('export', 'video_stream', false, 'critical', 'The file has no video stream.', { container: media.container }, 'Export again.'));
     return { checks, spec: { requested, actual: null, meetsSpec: false, label: 'no video' } };
   }
+  // Integrity: the container may claim a duration its data does not hold (a truncated recording keeps its header).
+  const expectedFrames = Math.round(media.durationS * (v.fps || spec.fps));
+  const decodable = expectedFrames ? v.frames / expectedFrames : 1;
+  checks.push(check('export', 'file_integrity', decodable >= 0.9, 'critical',
+    decodable >= 0.9 ? `${v.frames} of ~${expectedFrames} frames decode.` : `The file is damaged: only ${v.frames} of the ~${expectedFrames} frames its header promises can be decoded (${Math.round(decodable * 100)}%).`,
+    { decodedFrames: v.frames, expectedFrames, ratio: round(decodable, 3) }, 'The recording was cut off or corrupted: export again.'));
   const dimsOk = v.width === spec.width && v.height === spec.height;
   checks.push(check('export', 'dimensions', dimsOk, 'critical',
     dimsOk ? `Actual size ${v.width}x${v.height} matches the export setting.` : `Actual size is ${v.width}x${v.height}, not the requested ${spec.width}x${spec.height}.`,
@@ -29,7 +35,7 @@ export function evaluateExport(media: MediaFacts | null, timeline: Timeline | nu
   checks.push(check('export', 'pixel_format', v.pixFmt === th.spec.pixFmt, 'major', `Pixel format: ${v.pixFmt}.`, { pixFmt: v.pixFmt }, 'Re-encode to yuv420p for universal playback.'));
   const fpsOk = Math.abs(v.fps - spec.fps) <= th.spec.fpsTolerance;
   checks.push(check('export', 'frame_rate', fpsOk, 'major', `Frame rate: ${v.fps} fps (target ${spec.fps}).`, { fps: v.fps, frames: v.frames, target: spec.fps }, 'Conform to a constant frame rate.'));
-  if (timeline?.audio.required) {
+  if (timeline && (timeline.audio.required || timeline.audio.speechExpected)) {
     const a = media.audio;
     checks.push(check('export', 'audio_codec', Boolean(a && a.codec === th.spec.audioCodec), a ? 'major' : 'critical',
       a ? `Audio codec: ${a.codec}.` : 'No audio track although the reel needs audio.', { codec: a?.codec ?? null }, a ? 'Re-encode audio to AAC.' : 'Export again; check that music, voice or source audio is enabled.'));

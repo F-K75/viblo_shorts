@@ -41,7 +41,7 @@ const srv = await startTestServer({
   NODE_ENV: 'production', TRUST_PROXY: 'none', CAPTCHA_REQUIRED: 'false', STORAGE_BACKEND: 'json',
   ...(fromYouTube ? { YOUTUBE_DOWNLOAD_ENABLED: 'true' } : {}),
 });
-const browser = await chromium.launch({ args: ['--autoplay-policy=no-user-gesture-required'] });
+const browser = await chromium.launch({ ...(process.env.PW_CHROMIUM_PATH ? { executablePath: process.env.PW_CHROMIUM_PATH } : {}), args: ['--autoplay-policy=no-user-gesture-required'] });
 try {
   const page = await (await browser.newContext({ viewport: { width: 1366, height: 900 }, acceptDownloads: true })).newPage();
   page.on('pageerror', (e) => console.error('[page error]', e.message));

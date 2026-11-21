@@ -49,6 +49,7 @@ import { registerAuthRoutes } from './server/routes/auth.ts';
 import { registerProjectRoutes } from './server/routes/projects.ts';
 import { registerYouTubeDownloadRoutes } from './server/routes/youtubeDownload.ts';
 import { registerQualityRoutes } from './server/routes/quality.ts';
+import { offlineTtsAvailable, synthesizeOffline } from './server/lib/offlineTts.ts';
 import { buildContentSecurityPolicy, cspHeaderName, parseCspEnv, PERMISSIONS_POLICY, CROSS_ORIGIN_OPENER_POLICY } from './server/lib/csp.ts';
 
 dotenv.config();
@@ -1386,7 +1387,14 @@ registerProjectRoutes(app, {
 // Optional, off by default (YOUTUBE_DOWNLOAD_ENABLED=true + yt-dlp): real YouTube footage for clips.
 const youTubeDownloads = registerYouTubeDownloadRoutes(app, { dataDir: DATA_DIR, rateLimit, uid, extractYouTubeId, parseRangeHeader });
 // Post-export quality gate: upload the exported reel → conform → evaluate → deliver (server/routes/quality.ts).
-const qualityRoutes = registerQualityRoutes(app, { dataDir: DATA_DIR, rateLimit, uid, maxUploadBytes: BODY_LIMITS.uploadBytes! });
+const qualityRoutes = registerQualityRoutes(app, {
+  dataDir: DATA_DIR,
+  rateLimit,
+  uid,
+  maxUploadBytes: BODY_LIMITS.uploadBytes!,
+  // Evidence-backed storytelling review (throws "not configured" without a key; the report then says so).
+  llm: (contents, config) => llmJson('quality-review', contents, config),
+});
 
 app.post('/api/projects/claim', rateLimit('projects-write', 60), async (req, res) => {
   if (req.identity?.kind !== 'firebase') {
@@ -2181,6 +2189,7 @@ app.post('/api/tts', rateLimit('tts', 25, { ai: true }), async (req, res) => {
           mimeType: audioPart.inlineData.mimeType || 'audio/pcm;rate=24000',
           sampleRate: 24000,
           voice: chosenVoice,
+          engine: 'neural',
         });
       }
       llmMetrics.failures++;
@@ -2190,7 +2199,26 @@ app.post('/api/tts', rateLimit('tts', 25, { ai: true }), async (req, res) => {
     }
   }
   llmMetrics.fallbacksServed++;
-  return res.json({ success: false, fallback: true, message: 'Server-side TTS unavailable, using browser speech synthesis fallback' });
+  // Offline voice: robotic but REAL audio that the export recorder can capture (browser speechSynthesis cannot be
+  // recorded, which is how reels ended up with a silent audio track). Labelled so the UI can say what it is.
+  if (process.env.OFFLINE_TTS !== 'false' && offlineTtsAvailable()) {
+    try {
+      const { pcm, sampleRate, voice } = await synthesizeOffline(text, chosenVoice);
+      return res.json({
+        success: true,
+        engine: 'offline',
+        audioData: pcm.toString('base64'),
+        mimeType: `audio/pcm;rate=${sampleRate}`,
+        sampleRate,
+        voice: chosenVoice,
+        offlineVoice: voice,
+        message: 'AI voice is unavailable; using the basic offline voice.',
+      });
+    } catch (err: any) {
+      console.warn('[TTS] offline voice failed:', err?.message || err);
+    }
+  }
+  return res.json({ success: false, fallback: true, recordable: false, message: 'No recordable voice is available on this server (AI voice and offline voice both unavailable).' });
 });
 
 // ==========================================

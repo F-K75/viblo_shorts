@@ -226,7 +226,12 @@ describe('S1: the queue worker is the only code that starts a render encoder', (
     // Nothing else in the server tree spawns ffmpeg, except the post-export quality gate, which is not a render: it
     // probes/conforms an already-exported reel, costs no credits, and is bounded on its own (concurrency cap,
     // per-process timeouts, rate limits, upload size cap). Only these two files may, and only with those bounds.
-    const QUALITY = new Set(['lib/videoQuality/probe.ts', 'routes/quality.ts'].map((f) => path.normalize(f)));
+    // The offline voice (flite through ffmpeg) is the third bounded exception: a short synthesis, not a render.
+    const QUALITY = new Set(['lib/videoQuality/probe.ts', 'routes/quality.ts', 'lib/offlineTts.ts'].map((f) => path.normalize(f)));
+    const tts = fs.readFileSync(path.join(ROOT, 'server/lib/offlineTts.ts'), 'utf8');
+    assert.match(tts, /running >= MAX_OFFLINE_TTS/, 'offline TTS caps concurrent ffmpeg work');
+    assert.match(tts, /p\.kill\('SIGKILL'\)/, 'offline TTS has a kill timeout');
+    assert.match(tts, /\.slice\(0, 1000\)/, 'offline TTS caps the text length');
     const others = fs.readdirSync(path.join(ROOT, 'server'), { recursive: true }).map(String).filter((f) => f.endsWith('.ts'));
     for (const f of others) {
       const code = fs.readFileSync(path.join(ROOT, 'server', f), 'utf8');

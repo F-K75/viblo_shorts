@@ -1,4 +1,5 @@
 import { apiFetch } from './api';
+import { pcm16Base64ToFloat } from './alignment';
 /**
  * Production-ready Web Audio and TTS manager.
  * Provides synthesized royalty-free background music, Gemini Neural TTS decoding,
@@ -373,28 +374,141 @@ class AudioManager {
    * captions can be timed to the actual voice. Null when neural TTS is unavailable (no key / error).
    */
   public async prefetchTts(text: string, voiceName: string = 'Kore'): Promise<number | null> {
+    return (await this.prefetchLine(text, voiceName))?.seconds ?? null;
+  }
+
+  private ttsLines = new Map<string, { seconds: number; engine: 'neural' | 'offline'; b64: string; sampleRate: number }>();
+  /** Engine of the most recent successfully fetched line ('neural' AI voice or the basic 'offline' voice). */
+  public lastTtsEngine: 'neural' | 'offline' | null = null;
+
+  /**
+   * Fetches (and caches) a narration line and keeps its PCM so captions can be aligned to the REAL audio. Only voices
+   * the export can record count: neural AI voice or the server's offline voice. Null = no recordable voice for it.
+   */
+  public async prefetchLine(text: string, voiceName: string = 'Kore'): Promise<{ seconds: number; engine: 'neural' | 'offline'; samples: Float32Array; sampleRate: number } | null> {
     const cacheKey = `${voiceName}:${text.trim()}`;
     if (!text.trim()) return null;
-    const known = this.ttsDurations.get(cacheKey);
-    if (known !== undefined && this.ttsCache.has(cacheKey)) return known;
-    try {
-      const res = await apiFetch('/api/tts', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text, voice: voiceName }),
-      });
-      if (!res.ok) return null;
-      const data = await res.json();
-      if (!data.success || !data.audioData) return null;
-      const sampleRate = data.sampleRate || 24000;
-      const bytes = Math.floor((data.audioData.length * 3) / 4); // base64 → bytes (16-bit mono PCM)
-      const seconds = bytes / 2 / sampleRate;
-      this.setTtsCache(cacheKey, URL.createObjectURL(pcmToWavBlob(data.audioData, sampleRate)));
-      this.ttsDurations.set(cacheKey, seconds);
-      return seconds;
-    } catch {
-      return null;
+    let line = this.ttsLines.get(cacheKey);
+    if (!line || !this.ttsCache.has(cacheKey)) {
+      try {
+        const res = await apiFetch('/api/tts', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text, voice: voiceName }),
+        });
+        if (!res.ok) return null;
+        const data = await res.json();
+        if (!data.success || !data.audioData) return null;
+        const sampleRate = data.sampleRate || 24000;
+        const bytes = Math.floor((data.audioData.length * 3) / 4); // base64 → bytes (16-bit mono PCM)
+        line = { seconds: bytes / 2 / sampleRate, engine: data.engine === 'offline' ? 'offline' : 'neural', b64: data.audioData, sampleRate };
+        this.setTtsCache(cacheKey, URL.createObjectURL(pcmToWavBlob(data.audioData, sampleRate)));
+        this.ttsLines.set(cacheKey, line);
+        this.ttsDurations.set(cacheKey, line.seconds);
+        while (this.ttsLines.size > AudioManager.MAX_TTS_CACHE_SIZE) this.ttsLines.delete(this.ttsLines.keys().next().value!);
+      } catch {
+        return null;
+      }
     }
+    this.lastTtsEngine = line.engine;
+    return { seconds: line.seconds, engine: line.engine, samples: pcm16Base64ToFloat(line.b64), sampleRate: line.sampleRate };
+  }
+
+  /** Prefetches lines with limited concurrency (the server synthesises a few at a time; a burst would be refused). */
+  public async prefetchLines(texts: string[], voiceName: string, concurrency = 3) {
+    const out: Array<Awaited<ReturnType<AudioManager['prefetchLine']>>> = new Array(texts.length).fill(null);
+    let next = 0;
+    const worker = async () => {
+      while (next < texts.length) {
+        const i = next++;
+        out[i] = await this.prefetchLine(texts[i], voiceName);
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(concurrency, texts.length) }, worker));
+    return out;
+  }
+
+  /**
+   * Schedules every narration line on the AUDIO clock (sample-accurate, no network round-trip at play time, no line
+   * cut off by the next), routed to the speakers and into the export recording. `t0` is the AudioContext time at
+   * which reel time 0 plays; the caller starts drawing frames when ctx.currentTime reaches it.
+   */
+  public async scheduleNarration(lines: Array<{ text: string; start_s: number }>, voiceName: string, leadS = 0.3): Promise<{ t0: number; missing: string[]; engines: string[]; stop: () => void }> {
+    const ctx = this.initContext();
+    if (!ctx) return { t0: 0, missing: lines.map((l) => l.text), engines: [], stop: () => {} };
+    this.getExportAudioStream(); // ensure the export destination exists
+    const data = await this.prefetchLines(lines.map((l) => l.text), voiceName);
+    const t0 = ctx.currentTime + leadS;
+    const sources: AudioBufferSourceNode[] = [];
+    const missing: string[] = [];
+    const engines = new Set<string>();
+    lines.forEach((l, i) => {
+      const d = data[i];
+      if (!d) {
+        missing.push(l.text);
+        return;
+      }
+      engines.add(d.engine);
+      const buf = ctx.createBuffer(1, d.samples.length, d.sampleRate);
+      buf.copyToChannel(d.samples as Float32Array<ArrayBuffer>, 0);
+      const src = ctx.createBufferSource();
+      src.buffer = buf;
+      src.connect(ctx.destination);
+      if (this.exportDestination) src.connect(this.exportDestination);
+      src.start(t0 + Math.max(0, l.start_s));
+      sources.push(src);
+    });
+    return {
+      t0,
+      missing,
+      engines: [...engines],
+      stop: () => sources.forEach((s) => {
+        try {
+          s.stop();
+          s.disconnect();
+        } catch {
+          // already stopped
+        }
+      }),
+    };
+  }
+
+  /**
+   * Meters exactly what the recorder receives (the export stream), so a silent recording is known the moment it
+   * ends. Returns a function that stops metering and reports peak level and the share of time with signal.
+   */
+  public startExportMeter(): () => { peakDb: number | null; activeRatio: number } {
+    const ctx = this.initContext();
+    this.getExportAudioStream();
+    if (!ctx || !this.exportDestination) return () => ({ peakDb: null, activeRatio: 0 });
+    const src = ctx.createMediaStreamSource(this.exportDestination.stream);
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 2048;
+    src.connect(analyser);
+    const buf = new Float32Array(analyser.fftSize);
+    let peak = 0;
+    let ticks = 0;
+    let active = 0;
+    const timer = window.setInterval(() => {
+      analyser.getFloatTimeDomainData(buf);
+      let sum = 0;
+      for (let i = 0; i < buf.length; i++) {
+        const a = Math.abs(buf[i]);
+        if (a > peak) peak = a;
+        sum += buf[i] * buf[i];
+      }
+      ticks++;
+      if (Math.sqrt(sum / buf.length) > 0.003) active++; // ≈ -50 dBFS
+    }, 100);
+    return () => {
+      window.clearInterval(timer);
+      try {
+        src.disconnect();
+      } catch {
+        // ignore
+      }
+      return { peakDb: peak > 0 ? Math.round(20 * Math.log10(peak) * 10) / 10 : null, activeRatio: ticks ? active / ticks : 0 };
+    };
   }
 
   public async speakNeuralOrFallback(text: string, voiceName: string = 'Kore') {

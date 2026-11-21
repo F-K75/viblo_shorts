@@ -15,6 +15,7 @@ import { ScriptEditor } from './ScriptEditor';
 import { CaptionStyleConfig } from './CaptionStyleConfig';
 import { YouTubeMetadataCard } from './YouTubeMetadataCard';
 import { ShortsPlayer } from './ShortsPlayer';
+import type { RepairAction } from '../utils/quality';
 import { audioManager } from '../utils/audio';
 import type { SourceFootage } from '../utils/useSourceFootage';
 
@@ -57,6 +58,8 @@ interface StudioPage3CanvasTimelineProps {
   onChangeVisualMode?: (mode: VisualSourceMode) => void;
   sourceFile?: SourceFootage | null;
   onChangeSourceFile?: (next: SourceFootage | null) => void;
+  wordTimingSource?: 'aligned' | 'transcript' | 'estimated';
+  onQualityAction?: (action: RepairAction) => void;
 }
 
 export const StudioPage3CanvasTimeline: React.FC<StudioPage3CanvasTimelineProps> = ({
@@ -98,6 +101,8 @@ export const StudioPage3CanvasTimeline: React.FC<StudioPage3CanvasTimelineProps>
   onChangeVisualMode,
   sourceFile,
   onChangeSourceFile,
+  wordTimingSource,
+  onQualityAction,
 }) => {
   const scriptSectionRef = useRef<HTMLDivElement>(null);
   const captionSectionRef = useRef<HTMLDivElement>(null);
@@ -271,6 +276,8 @@ export const StudioPage3CanvasTimeline: React.FC<StudioPage3CanvasTimelineProps>
             sourceFile={sourceFile}
             onChangeSourceFile={onChangeSourceFile}
             localSourceName={script.sourceLocalVideo?.name}
+            wordTimingSource={wordTimingSource}
+            onQualityAction={onQualityAction}
           />
         </aside>
       </div>

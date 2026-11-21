@@ -31,7 +31,7 @@ before(async () => {
 after(async () => srv?.stop());
 
 test('E2E: guest onboarding → generate → save → projects → export', { skip, timeout: 240000 }, async () => {
-  const browser = await chromium.launch({ args: ['--autoplay-policy=no-user-gesture-required'] });
+  const browser = await chromium.launch({ ...(process.env.PW_CHROMIUM_PATH ? { executablePath: process.env.PW_CHROMIUM_PATH } : {}), args: ['--autoplay-policy=no-user-gesture-required'] });
   const ctx = await browser.newContext({ viewport: { width: 1366, height: 900 }, acceptDownloads: true });
   const page = await ctx.newPage();
   const cspViolations = await watchCspViolations(page, srv.baseUrl); // FS-013: the production CSP blocks nothing legitimate
