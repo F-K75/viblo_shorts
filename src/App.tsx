@@ -153,7 +153,8 @@ export const App: React.FC = () => {
     strokeColor: '#000000',
     strokeWidth: 5,
     positionY: 68,
-    wordsPerChunk: 2,
+    wordsPerChunk: 5,
+    grouping: 'phrase',
     textTransform: 'uppercase',
     boxStyle: 'rounded-pill',
     badge: 'Hormozi Gold',
@@ -1250,9 +1251,19 @@ export const App: React.FC = () => {
             </div>
           )}
           {aiNotice && (
-            <div role="status" className="flex items-start justify-between gap-3 rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-xs text-amber-100">
-              <span>{aiNotice}</span>
-              <button onClick={() => setAiNotice(null)} className="text-amber-300 hover:text-white" aria-label="Dismiss notice">✕</button>
+            <div role="status" className="flex items-start justify-between gap-3 rounded-xl border border-amber-500/30 bg-amber-950/40 px-4 py-3 text-xs text-amber-100 shadow-sm backdrop-blur-sm">
+              <div className="flex items-start gap-2.5">
+                <span className="text-amber-400 mt-0.5 text-sm shrink-0" aria-hidden="true">⚠️</span>
+                <div className="space-y-1">
+                  <p className="leading-relaxed">{aiNotice}</p>
+                  {aiNotice.includes('GEMINI_API_KEY') && (
+                    <p className="text-[11px] text-amber-300/90 font-medium">
+                      To enable Gemini AI video analysis and custom script generation, configure your Gemini API key in the AI Studio <strong>Settings &gt; Secrets</strong> panel.
+                    </p>
+                  )}
+                </div>
+              </div>
+              <button onClick={() => setAiNotice(null)} className="text-amber-300/70 hover:text-white shrink-0 ml-2" aria-label="Dismiss notice">✕</button>
             </div>
           )}
         </div>

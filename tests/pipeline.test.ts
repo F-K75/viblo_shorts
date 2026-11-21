@@ -163,7 +163,7 @@ test('Pipeline: phrase captions keep every word, end on clause/sentence boundari
     assert.ok(chars <= Math.round(28 * 1.15), `fits: ${chars}`);
     assert.ok(!(c.words.length === 1 && !/[.!?,]$/.test(c.words[0].word)), `orphan: ${c.text}`);
   }
-  assert.ok(chunks.some((c) => /DONE$/.test(c.text)) && chunks.every((c) => !/DONE IT/.test(c.text)), 'sentence end respected');
+  assert.ok(chunks.some((c) => /DONE\??$/.test(c.text)) && chunks.every((c) => !/DONE\?? IT/.test(c.text)), 'sentence end respected');
   const avg = words.length / chunks.length;
   assert.ok(avg >= 3, `phrases, not 2-word fragments (avg ${avg})`);
 });

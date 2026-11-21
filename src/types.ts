@@ -1,3 +1,5 @@
+export type BeatRole = 'hook' | 'context' | 'main' | 'progression' | 'cta';
+
 export interface Beat {
   id: string;
   text: string;
@@ -7,6 +9,7 @@ export interface Beat {
   video_url: string;
   thumbnail?: string;
   duration?: number;
+  role?: BeatRole;
 }
 
 export interface ShortScript {
@@ -33,6 +36,8 @@ export interface WordTiming {
   start_s: number;
   end_s: number;
   beatId?: string;
+  segmentIndex?: number;
+  wordIndex?: number;
 }
 
 export interface CaptionChunk {
@@ -40,6 +45,30 @@ export interface CaptionChunk {
   start_s: number;
   end_s: number;
   words: WordTiming[];
+  beatId?: string;
+}
+
+/** Explicit 4-layer Caption Intelligence representation: transcript -> segments -> individual words -> active highlight. */
+export interface CaptionModel {
+  fullTranscript: string;
+  segments: CaptionChunk[];
+  words: WordTiming[];
+}
+
+export interface ActiveCaptionState {
+  segment: CaptionChunk | null;
+  segmentIndex: number;
+  activeWord: WordTiming | null;
+  activeWordIndexInSegment: number;
+}
+
+export interface AudioAnalysisMetrics {
+  durationS: number;
+  rmsDb: number;
+  peakDb: number;
+  silenceRatio: number;
+  isSilent: boolean;
+  sampleRate: number;
 }
 
 export interface CaptionStyle {

@@ -3,17 +3,17 @@ import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { evaluate, loadThresholds } from '../lib/videoQuality/evaluator.ts';
+import { evaluateStoryWithAi } from '../lib/videoQuality/aiEvaluator.ts';
+import { evaluate, evaluatePreflight, loadThresholds } from '../lib/videoQuality/evaluator.ts';
 import type { Evaluation, MediaFacts, Timeline, TimelineBeat } from '../lib/videoQuality/models.ts';
-import { probeMedia } from '../lib/videoQuality/probe.ts';
+import { detectFfmpegCapabilities, probeMedia } from '../lib/videoQuality/probe.ts';
 
 /**
- * Post-export quality pipeline:  upload (exported reel only) → probe → conform to the delivery spec → evaluate →
- * gate → download.  A reel is never "done" just because the encoder exited 0: the user gets the measured spec, the
- * score, the problems and what was fixed automatically.
+ * Post-export quality pipeline:
+ *   upload (exported reel) -> probe -> conform to delivery spec -> evaluate (deterministic + optional AI) -> gate -> download.
  *
- * Conform = re-encode to H.264 High / yuv420p / constant 30 fps / AAC 48 kHz / -14 LUFS / +faststart. It NEVER
- * upscales: a recording smaller than the target keeps its real size, so the export check still rejects it.
+ * Conform re-encodes to H.264 High / yuv420p / constant target fps / AAC 48 kHz stereo / -14 LUFS (only when audible) / +faststart.
+ * It NEVER upscales: a recording smaller than target keeps its real dimensions so the export check catches and rejects it honestly.
  */
 export interface QualityDeps {
   dataDir: string;
@@ -21,6 +21,7 @@ export interface QualityDeps {
   uid: (req: express.Request) => string;
   maxUploadBytes: number;
   env?: NodeJS.ProcessEnv;
+  resolveGeminiApiKey?: () => string | null;
 }
 
 const ID_RE = /^qa_[a-f0-9]{32}$/;
@@ -44,25 +45,50 @@ export function sanitizeTimeline(input: any): Timeline | null {
     role: ROLES.has(b?.role) ? b.role : undefined,
     kind: KINDS.has(b?.kind) ? b.kind : undefined,
   }));
-  const chunks = (Array.isArray(input.captions?.chunks) ? input.captions.chunks : []).slice(0, 3000).map((c: any) => ({
-    text: str(c?.text, 300),
-    start_s: num(c?.start_s, -10, 3600),
-    end_s: num(c?.end_s, -10, 3600),
-    words: Math.round(num(c?.words, 0, 100)),
-    lines: c?.lines === undefined ? undefined : Math.round(num(c?.lines, 0, 20)),
-  }));
+  const chunks: Timeline['captions']['chunks'] = (Array.isArray(input.captions?.chunks) ? input.captions.chunks : [])
+    .slice(0, 3000)
+    .map((c: any) => ({
+      text: str(c?.text, 300),
+      start_s: num(c?.start_s, -10, 3600),
+      end_s: num(c?.end_s, -10, 3600),
+      words: Math.round(num(c?.words, 0, 100)),
+      lines: c?.lines === undefined ? undefined : Math.round(num(c?.lines, 0, 20)),
+      wordTimings: Array.isArray(c?.wordTimings)
+        ? c.wordTimings.slice(0, 50).map((w: any) => ({
+            word: str(w?.word, 80),
+            start_s: num(w?.start_s, -10, 3600),
+            end_s: num(w?.end_s, -10, 3600),
+          }))
+        : undefined,
+    }));
   const t = input.target;
+  const grouping = input.captions?.grouping === 'words' ? 'words' : input.captions?.grouping === 'phrase' ? 'phrase' : undefined;
   return {
     durationS: num(input.durationS, 0, 3600),
     scriptText: str(input.scriptText, 50_000),
     beats,
-    captions: { enabled: input.captions?.enabled !== false, chunks, maxLines: input.captions?.maxLines ? Math.round(num(input.captions.maxLines, 1, 6)) : undefined },
+    captions: {
+      enabled: input.captions?.enabled !== false,
+      chunks,
+      maxLines: input.captions?.maxLines ? Math.round(num(input.captions.maxLines, 1, 6)) : undefined,
+      positionY: input.captions?.positionY === undefined ? undefined : num(input.captions.positionY, 0, 100),
+      fontSize: input.captions?.fontSize === undefined ? undefined : num(input.captions.fontSize, 8, 200),
+      grouping,
+    },
     audio: {
       required: input.audio?.required !== false,
       narration: Boolean(input.audio?.narration),
       sourceSpeech: Boolean(input.audio?.sourceSpeech),
       music: Boolean(input.audio?.music),
       musicVolume: input.audio?.musicVolume === undefined ? undefined : num(input.audio.musicVolume, 0, 1),
+      clientMeasuredPeakDb:
+        input.audio?.clientMeasuredPeakDb === undefined || input.audio?.clientMeasuredPeakDb === null
+          ? undefined
+          : num(input.audio.clientMeasuredPeakDb, -120, 6),
+      clientMeasuredRmsDb:
+        input.audio?.clientMeasuredRmsDb === undefined || input.audio?.clientMeasuredRmsDb === null
+          ? undefined
+          : num(input.audio.clientMeasuredRmsDb, -120, 6),
     },
     target: t ? { width: Math.round(num(t.width, 64, 4096, 1080)), height: Math.round(num(t.height, 64, 4096, 1920)), fps: num(t.fps, 1, 120, 30) } : undefined,
   };
@@ -87,21 +113,71 @@ function runFfmpeg(args: string[], timeoutMs: number): Promise<{ ok: boolean; st
   });
 }
 
-/** Builds the conform command. Scales DOWN to fit the target if larger; never up. Keeps dimensions even. */
-export function conformArgs(src: string, out: string, facts: MediaFacts, target: { width: number; height: number; fps: number }): string[] {
+/**
+ * Builds the delivery conform FFmpeg command.
+ * - Scales DOWN to fit target if larger; NEVER upscales.
+ * - Uses `-fps_mode cfr` on FFmpeg 5.1+ and `-vsync cfr` on FFmpeg 4.x so conform works reliably across versions.
+ * - Applies EBU R128 loudness normalization (-14 LUFS) ONLY when the audio signal is actually audible; silent audio
+ *   is never artificially amplified or disguised as speech.
+ */
+export function conformArgs(
+  src: string,
+  out: string,
+  facts: MediaFacts,
+  target: { width: number; height: number; fps: number },
+  caps: { hasFpsMode: boolean } = detectFfmpegCapabilities(),
+): string[] {
   const v = facts.video!;
   const fits = v.width <= target.width && v.height <= target.height;
   const scale = fits
     ? 'scale=trunc(iw/2)*2:trunc(ih/2)*2'
     : `scale=${target.width}:${target.height}:force_original_aspect_ratio=decrease:flags=lanczos,scale=trunc(iw/2)*2:trunc(ih/2)*2`;
-  const args = ['-hide_banner', '-nostdin', '-y', '-i', src, '-map', '0:v:0', '-vf', `${scale},fps=${target.fps},format=yuv420p`,
-    '-c:v', 'libx264', '-preset', 'medium', '-crf', '18', '-profile:v', 'high', '-pix_fmt', 'yuv420p', '-fps_mode', 'cfr'];
-  if (facts.audio) args.push('-map', '0:a:0', '-af', 'loudnorm=I=-14:TP=-1.5:LRA=11', '-c:a', 'aac', '-b:a', '192k', '-ar', '48000');
+  const cfrFlag = caps.hasFpsMode ? ['-fps_mode', 'cfr'] : ['-vsync', 'cfr'];
+  const args = [
+    '-hide_banner',
+    '-nostdin',
+    '-y',
+    '-i',
+    src,
+    '-map',
+    '0:v:0',
+    '-vf',
+    `${scale},fps=${target.fps},format=yuv420p`,
+    '-c:v',
+    'libx264',
+    '-preset',
+    'medium',
+    '-crf',
+    '18',
+    '-profile:v',
+    'high',
+    '-pix_fmt',
+    'yuv420p',
+    ...cfrFlag,
+  ];
+  if (facts.audio) {
+    const audible =
+      (facts.analysis.meanVolumeDb !== null && facts.analysis.meanVolumeDb > -58) ||
+      (facts.analysis.maxVolumeDb !== null && facts.analysis.maxVolumeDb > -48);
+    args.push('-map', '0:a:0');
+    if (audible) {
+      args.push('-af', 'loudnorm=I=-14:TP=-1.5:LRA=11');
+    }
+    args.push('-c:a', 'aac', '-b:a', '192k', '-ar', '48000', '-ac', '2');
+  }
   args.push('-movflags', '+faststart', out);
   return args;
 }
 
-const summary = (e: Evaluation) => ({ score: e.score, status: e.status, spec: e.spec, problems: e.problems.map((p) => ({ id: p.id, severity: p.severity, message: p.message })) });
+const summary = (e: Evaluation) => ({
+  score: e.score,
+  classification: e.classification,
+  action: e.action,
+  readyToPublish: e.readyToPublish,
+  status: e.status,
+  spec: e.spec,
+  problems: e.problems.map((p) => ({ id: p.id, severity: p.severity, message: p.message })),
+});
 
 export function registerQualityRoutes(app: express.Express, deps: QualityDeps): { stop: () => void } {
   const env = deps.env || process.env;
@@ -131,6 +207,17 @@ export function registerQualityRoutes(app: express.Express, deps: QualityDeps): 
   };
   const timer = setInterval(sweep, Math.min(ttlMs, 10 * 60_000));
   timer.unref();
+
+  // 0. Preflight / post-edit timeline quality evaluation (instant, no video upload required).
+  app.post('/api/quality/preflight', deps.rateLimit('quality-preflight', 60), async (req, res) => {
+    const timeline = sanitizeTimeline(req.body?.timeline);
+    if (!timeline) return res.status(400).json({ error: 'Timeline payload is required.' });
+    const th = loadThresholds(env);
+    const apiKey = deps.resolveGeminiApiKey ? deps.resolveGeminiApiKey() : env.GEMINI_API_KEY || null;
+    const aiReview = req.body?.useAi === false ? undefined : await evaluateStoryWithAi(timeline, { apiKey: apiKey ?? undefined, model: env.QUALITY_AI_MODEL, timeoutMs: 8_000 });
+    const evaluation = evaluatePreflight(timeline, th, aiReview);
+    return res.json({ mode: 'preflight', evaluation });
+  });
 
   // 1. Upload the exported reel (streamed to disk, size-capped). Source footage is never uploaded.
   app.post('/api/quality/uploads', deps.rateLimit('quality-upload', 20), (req, res) => {
@@ -178,29 +265,51 @@ export function registerQualityRoutes(app: express.Express, deps: QualityDeps): 
     const timeline = sanitizeTimeline(req.body?.timeline);
     const th = loadThresholds(env);
     const target = timeline?.target || { width: th.spec.width, height: th.spec.height, fps: th.spec.fps };
+    const apiKey = deps.resolveGeminiApiKey ? deps.resolveGeminiApiKey() : env.GEMINI_API_KEY || null;
     running++;
     try {
+      const aiReviewPromise =
+        timeline && req.body?.useAi !== false
+          ? evaluateStoryWithAi(timeline, { apiKey: apiKey ?? undefined, model: env.QUALITY_AI_MODEL, timeoutMs: 10_000 })
+          : Promise.resolve(undefined);
+
       let rawFacts: MediaFacts | null = null;
       try {
         rawFacts = await probeMedia(p(id, 'src'), { timeoutMs });
       } catch (e) {
-        const ev = evaluate(null, timeline, th);
-        return res.json({ evaluation: ev, before: summary(ev), remediation: [{ action: 'probe', ok: false, detail: (e as Error).message }], downloadId: null });
+        const aiReview = await aiReviewPromise;
+        const ev = evaluate(null, timeline, th, aiReview);
+        return res.json({
+          evaluation: ev,
+          before: summary(ev),
+          remediation: [{ action: 'probe', ok: false, detail: (e as Error).message }],
+          downloadId: null,
+        });
       }
-      const before = evaluate(rawFacts, timeline, th);
+
+      const aiReview = await aiReviewPromise;
+      const before = evaluate(rawFacts, timeline, th, aiReview);
       const remediation: Array<{ action: string; ok: boolean; detail: string }> = [];
       let final = before;
       let deliver: string | null = null;
+
       if (rawFacts.video && req.body?.conform !== false) {
         const conformed = p(id, 'mp4');
         const r = await runFfmpeg(conformArgs(p(id, 'src'), conformed, rawFacts, target), timeoutMs);
         if (r.ok && fs.existsSync(conformed)) {
-          const after = evaluate(await probeMedia(conformed, { timeoutMs }), timeline, th);
-          const fixed = before.problems.filter((b) => b.dimension === 'export' || b.dimension === 'audio').filter((b) => !after.problems.some((a) => a.id === b.id)).map((b) => b.id);
+          const after = evaluate(await probeMedia(conformed, { timeoutMs }), timeline, th, aiReview);
+          const fixed = before.problems
+            .filter((b) => b.dimension === 'export' || b.dimension === 'audio' || b.dimension === 'technical')
+            .filter((b) => !after.problems.some((a) => a.id === b.id))
+            .map((b) => b.id);
+          const audible =
+            rawFacts.audio &&
+            ((rawFacts.analysis.meanVolumeDb !== null && rawFacts.analysis.meanVolumeDb > -58) ||
+              (rawFacts.analysis.maxVolumeDb !== null && rawFacts.analysis.maxVolumeDb > -48));
           remediation.push({
             action: 'conform',
             ok: true,
-            detail: `Re-encoded to H.264/yuv420p/${target.fps} fps CFR/AAC/-14 LUFS/faststart${fixed.length ? `; fixed: ${fixed.join(', ')}` : ''}. No upscaling.`,
+            detail: `Re-encoded to H.264/yuv420p/${target.fps} fps CFR/AAC${audible ? '/-14 LUFS' : ''}/faststart${fixed.length ? `; fixed: ${fixed.join(', ')}` : ''}. No upscaling.`,
           });
           final = after;
           deliver = conformed;
@@ -208,9 +317,16 @@ export function registerQualityRoutes(app: express.Express, deps: QualityDeps): 
           remediation.push({ action: 'conform', ok: false, detail: r.stderr.split('\n').filter(Boolean).pop()?.slice(0, 200) || 'ffmpeg failed' });
         }
       }
+
       if (!deliver) deliver = p(id, 'src');
       fs.writeFileSync(p(id, 'deliver'), JSON.stringify({ file: path.basename(deliver), label: final.spec.label }));
-      res.json({ evaluation: final, before: summary(before), remediation, downloadId: id, fileName: `forge_short_${final.spec.label}_${Date.now()}.mp4` });
+      res.json({
+        evaluation: final,
+        before: summary(before),
+        remediation,
+        downloadId: id,
+        fileName: `forge_short_${final.spec.label}_${Date.now()}.mp4`,
+      });
     } catch (e) {
       res.status(500).json({ error: 'Quality evaluation failed.', detail: (e as Error).message.slice(0, 200) });
     } finally {

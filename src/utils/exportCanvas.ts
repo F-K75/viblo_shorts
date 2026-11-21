@@ -1,4 +1,5 @@
 import type { CaptionStyle, WordTiming } from '../types';
+import { formatCaptionDisplayWord } from './pipeline';
 import { TOPICS, getTopic } from './visualPlaceholders';
 
 /** The editor preview is 360 px wide; exported frames are scaled from it so captions look the same as in the editor. */
@@ -14,43 +15,60 @@ const easeOut = (x: number) => 1 - Math.pow(1 - Math.min(1, Math.max(0, x)), 3);
 
 /**
  * Animated motion-graphics background for beats that have no real footage or photo (no stock API key, offline,
- * or blocked media). Drifting colour orbs in the beat's topic palette, a floating topic icon that pops in on every cut,
- * and story-style progress segments.
+ * or blocked media). Each beat gets a distinct hue shift, directional composition, and floating topic visual
+ * so scenes have strong visual progression rather than feeling static.
  */
 export function drawMotionBackground(
   ctx: CanvasRenderingContext2D,
   opts: { t: number; beatIndex: number; beatCount: number; beatProgress: number; beatElapsed: number; text?: string; keywords?: string; w: number; h: number },
 ) {
   const { t, beatIndex, beatCount, beatProgress, beatElapsed, text, keywords, w, h } = opts;
-  // The beat's own words pick the icon (varies per beat); the visual keywords are the fallback.
   const byText = getTopic(text);
   const topic = TOPICS[byText !== 'default' ? byText : getTopic(keywords)];
-  const hue = (topic.hue + beatIndex * 28) % 360;
+  const hue = (topic.hue + beatIndex * 47) % 360;
 
-  const base = ctx.createLinearGradient(0, 0, w * 0.4, h);
-  base.addColorStop(0, `hsl(${hue}, 55%, 9%)`);
-  base.addColorStop(1, `hsl(${(hue + 40) % 360}, 60%, 18%)`);
+  // Vary gradient direction per scene so every cut creates a clear visual transition
+  const angle = (beatIndex % 4) * 0.25;
+  const base = ctx.createLinearGradient(w * angle, 0, w * (1 - angle), h);
+  base.addColorStop(0, `hsl(${hue}, 58%, 10%)`);
+  base.addColorStop(0.55, `hsl(${(hue + 28) % 360}, 52%, 15%)`);
+  base.addColorStop(1, `hsl(${(hue + 60) % 360}, 62%, 20%)`);
   ctx.fillStyle = base;
   ctx.fillRect(0, 0, w, h);
 
-  // Drifting light orbs
+  // Drifting light orbs shifted per beat index
   const orbs = [
-    { x: 0.2, y: 0.25, r: 0.55, sp: 0.23, hs: 0, a: 0.55 },
-    { x: 0.85, y: 0.55, r: 0.6, sp: 0.17, hs: 50, a: 0.45 },
-    { x: 0.4, y: 0.9, r: 0.5, sp: 0.29, hs: -40, a: 0.4 },
+    { x: 0.22 + (beatIndex % 3) * 0.14, y: 0.22, r: 0.56, sp: 0.26, hs: 0, a: 0.52 },
+    { x: 0.82 - (beatIndex % 3) * 0.12, y: 0.56, r: 0.62, sp: 0.19, hs: 55, a: 0.44 },
+    { x: 0.42, y: 0.88, r: 0.52, sp: 0.31, hs: -45, a: 0.38 },
   ];
   ctx.save();
   ctx.globalCompositeOperation = 'lighter';
   orbs.forEach((o, i) => {
-    const cx = (o.x + Math.sin(t * o.sp + i * 2.1) * 0.12) * w;
-    const cy = (o.y + Math.cos(t * o.sp * 0.8 + i) * 0.08) * h;
+    const cx = (o.x + Math.sin(t * o.sp + i * 2.1 + beatIndex) * 0.12) * w;
+    const cy = (o.y + Math.cos(t * o.sp * 0.8 + i + beatIndex) * 0.08) * h;
     const r = o.r * w;
     const g = ctx.createRadialGradient(cx, cy, 0, cx, cy, r);
-    g.addColorStop(0, `hsla(${(hue + o.hs + 360) % 360}, 85%, 55%, ${o.a})`);
-    g.addColorStop(1, `hsla(${(hue + o.hs + 360) % 360}, 85%, 55%, 0)`);
+    g.addColorStop(0, `hsla(${(hue + o.hs + 360) % 360}, 85%, 56%, ${o.a})`);
+    g.addColorStop(1, `hsla(${(hue + o.hs + 360) % 360}, 85%, 56%, 0)`);
     ctx.fillStyle = g;
     ctx.fillRect(0, 0, w, h);
   });
+  ctx.restore();
+
+  // Subtle scene-specific geometric accent rings (gives sharp structural edges & distinct frames per beat)
+  ctx.save();
+  ctx.strokeStyle = `hsla(${(hue + 180) % 360}, 70%, 78%, 0.12)`;
+  ctx.lineWidth = Math.max(2, w * 0.003);
+  const ringCx = w * (0.3 + ((beatIndex * 29) % 40) / 100);
+  const ringCy = h * (0.28 + ((beatIndex * 17) % 18) / 100);
+  const ringScale = 1 + beatProgress * 0.12;
+  ctx.beginPath();
+  ctx.arc(ringCx, ringCy, w * 0.28 * ringScale, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.arc(ringCx, ringCy, w * 0.42 * ringScale, 0, Math.PI * 2);
+  ctx.stroke();
   ctx.restore();
 
   // Diagonal light sweep
@@ -69,8 +87,8 @@ export function drawMotionBackground(
 
   // Topic icon: pops in on each cut, then floats
   const pop = easeOut(beatElapsed / 0.35);
-  const scale = (0.6 + 0.4 * pop) * (1 + beatProgress * 0.06);
-  const iconY = h * 0.36 + Math.sin(t * 1.6) * h * 0.008;
+  const scale = (0.62 + 0.38 * pop) * (1 + beatProgress * 0.07);
+  const iconY = h * 0.35 + Math.sin(t * 1.6 + beatIndex) * h * 0.008;
   const ringR = w * 0.2 * scale;
   ctx.save();
   ctx.globalAlpha = pop;
@@ -119,6 +137,18 @@ export function drawMotionBackground(
 }
 
 /**
+ * Draws a subtle scene-cut polish fade (first 0.18s of a new scene) without causing black frames.
+ */
+export function drawSceneTransition(ctx: CanvasRenderingContext2D, beatElapsed: number, beatIndex: number, w: number, h: number) {
+  if (beatIndex <= 0 || beatElapsed < 0 || beatElapsed > 0.18) return;
+  const alpha = (1 - beatElapsed / 0.18) * 0.22;
+  ctx.save();
+  ctx.fillStyle = `rgba(10, 14, 24, ${alpha.toFixed(3)})`;
+  ctx.fillRect(0, 0, w, h);
+  ctx.restore();
+}
+
+/**
  * Number of lines drawCaptionChunk will need for these words (same font, word gap, width and active-word reserve),
  * so captions can be grouped to fit the line limit with the renderer's own layout instead of a character estimate.
  */
@@ -129,12 +159,11 @@ export function captionLineCount(ctx: CanvasRenderingContext2D, words: string[],
   ctx.save();
   ctx.font = `${style.fontWeight || '900'} ${fontPx}px '${style.fontFamily || 'Montserrat'}', 'Poppins', sans-serif`;
   const gap = fontPx * 0.32;
-  // 3% safety margin: measuring at preview scale and drawing at export scale can differ by a pixel at the wrap point.
   const maxLineW = ((PREVIEW_WIDTH - 24) * 0.94 * k - 14 * k * 2) * 0.97;
   const widths = words
-    .map((wd) => (isUpper ? wd.toUpperCase() : wd).replace(/[.,!?;:]/g, ''))
+    .map((wd) => formatCaptionDisplayWord(wd, isUpper))
     .filter(Boolean)
-    .map((t) => ctx.measureText(t).width * 1.12); // any word may be the highlighted (1.12x) one
+    .map((t) => ctx.measureText(t).width * 1.12);
   ctx.restore();
   if (!widths.length) return 0;
   let lines = 1;
@@ -150,17 +179,17 @@ export function captionLineCount(ctx: CanvasRenderingContext2D, words: string[],
 }
 
 /**
- * Draws a kinetic caption chunk exactly like the editor preview (ShortsPlayer overlay), scaled from the 360 px preview:
- * same font size, stroke, pill box, 94% max width with line wrapping, and the 1.12x pop on the active word.
+ * Draws a kinetic caption chunk scaled from the 360 px preview, enforcing mobile-safe margins
+ * so text never clips off-screen or collides with top/bottom social platform overlays.
  */
 export function drawCaptionChunk(
   ctx: CanvasRenderingContext2D,
   opts: { words: WordTiming[]; t: number; style: CaptionStyle; w: number; h: number },
-) : number {
+): number {
   const { words, t, style, w, h } = opts;
   const k = w / PREVIEW_WIDTH;
   const isUpper = style.textTransform !== 'none';
-  const fmt = (s: string) => (isUpper ? s.toUpperCase() : s).replace(/[.,!?;:]/g, '');
+  const fmt = (s: string) => formatCaptionDisplayWord(s, isUpper);
   const fontPx = style.fontSize * k;
   const fontFam = style.fontFamily || 'Montserrat';
   ctx.save();
@@ -168,14 +197,13 @@ export function drawCaptionChunk(
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
 
-  const gap = fontPx * 0.32; // a real word space
+  const gap = fontPx * 0.32;
   const padX = 14 * k;
   const padY = 8 * k;
   const maxLineW = (PREVIEW_WIDTH - 24) * 0.94 * k - padX * 2;
   const items = words
-    .map((wd) => ({ text: fmt(wd.word), active: t >= wd.start_s && t <= wd.end_s }))
+    .map((wd) => ({ text: fmt(wd.word), active: t >= wd.start_s - 0.04 && t <= wd.end_s + 0.06 }))
     .filter((i) => i.text)
-    // Reserve the active word's 1.12x pop in the layout so it never collides with its neighbours.
     .map((i) => ({ ...i, width: ctx.measureText(i.text).width * (i.active ? 1.12 : 1) }));
   if (!items.length) {
     ctx.restore();
@@ -199,7 +227,9 @@ export function drawCaptionChunk(
   const lineH = fontPx * 1.25;
   const boxW = Math.min(Math.max(...lineWidths), maxLineW) + padX * 2;
   const boxH = lineH * lines.length + padY * 2;
-  const cy = h * (style.positionY / 100);
+  // Clamp vertical position inside mobile-safe margins (14%..86% of frame height)
+  const rawCy = h * (style.positionY / 100);
+  const cy = Math.min(h * 0.86 - boxH / 2, Math.max(h * 0.14 + boxH / 2, rawCy));
 
   ctx.translate(w / 2, cy);
   if (style.rotation) ctx.rotate((style.rotation * Math.PI) / 180);
@@ -236,14 +266,11 @@ export function drawCaptionChunk(
     });
   });
   ctx.restore();
-  return lines.length; // reported to the quality check (caption overflow evidence)
+  return lines.length;
 }
 
 /**
  * Draws a landscape (or any) source video frame into the vertical canvas.
- * fill: crop to 9:16 around `cropCenter` (normalized 0..1 of the frame width; default 0.5 = centre crop), clamped so
- * the window stays inside the frame — smartCrop supplies a speaker-following centre.
- * fit: blurred, darkened cover as background + the whole frame centred.
  */
 export function drawSourceFrame(
   ctx: CanvasRenderingContext2D,
@@ -265,8 +292,6 @@ export function drawSourceFrame(
     } else {
       sh = vw / target;
     }
-    // Punch-in: a tighter crop of the same frame (a framing change at a sentence boundary). Kept slightly above
-    // centre vertically, where faces usually are.
     const z = mode === 'fill' && zoom > 1 ? zoom : 1;
     sw /= z;
     sh /= z;

@@ -104,7 +104,7 @@ export function buildContentSecurityPolicy(opts: CspOptions): string {
     "object-src 'none'",
     "base-uri 'self'",
     "form-action 'self'",
-    "frame-ancestors 'self'",
+    dev ? 'frame-ancestors *' : "frame-ancestors 'self'",
   ];
   if (opts.upgradeInsecureRequests && !opts.reportOnly) directives.push('upgrade-insecure-requests');
   if (opts.reportUri) directives.push(`report-uri ${opts.reportUri}`);

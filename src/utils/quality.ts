@@ -1,7 +1,22 @@
-// Client side of the post-export quality gate (server: server/routes/quality.ts, server/lib/videoQuality/).
+// Client side of the post-export & preflight quality gate (server: server/routes/quality.ts, server/lib/videoQuality/).
 
 export type QualityStatus = 'PASS' | 'NEEDS_IMPROVEMENT' | 'REJECTED';
+export type QualityClassification = 'Excellent' | 'Good' | 'Needs improvement' | 'Poor';
+export type QualityAction = 'Ready to publish' | 'Ready with minor warnings' | 'Revision recommended' | 'Regeneration required';
 export type TimelineKind = 'source' | 'broll' | 'image' | 'motion';
+
+export type RepairActionType =
+  | 'regenerate_voiceover'
+  | 'remux_audio'
+  | 'conform_encode'
+  | 'rerecord_export'
+  | 'enable_phrase_captions'
+  | 'adjust_caption_safe_zone'
+  | 'realign_captions'
+  | 'diversify_visuals'
+  | 'retrieve_relevant_assets'
+  | 'strengthen_hook'
+  | 'adjust_pacing';
 
 export interface QualityCheck {
   id: string;
@@ -14,17 +29,63 @@ export interface QualityCheck {
   evidence: Record<string, unknown>;
 }
 
+export interface RepairRecommendation {
+  id: string;
+  issueId: string;
+  dimension: string;
+  severity: 'info' | 'minor' | 'major' | 'critical';
+  autoRepairable: boolean;
+  repairAction: RepairActionType;
+  title: string;
+  description: string;
+  evidence: string;
+}
+
+export interface AiCreativeFinding {
+  criterion: 'hook' | 'narrative_continuity' | 'visual_relevance' | 'ending_cta';
+  score: number;
+  passed: boolean;
+  explanation: string;
+  evidence: string;
+  suggestion?: string;
+}
+
+export interface AiCreativeReview {
+  mode: 'ai_assisted' | 'deterministic_only';
+  model: string | null;
+  findings: AiCreativeFinding[];
+  summary: string;
+}
+
 export interface QualityEvaluation {
   score: number;
+  classification: QualityClassification;
+  action: QualityAction;
+  readyToPublish: boolean;
+  criticalOverride: boolean;
   status: QualityStatus;
   dimensions: Array<{ key: string; label: string; weight: number; score: number; points: number; checks: QualityCheck[] }>;
   criticalDefects: QualityCheck[];
+  warnings: QualityCheck[];
   problems: QualityCheck[];
   suggestions: string[];
+  recommendations: RepairRecommendation[];
   notes: string[];
+  aiReview?: AiCreativeReview;
+  evaluatedAt?: string;
   spec: {
     requested: { width: number; height: number; fps: number };
-    actual: null | { width: number; height: number; fps: number; videoCodec: string; pixFmt: string; audioCodec: string | null; durationS: number; faststart: boolean | null; sizeBytes: number };
+    actual: null | {
+      width: number;
+      height: number;
+      fps: number;
+      videoCodec: string;
+      pixFmt: string;
+      audioCodec: string | null;
+      durationS: number;
+      faststart: boolean | null;
+      sizeBytes: number;
+    };
     meetsSpec: boolean;
     label: string;
   };
@@ -32,7 +93,14 @@ export interface QualityEvaluation {
 
 export interface QualityResult {
   evaluation: QualityEvaluation;
-  before: { score: number; status: QualityStatus; problems: Array<{ id: string; severity: string; message: string }> };
+  before: {
+    score: number;
+    classification?: QualityClassification;
+    action?: QualityAction;
+    readyToPublish?: boolean;
+    status: QualityStatus;
+    problems: Array<{ id: string; severity: string; message: string }>;
+  };
   remediation: Array<{ action: string; ok: boolean; detail: string }>;
   downloadId: string | null;
   fileName?: string;
@@ -43,11 +111,13 @@ export interface RecordedExport {
   mime: string;
   linesByChunk: Map<number, number>;
   shownByBeat: Array<{ kind: TimelineKind; asset: string } | undefined>;
+  audioMetrics?: { peakDb: number; rmsDb: number; hasSignal: boolean } | null;
 }
 
 /** Report shown in the export panel. */
 export interface QualityReport {
   verified: boolean;
+  mode?: 'export' | 'preflight';
   result?: QualityResult;
   error?: string;
   attempts: string[];
@@ -79,7 +149,7 @@ export function downloadBlob(blob: Blob, name: string) {
   document.body.appendChild(a);
   a.click();
   a.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 60_000); // revoking immediately can cancel the download
+  setTimeout(() => URL.revokeObjectURL(url), 60_000);
 }
 
 /** Reads the real frame size of a recording in the browser (used only when the server check is unavailable). */
@@ -98,4 +168,20 @@ export function measureBlob(blob: Blob): Promise<{ width: number; height: number
     setTimeout(() => done(null), 5000);
     v.src = url;
   });
+}
+
+/** Runs an instant server-side timeline preflight evaluation (without requiring a video upload). */
+export async function runPreflightQuality(timeline: Record<string, unknown>, useAi = false): Promise<QualityEvaluation | null> {
+  try {
+    const resp = await fetch('/api/quality/preflight', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ timeline, useAi }),
+    });
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    return data?.evaluation ?? null;
+  } catch {
+    return null;
+  }
 }

@@ -271,6 +271,8 @@ export const StudioPage3CanvasTimeline: React.FC<StudioPage3CanvasTimelineProps>
             sourceFile={sourceFile}
             onChangeSourceFile={onChangeSourceFile}
             localSourceName={script.sourceLocalVideo?.name}
+            onAutoAlignBeats={onAutoAlignBeats}
+            onUpdateAllBeats={onUpdateAllBeats}
           />
         </aside>
       </div>

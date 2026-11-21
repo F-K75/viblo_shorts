@@ -43,25 +43,43 @@ export function normalizeHashtags(input: unknown, max = 10): string[] {
 
 const str = (v: unknown, max: number) => (typeof v === 'string' ? v.replace(/\s+/g, ' ').trim().slice(0, max) : '');
 
+const ROLES = new Set(['hook', 'context', 'main', 'progression', 'cta']);
+export type BeatRole = 'hook' | 'context' | 'main' | 'progression' | 'cta';
+
 export interface ValidatedScript {
   hook: string;
   title: string;
   description: string;
   hashtags: string[];
-  beats: Array<{ text: string; visual_keywords: string }>;
+  beats: Array<{ text: string; visual_keywords: string; role?: BeatRole }>;
 }
 
 /** Validates a generated script. Returns null (=> caller treats as model failure) if unusable. */
 export function validateScript(parsed: any): ValidatedScript | null {
   if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.beats)) return null;
-  const beats = parsed.beats
+  const rawBeats = parsed.beats
     .map((b: any) => ({
       text: str(b?.text, 300),
       visual_keywords: str(b?.visual_keywords, 80) || 'cinematic b-roll',
+      role: ROLES.has(b?.role) ? (b.role as BeatRole) : undefined,
     }))
     .filter((b: { text: string }) => b.text.length > 0)
     .slice(0, 10);
-  if (beats.length < 2) return null;
+  if (rawBeats.length < 2) return null;
+  const beats = rawBeats.map((b: { text: string; visual_keywords: string; role?: BeatRole }, idx: number) => ({
+    ...b,
+    role:
+      b.role ||
+      (idx === 0
+        ? 'hook'
+        : idx === rawBeats.length - 1
+          ? 'cta'
+          : idx === 1
+            ? 'context'
+            : idx === rawBeats.length - 2
+              ? 'progression'
+              : 'main'),
+  }));
   const hashtags = normalizeHashtags(parsed.hashtags);
   if (!hashtags.includes('#shorts')) hashtags.unshift('#shorts');
   return {

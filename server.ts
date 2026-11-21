@@ -49,6 +49,7 @@ import { registerAuthRoutes } from './server/routes/auth.ts';
 import { registerProjectRoutes } from './server/routes/projects.ts';
 import { registerYouTubeDownloadRoutes } from './server/routes/youtubeDownload.ts';
 import { registerQualityRoutes } from './server/routes/quality.ts';
+import { detectFfmpegCapabilities } from './server/lib/videoQuality/probe.ts';
 import { buildContentSecurityPolicy, cspHeaderName, parseCspEnv, PERMISSIONS_POLICY, CROSS_ORIGIN_OPENER_POLICY } from './server/lib/csp.ts';
 
 dotenv.config();
@@ -71,7 +72,7 @@ const rawNum = (name: string, def: number) => (process.env[name] === undefined |
 const MAX_CONCURRENT_RENDERS = rawNum('MAX_CONCURRENT_RENDERS', 2);
 const RENDER_TTL_HOURS = Math.max(1, Number(process.env.RENDER_TTL_HOURS || 24));
 const LLM_TIMEOUT_MS = Math.max(2000, Number(process.env.LLM_TIMEOUT_MS || 25000));
-const LLM_MODELS = (process.env.GEMINI_MODELS || 'gemini-3.1-flash-lite,gemini-3.8-flash')
+const LLM_MODELS = (process.env.GEMINI_MODELS || 'gemini-4-hydrogen,gemini-3.1-flash-lite')
   .split(',')
   .map((m) => m.trim())
   .filter(Boolean);
@@ -364,7 +365,7 @@ const CSP_HTTPS = buildContentSecurityPolicy({ ...cspOptions, upgradeInsecureReq
 
 app.use((req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
-  res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+  if (IS_PROD || IS_TEST) res.setHeader('X-Frame-Options', 'SAMEORIGIN');
   res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
   res.setHeader('Permissions-Policy', PERMISSIONS_POLICY);
   res.setHeader('Cross-Origin-Opener-Policy', CROSS_ORIGIN_OPENER_POLICY);
@@ -591,7 +592,11 @@ function getGeminiClient(): GoogleGenAI | null {
   if (cachedClient?.key === key) return cachedClient.client;
   const client = new GoogleGenAI({
     apiKey: key,
-    httpOptions: { timeout: LLM_TIMEOUT_MS, ...(GEMINI_BASE_URL ? { baseUrl: GEMINI_BASE_URL } : {}) },
+    httpOptions: {
+      timeout: LLM_TIMEOUT_MS,
+      headers: { 'User-Agent': 'aistudio-build' },
+      ...(GEMINI_BASE_URL ? { baseUrl: GEMINI_BASE_URL } : {}),
+    },
   });
   cachedClient = { key, client };
   return client;
@@ -899,23 +904,28 @@ function generateSmartScript(topic: string, _audience: string, _tone: string) {
       beats: [
         {
           text: "Sleeping 6 hours instead of 8 causes irreversible brain fog by midday.",
-          visual_keywords: "person waking up alarm clock tired morning"
+          visual_keywords: "person waking up alarm clock tired morning",
+          role: "hook" as const,
         },
         {
           text: "During deep REM sleep, your brain literally flushes out cellular toxins accumulated throughout the day.",
-          visual_keywords: "sleeping dark bedroom calm moonlight"
+          visual_keywords: "sleeping dark bedroom calm moonlight",
+          role: "context" as const,
         },
         {
           text: "Cut blue light 60 minutes before bed. Melatonin production immediately increases by 40%.",
-          visual_keywords: "hands placing phone down desk night"
+          visual_keywords: "hands placing phone down desk night",
+          role: "main" as const,
         },
         {
           text: "Keep your bedroom cool at 66 degrees Fahrenheit for continuous restorative sleep cycles.",
-          visual_keywords: "window sunrise sunlight room morning"
+          visual_keywords: "window sunrise sunlight room morning",
+          role: "progression" as const,
         },
         {
           text: "Prioritize sleep tonight, and watch your mental clarity skyrocket tomorrow.",
-          visual_keywords: "person drinking coffee smiling morning sunrise"
+          visual_keywords: "person drinking coffee smiling morning sunrise",
+          role: "cta" as const,
         }
       ],
       title: "The Brutal Truth About 6 vs 8 Hours of Sleep #shorts",
@@ -930,23 +940,28 @@ function generateSmartScript(topic: string, _audience: string, _tone: string) {
       beats: [
         {
           text: "99% of people abandon their side project within the first 30 days.",
-          visual_keywords: "person looking stressed laptop desk night"
+          visual_keywords: "person looking stressed laptop desk night",
+          role: "hook" as const,
         },
         {
           text: "They overcomplicate the setup, building fancy features before validating any real demand.",
-          visual_keywords: "code on screen typing hands dark"
+          visual_keywords: "code on screen typing hands dark",
+          role: "context" as const,
         },
         {
           text: "The secret is shipping the ugliest version that solves one clear problem for one person.",
-          visual_keywords: "person writing quick notes coffee cup"
+          visual_keywords: "person writing quick notes coffee cup",
+          role: "main" as const,
         },
         {
           text: "Spend 20% of your time building, and 80% talking to actual users.",
-          visual_keywords: "person talking phone walking city street"
+          visual_keywords: "person talking phone walking city street",
+          role: "progression" as const,
         },
         {
           text: "Consistency over months beats manic energy over a single weekend every time.",
-          visual_keywords: "person walking confident sunrise city"
+          visual_keywords: "person walking confident sunrise city",
+          role: "cta" as const,
         }
       ],
       title: "Why 99% Fail at Side Projects in 30 Days #shorts",
@@ -961,23 +976,28 @@ function generateSmartScript(topic: string, _audience: string, _tone: string) {
       beats: [
         {
           text: "You have exactly 3 seconds to stop someone from scrolling past your video.",
-          visual_keywords: "hands scrolling phone screen fast"
+          visual_keywords: "hands scrolling phone screen fast",
+          role: "hook" as const,
         },
         {
           text: "Never start with 'Hey guys'. Start in the middle of intense action or conflict.",
-          visual_keywords: "person looking surprised city street"
+          visual_keywords: "person looking surprised city street",
+          role: "context" as const,
         },
         {
           text: "Open an irresistible curiosity loop: introduce a question that demands resolution.",
-          visual_keywords: "person thinking typing laptop focused"
+          visual_keywords: "person thinking typing laptop focused",
+          role: "main" as const,
         },
         {
           text: "Change the visual angle every 3 seconds to reset the viewer's dopamine attention span.",
-          visual_keywords: "clock ticking fast time lapse"
+          visual_keywords: "clock ticking fast time lapse",
+          role: "progression" as const,
         },
         {
           text: "Master the opening hook, and watch your retention rates double immediately.",
-          visual_keywords: "city skyline drone sunset forward"
+          visual_keywords: "city skyline drone sunset forward",
+          role: "cta" as const,
         }
       ],
       title: "The 3-Second Hook That Grabs Anyone's Attention #shorts",
@@ -994,23 +1014,28 @@ function generateSmartScript(topic: string, _audience: string, _tone: string) {
     beats: [
       {
         text: `Here is the brutal truth about ${cleanTitle.slice(0, 32)} that nobody talks about.`,
-        visual_keywords: "person looking serious city street"
+        visual_keywords: "person looking serious city street",
+        role: "hook" as const,
       },
       {
         text: "Most people spend months overthinking and waiting for the perfect timing.",
-        visual_keywords: "clock ticking desk night laptop"
+        visual_keywords: "clock ticking desk night laptop",
+        role: "context" as const,
       },
       {
         text: "The real secret is aggressive simplicity: focus on just one daily high-leverage action.",
-        visual_keywords: "person writing notes notebook focused"
+        visual_keywords: "person writing notes notebook focused",
+        role: "main" as const,
       },
       {
         text: "Eliminate secondary distractions, track your streak publicly, and don't look back.",
-        visual_keywords: "person typing laptop night coffee"
+        visual_keywords: "person typing laptop night coffee",
+        role: "progression" as const,
       },
       {
         text: `Start today with ${cleanTitle.slice(0, 24)}. Consistency beats perfection every single time.`,
-        visual_keywords: "city skyline drone sunset forward"
+        visual_keywords: "city skyline drone sunset forward",
+        role: "cta" as const,
       }
     ],
     title: `${cleanTitle}: What Nobody Tells You #shorts`,
@@ -1026,7 +1051,7 @@ JSON shape:
 {
   "hook": "<first spoken line, <=12 words, must create curiosity or tension>",
   "beats": [
-    {"text": "<one sentence or short clause of voiceover>", "visual_keywords": "<2-4 word stock-footage search query matching this beat>"}
+    {"text": "<one sentence or short clause of voiceover>", "visual_keywords": "<2-4 word distinct stock-footage search query matching this beat>", "role": "hook|context|main|progression|cta"}
   ],
   "title": "<YouTube title, <=60 chars, punchy>",
   "description": "<1-2 sentence YouTube description>",
@@ -1034,11 +1059,11 @@ JSON shape:
 }
 
 Rules:
-- The hook IS the first beat's text as well — do not duplicate it separately in the spoken flow, just make beats[0].text equal to the hook.
+- The hook IS the first beat's text as well — do not duplicate it separately in the spoken flow, just make beats[0].text equal to the hook with role "hook".
 - Total spoken words across all beats must be between 75 and 130 (fits ~30-50s at natural speaking pace).
-- Total beats must be between 4 and 7 beats.
+- Total beats must be between 4 and 7 beats with a clear arc: hook -> context -> main -> progression -> cta.
 - Each beat is short (6-15 words) so it maps to one punchy visual clip.
-- visual_keywords must describe a concrete, filmable, stock-footage-searchable scene (e.g. "person typing laptop night", "city skyline sunrise drone", "alarm clock ringing", "coffee cup steam morning") — never abstract ("success", "growth").
+- visual_keywords MUST be distinct across beats and describe concrete, filmable, stock-footage-searchable scenes matching what is spoken in that beat — never repeat the same keywords or use abstract single words.
 - No emojis in spoken text. Hashtags must include YouTube Shorts-relevant tags plus 2 topic-specific ones.`;
 
 // ==========================================
@@ -1272,6 +1297,7 @@ const SAMPLE_PROJECT: any = {
         id: 'yt-beat-1',
         text: "Your time is limited, so don't waste it living someone else's life.",
         visual_keywords: 'focus inspiration speech leadership',
+        role: 'hook',
         start_s: 0.0,
         end_s: 5.5,
         video_url: '',
@@ -1281,6 +1307,7 @@ const SAMPLE_PROJECT: any = {
         id: 'yt-beat-2',
         text: "Don't be trapped by dogma, which is living with the results of other people's thinking.",
         visual_keywords: 'person walking city skyline focus',
+        role: 'context',
         start_s: 5.5,
         end_s: 12.0,
         video_url: '',
@@ -1290,6 +1317,7 @@ const SAMPLE_PROJECT: any = {
         id: 'yt-beat-3',
         text: "Don't let the noise of others' opinions drown out your own inner voice.",
         visual_keywords: 'calm moonlight reflection nature',
+        role: 'main',
         start_s: 12.0,
         end_s: 18.5,
         video_url: '',
@@ -1299,6 +1327,7 @@ const SAMPLE_PROJECT: any = {
         id: 'yt-beat-4',
         text: 'And most important, have the courage to follow your heart and intuition.',
         visual_keywords: 'sunrise city modern skyline goal',
+        role: 'progression',
         start_s: 18.5,
         end_s: 25.5,
         video_url: '',
@@ -1308,6 +1337,7 @@ const SAMPLE_PROJECT: any = {
         id: 'yt-beat-5',
         text: 'They somehow already know what you truly want to become. Everything else is secondary.',
         visual_keywords: 'success victory celebration team',
+        role: 'cta',
         start_s: 25.5,
         end_s: 33.0,
         video_url: '',
@@ -1326,7 +1356,8 @@ const SAMPLE_PROJECT: any = {
     strokeColor: '#000000',
     strokeWidth: 5,
     positionY: 68,
-    wordsPerChunk: 2,
+    wordsPerChunk: 5,
+    grouping: 'phrase',
     textTransform: 'uppercase',
     boxStyle: 'rounded-pill',
     badge: 'Hormozi Gold',
@@ -1386,7 +1417,13 @@ registerProjectRoutes(app, {
 // Optional, off by default (YOUTUBE_DOWNLOAD_ENABLED=true + yt-dlp): real YouTube footage for clips.
 const youTubeDownloads = registerYouTubeDownloadRoutes(app, { dataDir: DATA_DIR, rateLimit, uid, extractYouTubeId, parseRangeHeader });
 // Post-export quality gate: upload the exported reel → conform → evaluate → deliver (server/routes/quality.ts).
-const qualityRoutes = registerQualityRoutes(app, { dataDir: DATA_DIR, rateLimit, uid, maxUploadBytes: BODY_LIMITS.uploadBytes! });
+const qualityRoutes = registerQualityRoutes(app, {
+  dataDir: DATA_DIR,
+  rateLimit,
+  uid,
+  maxUploadBytes: BODY_LIMITS.uploadBytes!,
+  resolveGeminiApiKey: () => resolveGeminiApiKey() ?? null,
+});
 
 app.post('/api/projects/claim', rateLimit('projects-write', 60), async (req, res) => {
   if (req.identity?.kind !== 'firebase') {
@@ -1459,22 +1496,30 @@ function renderVideoWithFfmpeg(
   const fontPath = path.resolve(__dirname, 'assets/fonts/Poppins-Bold.ttf');
   const fontOpt = fs.existsSync(fontPath) ? `:fontfile='${fontPath}'` : '';
 
+  const beatPalettes = ['0x0f172a', '0x1e1b4b', '0x14262b', '0x2a1829', '0x1c1917', '0x0c2431'];
+  const sceneBackdrops = beats.map(
+    (b, idx) =>
+      `drawbox=x=0:y=0:w=iw:h=ih:color=${beatPalettes[idx % beatPalettes.length]}@1:t=fill:enable='between(t,${b.start_s.toFixed(2)},${b.end_s.toFixed(2)})'`,
+  );
   const filters = [
-    `drawtext=text='${title}'${fontOpt}:x=(w-text_w)/2:y=80:fontsize=${Math.round(width * 0.03)}:fontcolor=white@0.6:box=1:boxcolor=black@0.4:boxborderw=10`,
+    ...sceneBackdrops,
+    `drawtext=text='${title}'${fontOpt}:x=(w-text_w)/2:y=120:fontsize=${Math.round(width * 0.03)}:fontcolor=white@0.65:box=1:boxcolor=black@0.45:boxborderw=10`,
     ...beats.map(
       (b) =>
-        `drawtext=text='${b.text}'${fontOpt}:x=(w-text_w)/2:y=(h*0.68)-text_h/2:fontsize=${Math.round(width * 0.05)}:fontcolor=yellow:box=1:boxcolor=black@0.75:boxborderw=15:enable='between(t,${b.start_s.toFixed(2)},${b.end_s.toFixed(2)})'`,
+        `drawtext=text='${b.text}'${fontOpt}:x=(w-text_w)/2:y=(h*0.68)-text_h/2:fontsize=${Math.round(width * 0.048)}:fontcolor=yellow:box=1:boxcolor=black@0.75:boxborderw=15:enable='between(t,${b.start_s.toFixed(2)},${b.end_s.toFixed(2)})'`,
     ),
   ];
 
+  const cfrFlag = detectFfmpegCapabilities().hasFpsMode ? ['-fps_mode', 'cfr'] : ['-vsync', 'cfr'];
   // Argument array, no shell: user text cannot inject commands.
   const args = [
     '-y',
     '-f', 'lavfi', '-i', `color=c=0x0a0c10:s=${width}x${height}:d=${duration}:r=30`,
-    '-f', 'lavfi', '-i', `anullsrc=channel_layout=stereo:sample_rate=44100`,
+    '-f', 'lavfi', '-i', `anullsrc=channel_layout=stereo:sample_rate=48000`,
     '-vf', filters.join(','),
-    '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p',
-    '-c:a', 'aac', '-b:a', '128k',
+    '-c:v', 'libx264', '-preset', 'ultrafast', '-profile:v', 'high', '-pix_fmt', 'yuv420p',
+    ...cfrFlag,
+    '-c:a', 'aac', '-b:a', '192k', '-ar', '48000', '-ac', '2',
     '-movflags', '+faststart',
     '-t', String(duration),
     outputPath,
@@ -1973,39 +2018,35 @@ app.post('/api/stock-footage', rateLimit('stock', 60), async (req, res) => {
     }
   }
 
-  // 2. Curated royalty-free vertical video fallback matched to visual keywords
-  const qTokens = query.toLowerCase().split(/\s+/);
-  let bestMatch = FALLBACK_VERTICAL_VIDEOS[0];
-  let maxScore = -1;
-
-  for (const item of FALLBACK_VERTICAL_VIDEOS) {
+  // 2. Curated royalty-free vertical video fallback ranked across all candidates so multi-beat reels never repeat
+  const qTokens = query.toLowerCase().split(/\W+/).filter((t) => t.length > 2);
+  const scored = FALLBACK_VERTICAL_VIDEOS.map((item, idx) => {
     let score = 0;
     for (const token of qTokens) {
-      if (item.keywords.some(k => k.includes(token) || token.includes(k))) {
-        score += 2;
-      }
+      if (item.keywords.includes(token)) score += 3;
+      else if (item.keywords.some((k) => k.includes(token) || token.includes(k))) score += 1.5;
     }
-    if (score > maxScore) {
-      maxScore = score;
-      bestMatch = item;
-    }
-  }
+    // Mild preference for entries with direct video URLs on ties, without drowning out stronger topical matches.
+    if (item.url) score += 0.4;
+    return {
+      item,
+      score,
+      entry: {
+        id: `fallback-${idx}`,
+        url: item.url,
+        thumbnail: item.thumbnail,
+        duration: item.duration,
+        keywords: item.keywords,
+        width: 1080,
+        height: 1920,
+        isCuratedFallback: true,
+        relevanceScore: Math.round(score * 10) / 10,
+      },
+    };
+  }).sort((a, b) => b.score - a.score);
 
-  const results = FALLBACK_VERTICAL_VIDEOS.map((item, idx) => ({
-    id: `fallback-${idx}`,
-    url: item.url,
-    thumbnail: item.thumbnail,
-    duration: item.duration,
-    keywords: item.keywords,
-    width: 1080,
-    height: 1920,
-    isCuratedFallback: true,
-  }));
-
-  const sorted = [
-    { ...bestMatch, id: 'best-match', width: 1080, height: 1920 },
-    ...results.filter(r => r.thumbnail !== bestMatch.thumbnail)
-  ];
+  const bestMatch = scored[0]?.item || FALLBACK_VERTICAL_VIDEOS[0];
+  const sorted = scored.map((s, idx) => (idx === 0 ? { ...s.entry, id: 'best-match' } : s.entry));
 
   return res.json({
     results: sorted,
@@ -2145,6 +2186,26 @@ async function fetchYouTubeCaptions(videoId: string): Promise<Array<{ start_s: n
   return [];
 }
 
+// Validates raw 16-bit signed PCM TTS output so silent or corrupted buffers are never served as valid audio.
+function analyzePcm16Buffer(pcm: Buffer, sampleRate: number): { durationS: number; rmsDb: number; peakDb: number; isSilent: boolean } {
+  const sampleCount = Math.floor(pcm.length / 2);
+  if (sampleCount === 0) return { durationS: 0, rmsDb: -120, peakDb: -120, isSilent: true };
+  let sumSq = 0;
+  let peak = 0;
+  for (let i = 0; i < sampleCount; i++) {
+    const v = pcm.readInt16LE(i * 2) / 32768;
+    const abs = Math.abs(v);
+    if (abs > peak) peak = abs;
+    sumSq += v * v;
+  }
+  const rms = Math.sqrt(sumSq / sampleCount);
+  const rmsDb = rms > 1e-6 ? Math.round(20 * Math.log10(rms) * 10) / 10 : -120;
+  const peakDb = peak > 1e-6 ? Math.round(20 * Math.log10(peak) * 10) / 10 : -120;
+  const durationS = Math.round((sampleCount / sampleRate) * 100) / 100;
+  const isSilent = durationS < 0.1 || peakDb < -45 || rmsDb < -58;
+  return { durationS, rmsDb, peakDb, isSilent };
+}
+
 // ==========================================
 // AI: TEXT-TO-SPEECH
 // ==========================================
@@ -2172,18 +2233,33 @@ app.post('/api/tts', rateLimit('tts', 25, { ai: true }), async (req, res) => {
       );
       const audioPart = response.candidates?.[0]?.content?.parts?.find((p: any) => p.inlineData?.data);
       if (audioPart?.inlineData?.data) {
-        req.aiSucceeded = true;
-        llmMetrics.successes++;
-        llmMetrics.totalLatencyMs += Date.now() - started;
-        return res.json({
-          success: true,
-          audioData: audioPart.inlineData.data,
-          mimeType: audioPart.inlineData.mimeType || 'audio/pcm;rate=24000',
-          sampleRate: 24000,
-          voice: chosenVoice,
-        });
+        const mimeType = audioPart.inlineData.mimeType || 'audio/pcm;rate=24000';
+        const rateMatch = mimeType.match(/rate=(\d+)/i);
+        const sampleRate = rateMatch ? Number(rateMatch[1]) : 24000;
+        const rawBuf = Buffer.from(audioPart.inlineData.data, 'base64');
+        const isPcm = /pcm|l16/i.test(mimeType) || !/wav|mp3|ogg|mpeg/i.test(mimeType);
+        const analysis = isPcm ? analyzePcm16Buffer(rawBuf, sampleRate) : { durationS: 0, rmsDb: -20, peakDb: -6, isSilent: rawBuf.length < 256 };
+        if (analysis.isSilent) {
+          llmMetrics.failures++;
+          console.warn('[Gemini TTS] rejected silent/empty audio buffer:', analysis);
+        } else {
+          req.aiSucceeded = true;
+          llmMetrics.successes++;
+          llmMetrics.totalLatencyMs += Date.now() - started;
+          return res.json({
+            success: true,
+            audioData: audioPart.inlineData.data,
+            mimeType,
+            sampleRate,
+            voice: chosenVoice,
+            durationS: analysis.durationS,
+            rmsDb: analysis.rmsDb,
+            peakDb: analysis.peakDb,
+          });
+        }
+      } else {
+        llmMetrics.failures++;
       }
-      llmMetrics.failures++;
     } catch (err: any) {
       llmMetrics.failures++;
       console.warn('[Gemini TTS] failed, client will use browser speech synthesis:', err?.message || err);
@@ -2225,7 +2301,7 @@ Write the YouTube Short script now, strictly conforming to the schema. Treat eve
             type: Type.ARRAY,
             items: {
               type: Type.OBJECT,
-              properties: { text: { type: Type.STRING }, visual_keywords: { type: Type.STRING } },
+              properties: { text: { type: Type.STRING }, visual_keywords: { type: Type.STRING }, role: { type: Type.STRING } },
               required: ['text', 'visual_keywords'],
             },
           },

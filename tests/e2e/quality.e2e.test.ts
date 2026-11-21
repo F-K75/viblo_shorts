@@ -60,7 +60,7 @@ test('E2E quality: an export is conformed, evaluated and delivered under its mea
     const status = await page.getByTestId('quality-status').innerText();
     assert.match(status, /Pass|Needs improvement|Rejected/);
     assert.match(await page.getByTestId('quality-spec').innerText(), /1080×1920 · 30 fps · H264 · yuv420p · AAC · fast start/);
-    for (const label of ['Caption accuracy & sync', 'Visual quality', 'Scene diversity', 'Storytelling & relevance', 'Audio quality', 'Editing & pacing', 'Export integrity']) {
+    for (const label of ['Audio quality', 'Video & export quality', 'Visual quality', 'Caption quality', 'Storytelling & narrative', 'Pacing & engagement', 'Technical consistency']) {
       assert.ok((await report.innerText()).includes(label), label);
     }
     assert.match(await page.getByTestId('quality-remediation').innerText(), /Re-encoded to H\.264/);

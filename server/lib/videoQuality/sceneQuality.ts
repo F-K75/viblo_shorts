@@ -1,12 +1,12 @@
 import { hookFeatures } from '../youtube.ts';
 import { check, round, unmeasured } from './checks.ts';
-import type { Check, MediaFacts, Timeline, TimelineBeat } from './models.ts';
-import { repeatedShots, segmentShots, type Shot } from './similarity.ts';
+import type { AiCreativeReview, Check, MediaFacts, Timeline, TimelineBeat } from './models.ts';
+import type { Shot } from './similarity.ts';
 import type { Thresholds } from './thresholds.ts';
 import { tokens } from './captionQuality.ts';
 
 const STOP = new Set('the a an and or but so of to in on at for with is are was be it this that you your i we they my our'.split(' '));
-const CTA = /\b(comment|follow|subscribe|save|share|try (this|it)|tell me|drop a|link in|let me know|which one)\b/i;
+const CTA = /\b(comment|follow|subscribe|save|share|try (this|it)|tell me|drop a|link in|let me know|which one|start today|watch)\b/i;
 
 /** Beats merged into visual shots: consecutive beats on the same asset are one continuous shot. */
 export function timelineShots(beats: TimelineBeat[]): Array<{ start: number; end: number; asset: string; kind: TimelineBeat['kind'] }> {
@@ -27,102 +27,315 @@ function inferRole(i: number, n: number, text: string): NonNullable<TimelineBeat
   return i < n / 2 ? 'main' : 'progression';
 }
 
-/** Scene diversity: repetition, longest unchanged shot by scene type, distinct assets. */
-export function evaluateDiversity(media: MediaFacts | null, timeline: Timeline | null, th: Thresholds): { checks: Check[]; shots: Shot[] } {
-  const checks: Check[] = [];
-  const dur = media?.durationS || timeline?.durationS || 0;
-  const shots = media?.video ? segmentShots(dur, media.analysis.sceneCuts, media.analysis.frameHashes) : [];
-  if (media?.video) {
-    const reps = repeatedShots(shots);
-    const ratio = shots.length ? reps.length / shots.length : 0;
-    checks.push(check('diversity', 'repeated_shots', ratio <= th.maxRepeatRatio, ratio > 0.5 ? 'major' : 'minor',
-      `${reps.length} of ${shots.length} shots repeat an earlier shot.`, { shots: shots.length, repeats: reps.slice(0, 10) },
-      'Pick a different clip for repeated scenes (next search result or another query).'));
-  }
-  if (timeline) {
-    const tShots = timelineShots(timeline.beats);
-    const reused = tShots.filter((s, i) => !['source'].includes(String(s.kind)) && tShots.slice(0, Math.max(0, i - 1)).some((p) => p.asset === s.asset));
-    checks.push(check('diversity', 'asset_reuse', reused.length === 0, reused.length > tShots.length / 3 ? 'major' : 'minor',
-      `${reused.length} scene(s) reuse media already shown earlier.`, { reused: reused.slice(0, 10).map((s) => ({ at: round(s.start), asset: s.asset })) },
-      'Choose distinct footage per scene.'));
-    // Longest unchanged shot, by scene type. Media cuts (e.g. punch-ins) split timeline shots further.
-    let worst: { kind: string; length: number; limit: number; start: number } | null = null;
-    for (const s of tShots) {
-      const kind = (s.kind || 'broll') as keyof Thresholds['maxShotS'];
-      const limit = th.maxShotS[kind] ?? th.maxShotS.broll;
-      const cutsInside = media?.video ? media.analysis.sceneCuts.filter((c) => c > s.start + 0.3 && c < s.end - 0.3) : [];
-      const bounds = [s.start, ...cutsInside, s.end];
-      for (let i = 0; i < bounds.length - 1; i++) {
-        const len = bounds[i + 1] - bounds[i];
-        if (len > limit && (!worst || len - limit > worst.length - worst.limit)) worst = { kind, length: round(len, 1), limit, start: round(bounds[i]) };
-      }
+/**
+ * Storytelling and narrative evaluation (Weight: 15).
+ * Combines deterministic structural checks (3-second hook, narrative role arc, information progression,
+ * scene-to-script relevance, ending/CTA) with optional AI-assisted creative evaluation findings.
+ */
+export function evaluateStorytelling(timeline: Timeline | null, aiReview?: AiCreativeReview): Check[] {
+  if (!timeline || !timeline.beats.length) {
+    if (timeline && timeline.beats.length === 0) {
+      return [
+        check(
+          'storytelling',
+          'missing_scenes',
+          false,
+          'major',
+          'No script scenes present to form a story.',
+          { beatCount: 0 },
+          'Generate or write at least 3 scenes (hook, core insight, payoff/CTA).',
+        ),
+      ];
     }
-    // Graded: a little over the limit is minor; well over (1.5x+) is a major pacing defect.
-    checks.push(check('diversity', 'shot_length', !worst, worst && worst.length > worst.limit * 1.5 ? 'major' : 'minor',
-      worst ? `A ${worst.kind} shot runs ${worst.length} s unchanged at ${worst.start} s (limit ${worst.limit} s).` : 'No shot exceeds its length limit.',
-      { worst }, worst?.kind === 'source' ? 'Add framing changes (punch-ins) at sentence boundaries or a B-roll cut-away.' : 'Split the scene or add a second shot.'));
-  } else if (!media?.video) {
-    checks.push(unmeasured('diversity', 'shots', 'No media or timeline to measure.'));
+    return [unmeasured('storytelling', 'timeline', 'No scene plan supplied to evaluate narrative structure.')];
   }
-  return { checks, shots };
-}
 
-/** Storytelling proxies: hook, narrative roles, ending, visual relevance. Not a judgement of emotional impact. */
-export function evaluateStory(timeline: Timeline | null): Check[] {
-  if (!timeline || !timeline.beats.length) return [unmeasured('story', 'timeline', 'No scene plan to evaluate.')];
   const beats = timeline.beats;
   const n = beats.length;
   const checks: Check[] = [];
-  const hook = hookFeatures(beats[0].text);
-  checks.push(check('story', 'hook', hook.s >= 1, 'major', `Opening line: "${beats[0].text.slice(0, 80)}"`, { hookScore: hook.s, signals: hook.reasons },
-    'Open with a question, a number or a bold claim in the first two seconds.'));
+
+  // 1. First 3-second hook strength.
+  const hookBeat = beats[0];
+  const hook = hookFeatures(hookBeat.text);
+  const aiHook = aiReview?.mode === 'ai_assisted' ? aiReview.findings.find((f) => f.criterion === 'hook') : undefined;
+  const hookPassed = aiHook ? aiHook.passed && hook.s >= 0.5 : hook.s >= 1;
+  checks.push(
+    check(
+      'storytelling',
+      'hook',
+      hookPassed,
+      'major',
+      aiHook
+        ? `Opening hook (${aiHook.score}/100): ${aiHook.explanation}`
+        : `Opening hook (${round(hookBeat.end_s - hookBeat.start_s, 1)} s): "${hookBeat.text.slice(0, 80)}"`,
+      {
+        hookScore: aiHook ? aiHook.score : hook.s,
+        signals: hook.reasons,
+        openingDurationS: round(hookBeat.end_s - hookBeat.start_s, 1),
+        ...(aiHook ? { aiEvidence: aiHook.evidence, aiModel: aiReview?.model } : {}),
+      },
+      aiHook?.suggestion || 'Strengthen the first 3 seconds with a bold claim, sharp question, or surprising contrast.',
+    ),
+  );
+
+  // 2. Narrative continuity & role progression.
   const roles = beats.map((b, i) => b.role || inferRole(i, n, b.text));
   const has = (r: string) => roles.includes(r as any);
   const structureOk = n >= 3 && has('hook') && (has('main') || has('context')) && (has('cta') || has('progression'));
-  checks.push(check('story', 'structure', structureOk, 'major', `${n} scene(s); roles: ${roles.join(' → ')}.`,
-    { roles, inferred: beats.some((b) => !b.role) }, 'Plan hook → context → main point → progression → ending.'));
+  const aiCont = aiReview?.mode === 'ai_assisted' ? aiReview.findings.find((f) => f.criterion === 'narrative_continuity') : undefined;
+  checks.push(
+    check(
+      'storytelling',
+      'structure',
+      aiCont ? structureOk && aiCont.passed : structureOk,
+      'major',
+      aiCont
+        ? `Narrative progression (${aiCont.score}/100): ${aiCont.explanation}`
+        : `${n} scene(s) with arc: ${roles.join(' → ')}.`,
+      {
+        sceneCount: n,
+        roles,
+        inferred: beats.some((b) => !b.role),
+        ...(aiCont ? { aiEvidence: aiCont.evidence, aiModel: aiReview?.model } : {}),
+      },
+      aiCont?.suggestion || 'Structure at least 3–5 scenes: hook → context → core point → progression → ending/CTA.',
+    ),
+  );
+
+  // 3. Information progression (beats shouldn't repeat the same wording).
+  const beatTokenSets = beats.map((b) => new Set(tokens(b.text).filter((w) => !STOP.has(w))));
+  let redundantPairs = 0;
+  for (let i = 1; i < beatTokenSets.length; i++) {
+    const prev = beatTokenSets[i - 1];
+    const cur = beatTokenSets[i];
+    if (cur.size >= 3 && prev.size >= 3) {
+      let overlap = 0;
+      for (const w of cur) if (prev.has(w)) overlap++;
+      if (overlap / cur.size >= 0.75) redundantPairs++;
+    }
+  }
+  checks.push(
+    check(
+      'storytelling',
+      'information_progression',
+      redundantPairs === 0,
+      'minor',
+      redundantPairs === 0
+        ? 'Each scene introduces new information without repeating the previous line.'
+        : `${redundantPairs} adjacent scene pair(s) repeat almost the same wording.`,
+      { redundantPairs, scenes: n },
+      'Tighten repetitive lines so every beat advances the story.',
+    ),
+  );
+
+  // 4. Ending quality & CTA presence.
   const last = beats[n - 1];
-  const strongEnd = /[.!?]["')\]]?$/.test(last.text.trim()) && last.end_s - last.start_s >= 1.2;
-  checks.push(check('story', 'ending', strongEnd, 'minor', `Ending: "${last.text.slice(0, 80)}"`, { cta: CTA.test(last.text), lastSceneS: round(last.end_s - last.start_s) },
-    'End on a complete sentence with a takeaway or call to action.'));
-  // Relevance: do the visuals described for a scene relate to what is said? (keyword overlap; source footage is the speaker)
+  const strongEnd = /[.!?]["')\]]?$/.test(last.text.trim()) && last.end_s - last.start_s >= 1.1;
+  const aiEnd = aiReview?.mode === 'ai_assisted' ? aiReview.findings.find((f) => f.criterion === 'ending_cta') : undefined;
+  checks.push(
+    check(
+      'storytelling',
+      'ending',
+      aiEnd ? strongEnd && aiEnd.passed : strongEnd,
+      'minor',
+      aiEnd
+        ? `Ending & CTA (${aiEnd.score}/100): ${aiEnd.explanation}`
+        : `Ending (${CTA.test(last.text) ? 'includes CTA' : 'takeaway'}): "${last.text.slice(0, 80)}"`,
+      {
+        ctaPresent: CTA.test(last.text),
+        lastSceneS: round(last.end_s - last.start_s),
+        ...(aiEnd ? { aiEvidence: aiEnd.evidence, aiModel: aiReview?.model } : {}),
+      },
+      aiEnd?.suggestion || 'Close on a crisp takeaway or call-to-action that rewards watching to the end.',
+    ),
+  );
+
+  // 5. Scene-to-script creative relevance (AI finding if present, else deterministic keyword proxy).
+  const aiRel = aiReview?.mode === 'ai_assisted' ? aiReview.findings.find((f) => f.criterion === 'visual_relevance') : undefined;
   const judged = beats.filter((b) => b.kind !== 'source' && b.visual_keywords);
-  if (!judged.length) checks.push(unmeasured('story', 'relevance', 'Scenes show the source footage (the speaker), so visual relevance is inherent.'));
-  else {
+  if (aiRel) {
+    checks.push(
+      check(
+        'storytelling',
+        'relevance',
+        aiRel.passed,
+        'minor',
+        `Visual-to-script relevance (${aiRel.score}/100): ${aiRel.explanation}`,
+        { aiEvidence: aiRel.evidence, aiModel: aiReview?.model },
+        aiRel.suggestion || 'Match each scene visual to the exact concept being narrated.',
+      ),
+    );
+  } else if (!judged.length) {
+    checks.push(unmeasured('storytelling', 'relevance', 'Source-footage speaker scenes have inherent visual relevance.'));
+  } else {
     const unrelated = judged.filter((b) => {
       const said = new Set(tokens(b.text).filter((w) => !STOP.has(w)).map((w) => w.slice(0, 5)));
       return !tokens(b.visual_keywords || '').some((w) => said.has(w.slice(0, 5)));
     });
     const ratio = unrelated.length / judged.length;
-    checks.push(check('story', 'relevance', ratio <= 0.5, 'minor', `${unrelated.length} of ${judged.length} scenes have visuals with no word in common with what is said.`,
-      { unrelated: unrelated.slice(0, 6).map((b) => ({ text: b.text.slice(0, 60), visual: b.visual_keywords })), method: 'keyword overlap (proxy)' },
-      'Describe visuals using the scene\'s own nouns.'));
+    checks.push(
+      check(
+        'storytelling',
+        'relevance',
+        ratio <= 0.5,
+        'minor',
+        `${unrelated.length} of ${judged.length} scenes have visual keywords with no overlap against narration.`,
+        { unrelated: unrelated.slice(0, 6).map((b) => ({ text: b.text.slice(0, 60), visual: b.visual_keywords })), method: 'keyword_overlap' },
+        'Describe visuals using the concrete subjects in each spoken sentence.',
+      ),
+    );
   }
+
   return checks;
 }
 
-/** Editing and pacing: shot length distribution, speech rate, mid-reel blackouts, transitions. */
-export function evaluateEditing(media: MediaFacts | null, timeline: Timeline | null, shots: Shot[], th: Thresholds): Check[] {
+/**
+ * Pacing and engagement evaluation (Weight: 10).
+ * Evaluates visual shot cadence, speech rate (words/sec), mid-reel blackout gaps, and scene pacing.
+ */
+export function evaluatePacing(media: MediaFacts | null, timeline: Timeline | null, shots: Shot[], th: Thresholds): Check[] {
   const checks: Check[] = [];
-  const lengths = shots.length ? shots.map((s) => s.end - s.start) : timeline ? timelineShots(timeline.beats).map((s) => s.end - s.start) : [];
-  if (!lengths.length) return [unmeasured('editing', 'shots', 'No shots to evaluate.')];
+  const lengths = shots.length
+    ? shots.map((s) => s.end - s.start)
+    : timeline && timeline.beats.length
+      ? timelineShots(timeline.beats).map((s) => s.end - s.start)
+      : [];
+
+  if (!lengths.length) return [unmeasured('pacing', 'shots', 'No shots or scenes available to evaluate pacing.')];
+
   const mean = lengths.reduce((a, b) => a + b, 0) / lengths.length;
   const [lo, hi] = th.idealShotS;
-  const sourceOnly = timeline?.beats.every((b) => b.kind === 'source');
-  checks.push(check('editing', 'shot_pacing', mean >= lo && mean <= (sourceOnly ? th.maxShotS.source : hi), 'minor',
-    `Average shot ${round(mean, 1)} s over ${lengths.length} shot(s).`, { meanS: round(mean), shots: lengths.length, ideal: [lo, sourceOnly ? th.maxShotS.source : hi] },
-    mean > hi ? 'Cut more often: change framing or footage every few seconds.' : 'Hold shots a little longer.'));
-  if (timeline) {
+  const sourceOnly = Boolean(timeline?.beats.length && timeline.beats.every((b) => b.kind === 'source'));
+  const maxMean = sourceOnly ? th.maxShotS.source : hi;
+  checks.push(
+    check(
+      'pacing',
+      'shot_pacing',
+      mean >= lo && mean <= maxMean,
+      mean > maxMean * 1.6 ? 'major' : 'minor',
+      `Average shot length ${round(mean, 1)} s across ${lengths.length} shot(s) (ideal ${lo}–${maxMean} s).`,
+      { meanS: round(mean), shots: lengths.length, ideal: [lo, maxMean] },
+      mean > maxMean ? 'Tighten scene durations or add visual cuts every 2–5 seconds to maintain retention.' : 'Hold shots slightly longer so viewers can process each visual.',
+    ),
+  );
+
+  if (timeline && timeline.durationS > 0) {
     const words = tokens(timeline.scriptText).length;
-    const wps = timeline.durationS ? words / timeline.durationS : 0;
+    const wps = words / timeline.durationS;
     const [wlo, whi] = th.speechWpsRange;
-    checks.push(check('editing', 'speech_rate', wps >= wlo && wps <= whi, 'minor', `${round(wps, 1)} words per second.`, { wps: round(wps), range: th.speechWpsRange },
-      wps < wlo ? 'Tighten pauses; the reel drags.' : 'Too dense to read; shorten the script or extend the reel.'));
+    checks.push(
+      check(
+        'pacing',
+        'speech_rate',
+        wps >= wlo && wps <= whi,
+        'minor',
+        `Speech cadence: ${round(wps, 1)} words/sec (ideal ${wlo}–${whi} words/sec).`,
+        { wps: round(wps), words, durationS: round(timeline.durationS), range: th.speechWpsRange },
+        wps < wlo ? 'Tighten pauses and trim filler; pacing feels slow.' : 'Script is too dense; trim words or extend scene durations.',
+      ),
+    );
   }
+
   if (media?.video) {
-    const mid = media.analysis.blackSegments.filter((b) => b.start > 0.3 && (Number.isFinite(b.end) ? b.end : media.durationS) < media.durationS - 0.3);
-    checks.push(check('editing', 'continuity', mid.length === 0, 'major', `${mid.length} black gap(s) between scenes.`, { gaps: mid.slice(0, 6) }, 'A scene failed to load; replace its media.'));
+    const mid = media.analysis.blackSegments.filter(
+      (b) => b.start > 0.3 && (Number.isFinite(b.end) ? b.end : media.durationS) < media.durationS - 0.3,
+    );
+    checks.push(
+      check(
+        'pacing',
+        'continuity',
+        mid.length === 0,
+        'major',
+        mid.length === 0 ? 'No mid-reel black gaps between scenes.' : `${mid.length} black gap(s) interrupt pacing between scenes.`,
+        { gaps: mid.slice(0, 6) },
+        'Replace broken scene media so transitions stay continuous.',
+      ),
+    );
   }
-  checks.push(unmeasured('editing', 'transitions', 'Transitions are hard cuts throughout (consistent by construction).'));
+
+  return checks;
+}
+
+/**
+ * Technical consistency evaluation (Weight: 10).
+ * Evaluates effective distinct frame rate, bitrate adequacy, audio sample rate/channels,
+ * and video/audio stream timestamp start alignment.
+ */
+export function evaluateTechnical(media: MediaFacts | null, timeline: Timeline | null, th: Thresholds): Check[] {
+  if (!media || !media.video) {
+    return [unmeasured('technical', 'streams', 'Technical consistency requires a valid video file.')];
+  }
+  const checks: Check[] = [];
+  const targetFps = timeline?.target?.fps || th.spec.fps;
+
+  // 1. Distinct/effective FPS (detects dropped/duplicated encoder frames).
+  if (media.analysis.effectiveFps === null) {
+    checks.push(unmeasured('technical', 'dropped_frames', 'Distinct frame rate could not be measured.'));
+  } else {
+    const ratio = media.analysis.effectiveFps / (targetFps || 30);
+    checks.push(
+      check(
+        'technical',
+        'dropped_frames',
+        ratio >= th.minEffectiveFpsRatio,
+        ratio < 0.3 ? 'major' : 'minor',
+        `${media.analysis.effectiveFps} distinct fps (${Math.round(ratio * 100)}% of ${targetFps} fps target).`,
+        { effectiveFps: media.analysis.effectiveFps, targetFps, ratio: round(ratio, 2) },
+        'Keep the browser tab focused during export or switch to 720p on slower hardware.',
+      ),
+    );
+  }
+
+  // 2. Video bitrate adequacy (avoid severely starved low-bitrate mush on 1080p).
+  if (media.video.bitrate) {
+    const kbps = Math.round(media.video.bitrate / 1000);
+    const minKbps = media.video.width >= 1000 ? th.minVideoBitrateKbps : Math.round(th.minVideoBitrateKbps * 0.5);
+    checks.push(
+      check(
+        'technical',
+        'video_bitrate',
+        kbps >= minKbps,
+        'minor',
+        `Video bitrate: ${kbps} kbps (minimum ${minKbps} kbps).`,
+        { kbps, minKbps },
+        'Increase encoding bitrate or re-conform with CRF 18.',
+      ),
+    );
+  }
+
+  // 3. Audio sample rate & channel consistency.
+  if (media.audio) {
+    const srOk = media.audio.sampleRate >= th.spec.minAudioSampleRate && media.audio.channels >= 1;
+    checks.push(
+      check(
+        'technical',
+        'audio_format',
+        srOk,
+        'minor',
+        `Audio stream: ${media.audio.sampleRate} Hz, ${media.audio.channels} ch.`,
+        { sampleRate: media.audio.sampleRate, channels: media.audio.channels, minSampleRate: th.spec.minAudioSampleRate },
+        'Conform audio to 48 kHz AAC for consistent cross-platform playback.',
+      ),
+    );
+  }
+
+  // 4. Stream PTS start-time consistency.
+  if (media.audio) {
+    const vStart = media.video.startTimeS ?? 0;
+    const aStart = media.audio.startTimeS ?? 0;
+    const offset = Math.abs(vStart - aStart);
+    checks.push(
+      check(
+        'technical',
+        'stream_timestamps',
+        offset <= th.maxStreamStartOffsetS,
+        'major',
+        `Stream start timestamps: video ${round(vStart, 3)} s, audio ${round(aStart, 3)} s (offset ${round(offset, 3)} s).`,
+        { videoStartS: round(vStart, 3), audioStartS: round(aStart, 3), offsetS: round(offset, 3) },
+        'Remux with synchronized stream timestamps starting at 0.0 s.',
+      ),
+    );
+  }
+
   return checks;
 }

@@ -52,10 +52,11 @@ describe('buildContentSecurityPolicy', () => {
     assert.doesNotMatch(prod, /\*\.|\bws:|\bwss:|https:(?=\s|;|$)/);
   });
 
-  test('development relaxes only what the Vite dev server needs', () => {
+  test('development relaxes only what the Vite dev server and preview iframe need', () => {
     const dev = buildContentSecurityPolicy({ mode: 'development' });
     assert.ok(directive(dev, 'script-src')?.includes("'unsafe-inline'"));
     assert.ok(directive(dev, 'connect-src')?.includes('ws:'));
+    assert.deepEqual(directive(dev, 'frame-ancestors'), ['*']);
     assert.doesNotMatch(dev, /unsafe-eval/);
   });
 
