@@ -1,0 +1,43 @@
+{
+  "schema_version": "1.0",
+  "project_id": "media_subtitles_01",
+  "format": "square_social",
+  "resolution": {
+    "width": 1080,
+    "height": 1080
+  },
+  "fps": 30,
+  "duration_seconds": 6,
+  "tracks": {
+    "video": [
+      {
+        "asset_id": "asset_ffffffffffffffffffffffffffffffff",
+        "start": 0,
+        "end": 6,
+        "source_start": 0,
+        "source_end": 6,
+        "fit_mode": "cover"
+      }
+    ],
+    "audio": [],
+    "subtitles": [
+      {
+        "format": "inline",
+        "burn_in": true,
+        "font_size": 42,
+        "margin_v": 120,
+        "cues": [
+          { "start": 0.2, "end": 2.8, "text": "Stop scrolling: 3 tips for crisp audio." },
+          { "start": 3.0, "end": 5.8, "text": "Normalized to -16 LUFS automatically." }
+        ]
+      }
+    ]
+  },
+  "export": {
+    "container": "mp4",
+    "video_codec": "libx264",
+    "audio_codec": "aac",
+    "pixel_format": "yuv420p",
+    "video_bitrate": "6M"
+  }
+}

@@ -44,6 +44,10 @@ import { MemoryGuard, computeMemoryBudget, containerMemoryLimitBytes, createBody
 import { registerHealthRoutes } from './server/routes/health.ts';
 import { registerAuthRoutes } from './server/routes/auth.ts';
 import { registerProjectRoutes } from './server/routes/projects.ts';
+import { registerMediaRoutes } from './server/routes/media.ts';
+import { createMediaEngineConfig } from './server/media_engine/config.ts';
+import { JsonMediaMetadataStore, PostgresMediaMetadataStore } from './server/media_engine/mediaStore.ts';
+import { MediaProductionOrchestrator, type QueuedMediaRenderPayload } from './server/agents/media/orchestrator.ts';
 
 dotenv.config();
 
@@ -221,9 +225,20 @@ const CAPTCHA = (() => {
 const captchaVerifier: CaptchaVerifier | null = CAPTCHA.required ? new TurnstileVerifier(CAPTCHA) : null;
 const INSTANCE_ID = `${os.hostname()}:${process.pid}:${crypto.randomBytes(3).toString('hex')}`;
 let repo: Repo; // assigned in initStorage() before the server listens
+let mediaOrchestrator: MediaProductionOrchestrator;
 let jsonMigrationNote = '';
 
+async function generateMediaAgentCompletion(prompt: string): Promise<string | null> {
+  // Enforce daily AI quota reservation: only invoke Gemini when inside a `{ ai: true }` rate-limited context.
+  if (!aiCallContext.getStore()) return null;
+  const aiClient = getGeminiClient();
+  if (!aiClient) return null;
+  const resp = await generateGeminiContentWithFallback(aiClient, { contents: prompt }, 'media-director');
+  return resp?.response?.text ?? null;
+}
+
 async function initStorage(): Promise<void> {
+  const mediaCfg = createMediaEngineConfig({ dataDir: DATA_DIR });
   if (STORAGE_BACKEND === 'json') {
     // J1 invariant: never open the JSON stores while a snapshot restore is running or was interrupted. These must
     // stay the FIRST statements of this branch, before JsonRepo touches any file. The lock is written first and the
@@ -241,6 +256,7 @@ async function initStorage(): Promise<void> {
     if (report.migrated) jsonMigrationNote = ` (migrated ${report.records} from legacy file; snapshot ${report.snapshot})`;
     if (!r.ledger.available) console.error(JSON.stringify({ level: 'error', event: 'usage_ledger_unavailable', reason: r.ledger.reason }));
     repo = r;
+    mediaOrchestrator = new MediaProductionOrchestrator(mediaCfg, new JsonMediaMetadataStore(DATA_DIR), generateMediaAgentCompletion);
     return;
   }
   const pool = createPool(DATABASE_URL, { applicationName: `forge-studio:${INSTANCE_ID}` });
@@ -261,6 +277,7 @@ async function initStorage(): Promise<void> {
     }
   }
   repo = new PostgresRepo(pool, STORE_LIMITS);
+  mediaOrchestrator = new MediaProductionOrchestrator(mediaCfg, new PostgresMediaMetadataStore(pool), generateMediaAgentCompletion);
 }
 
 const authService = new AuthService(
@@ -299,7 +316,7 @@ function forwardErrors(fn: (...a: any[]) => any) {
     }
   };
 }
-for (const method of ['use', 'get', 'post', 'delete'] as const) {
+for (const method of ['use', 'get', 'post', 'put', 'patch', 'delete'] as const) {
   const original = (app as any)[method].bind(app);
   (app as any)[method] = (...args: any[]) =>
     original(...args.map((a) => (typeof a === 'function' && a.length < 4 && !(a as any).handle ? forwardErrors(a) : a)));
@@ -396,7 +413,13 @@ app.use('/api', async (req, res, next) => {
   } catch {
     req.identity = null;
   }
-  if (PUBLIC_API.has(req.baseUrl + req.path) || req.path.startsWith('/render/download/')) return next();
+  if (
+    PUBLIC_API.has(req.baseUrl + req.path) ||
+    req.path.startsWith('/render/download/') ||
+    /^\/v1\/media\/artifacts\/artifact_[a-f0-9]{32}\/download$/.test(req.path)
+  ) {
+    return next();
+  }
   if (!req.identity) {
     // The body is never parsed or buffered for an anonymous request (Node discards what the client still sends).
     return res.status(401).json({ error: 'Authentication required. Please sign in or continue as guest.', code: 'unauthenticated' });
@@ -1084,7 +1107,7 @@ registerHealthRoutes(app, {
   headersTimeoutMs: HEADERS_TIMEOUT_MS,
   requestTimeoutMs: REQUEST_TIMEOUT_MS,
   llmMetrics,
-  getRunningRendersCount: () => runningRenders.size,
+  getRunningRendersCount: () => runningRenders.size + activeMediaRenders.size,
   instanceId: INSTANCE_ID,
   dataDir: DATA_DIR,
   mb: MB,
@@ -1381,6 +1404,7 @@ app.post('/api/projects/claim', rateLimit('projects-write', 60), async (req, res
 // ==========================================
 const RENDER_JOB_TYPES = new Set(['render_video', 'render_short']);
 const runningRenders = new Map<string, ChildProcess>(); // key: job id or direct render id (this instance only)
+const activeMediaRenders = new Map<string, AbortController>(); // key: media_render job id across full lifecycle (validate -> encode -> QA -> publish)
 const HEARTBEAT_MS = envNum('JOB_HEARTBEAT_MS', 1000, 100);
 const JOB_STALE_MS = envNum('JOB_STALE_MS', 30000, 1000);
 
@@ -1535,7 +1559,7 @@ async function pumpRenderQueue() {
   if (workerPumping || workerStopped) return;
   workerPumping = true;
   try {
-    while (!workerStopped && runningRenders.size + workerStarting < MAX_CONCURRENT_RENDERS) {
+    while (!workerStopped && runningRenders.size + activeMediaRenders.size + workerStarting < MAX_CONCURRENT_RENDERS) {
       workerStarting++;
       let job: ServerJob | null = null;
       try {
@@ -1558,10 +1582,9 @@ async function pumpRenderQueue() {
 }
 
 async function executeRenderJob(job: ServerJob, started: () => void) {
-  const params = normalizeRenderParams(job.payload);
-  const renderId = newRenderId();
   let stopped: 'cancelled' | 'lost' | null = null;
   let startedSignalled = false;
+  const abortCtrl = new AbortController();
   const signalStarted = () => {
     if (!startedSignalled) {
       startedSignalled = true;
@@ -1575,7 +1598,9 @@ async function executeRenderJob(job: ServerJob, started: () => void) {
       .then((r) => {
         if (r !== 'ok' && !stopped) {
           stopped = r;
+          abortCtrl.abort();
           runningRenders.get(job.id)?.kill('SIGKILL');
+          mediaOrchestrator?.executor.cancel(job.id);
         }
       })
       .catch(() => {
@@ -1584,6 +1609,84 @@ async function executeRenderJob(job: ServerJob, started: () => void) {
   }, HEARTBEAT_MS);
   hb.unref();
   try {
+    if (job.type === 'media_render') {
+      const mediaPayload = job.payload as QueuedMediaRenderPayload;
+      // Register synchronously BEFORE signalStarted() so MAX_CONCURRENT_RENDERS holds across validation, encoding, and QA.
+      activeMediaRenders.set(job.id, abortCtrl);
+      try {
+        const mediaTask = mediaOrchestrator.executeQueuedRenderJob({
+          jobId: job.id,
+          payload: mediaPayload,
+          signal: abortCtrl.signal,
+          onProgress: (pct, stage) => {
+            job.progress = pct;
+            job.stepMessage = stage;
+          },
+        });
+        signalStarted();
+        const mediaResult = await mediaTask;
+        if (stopped) {
+          try {
+            const p = mediaOrchestrator.storage.resolveArtifactPath(mediaResult.artifact);
+            fs.rmSync(p, { force: true });
+          } catch {
+            // ignore
+          }
+          return;
+        }
+        const doneMedia: ServerJob = {
+          ...job,
+          status: 'completed',
+          progress: 100,
+          stepMessage: 'completed',
+          completedAt: new Date().toISOString(),
+          error: undefined,
+          result: {
+            stage: 'completed',
+            artifact_id: mediaResult.artifact.id,
+            downloadUrl: mediaResult.artifact.downloadUrl,
+            duration: mediaResult.artifact.durationSeconds,
+            resolution: mediaResult.artifact.resolution,
+            codec: mediaResult.artifact.codec,
+            qa_score: mediaResult.qaReport.total_score,
+            repaired: mediaResult.repaired,
+            applied_fixes: mediaResult.appliedFixes,
+            output_contract: mediaResult.outputContract,
+          },
+        };
+        let completedMedia = false;
+        try {
+          completedMedia = await repo.completeJob(
+            doneMedia,
+            INSTANCE_ID,
+            mediaResult.artifact.durationSeconds,
+            defaultStoredSubscription(),
+          );
+        } catch (err: any) {
+          const now = await repo.getJob(job.id).catch(() => null);
+          if (now?.status === 'completed') return;
+          try {
+            fs.rmSync(mediaOrchestrator.storage.resolveArtifactPath(mediaResult.artifact), { force: true });
+          } catch {
+            // ignore
+          }
+          throw new Error(`The media render finished but could not be recorded: ${String(err?.message || err)}`);
+        }
+        if (!completedMedia) {
+          try {
+            fs.rmSync(mediaOrchestrator.storage.resolveArtifactPath(mediaResult.artifact), { force: true });
+          } catch {
+            // ignore
+          }
+        }
+        return;
+      } finally {
+        activeMediaRenders.delete(job.id);
+      }
+    }
+
+    const params = normalizeRenderParams(job.payload);
+    const renderId = newRenderId();
     const render = renderVideoWithFfmpeg(renderId, params, job.id, (pct, msg) => {
       job.progress = pct;
       job.stepMessage = msg;
@@ -1621,6 +1724,16 @@ async function executeRenderJob(job: ServerJob, started: () => void) {
     signalStarted();
     // Cancelled/reassigned, or this instance is shutting down (the shutdown hands the job back to the queue).
     if (stopped || workerStopped) return;
+    if (job.type === 'media_render') {
+      mediaOrchestrator?.events.publish({
+        eventType: 'media.render.failed',
+        tenantId: job.userId,
+        projectId: String(job.payload?.projectId || 'workspace'),
+        jobId: job.id,
+        stage: 'failed',
+        payload: { error: err?.message || 'Render failed', code: err?.code },
+      });
+    }
     const failed: ServerJob = { ...job, status: 'failed', error: err?.message || 'Render failed', stepMessage: `Failed: ${err?.message || 'Render failed'}`, completedAt: new Date().toISOString() };
     try {
       await repo.finishJob(failed, INSTANCE_ID);
@@ -1786,6 +1899,8 @@ app.post('/api/jobs/:id/cancel', rateLimit('jobs-write', 60), async (req, res) =
   if (!cancelled) return res.status(409).json({ error: `Cannot cancel a job that is ${(await repo.getJob(job.id))?.status ?? job.status}` });
   // Stop the encoder now if it runs here; another instance stops it on its next heartbeat.
   runningRenders.get(job.id)?.kill('SIGKILL');
+  activeMediaRenders.get(job.id)?.abort();
+  mediaOrchestrator?.executor.cancel(job.id);
   res.json({ success: true, job: publicJob(cancelled) });
 });
 
@@ -2739,6 +2854,22 @@ app.post('/api/voice-to-text/align-words', rateLimit('voice-align', 60), (req, r
   res.json({ success: true, isEstimated: true, source: 'estimated_from_text', beats, words });
 });
 
+registerMediaRoutes(app, {
+  rateLimit,
+  uid,
+  isAdmin,
+  refuseGuestRender,
+  getRepo: () => repo,
+  getOrchestrator: () => mediaOrchestrator,
+  buildJobAdmission: async (userId, durationS) => jobAdmission(await getUserSubscription(userId), durationS),
+  sendDenial,
+  pumpRenderQueue: () => void pumpRenderQueue(),
+  cancelRunningProcess: (jobId) => {
+    runningRenders.get(jobId)?.kill('SIGKILL');
+    activeMediaRenders.get(jobId)?.abort();
+  },
+});
+
 // Unknown API routes: JSON 404 rather than falling through to the SPA HTML.
 app.use('/api', (_req, res) => {
   res.status(404).json({ error: 'Not found' });
@@ -2896,8 +3027,15 @@ export async function startServer(): Promise<Server> {
     for (const t of timers) clearInterval(t);
     // Renders running here cannot finish. A shutdown (deploy, scale-in) is not the job's fault: hand each job back
     // to the queue now (attempt not counted) so another instance renders it, instead of failing it (Track B, B7).
-    const interrupted = [...runningRenders.keys()].filter((k) => k.startsWith('job_'));
+    const interrupted = Array.from(
+      new Set([
+        ...[...runningRenders.keys()].filter((k) => k.startsWith('job_') || k.startsWith('render_')),
+        ...activeMediaRenders.keys(),
+        ...(mediaOrchestrator ? mediaOrchestrator.executor.cancelAll() : []),
+      ]),
+    );
     for (const proc of runningRenders.values()) proc.kill('SIGKILL');
+    for (const ctrl of activeMediaRenders.values()) ctrl.abort();
     await Promise.allSettled(
       interrupted.map(async (id) => {
         if (await repo.releaseJob(id, INSTANCE_ID)) console.warn(JSON.stringify({ level: 'warn', event: 'render_job_released_on_shutdown', jobId: id }));

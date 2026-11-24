@@ -1,6 +1,8 @@
 # dependencies / build output
+node_modules
 node_modules/
 dist/
+tests/fixtures/media/
 
 # runtime data (user projects, jobs, subscriptions, renders, session secret) — never commit
 data/

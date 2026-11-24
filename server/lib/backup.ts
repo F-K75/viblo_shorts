@@ -33,6 +33,7 @@ export const STORE_ENTRIES = [
   'jobs.json',
   'subscriptions.json',
   'usage.json',
+  'media_metadata.json',
 ] as const;
 
 export interface ManifestFile {

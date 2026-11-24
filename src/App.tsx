@@ -47,6 +47,7 @@ import { AuthPage, AuthUser } from './components/AuthPage';
 import { StudioPage1Source } from './components/StudioPage1Source';
 import { StudioPage2ClipStrategies } from './components/StudioPage2ClipStrategies';
 import { StudioPage3CanvasTimeline } from './components/StudioPage3CanvasTimeline';
+import { MediaStudioWorkspace } from './components/MediaStudioWorkspace';
 import { StockPickerModal } from './components/StockPickerModal';
 import { GoogleDriveExportModal } from './components/GoogleDriveExportModal';
 import { BillingModal } from './components/BillingModal';
@@ -113,8 +114,8 @@ export const App: React.FC = () => {
     }
   });
 
-  // Studio Progressive 3-Page Flow: 1: Source & Idea -> 2: Clip Strategies & Trimmer -> 3: Studio Canvas & Timeline
-  const [studioStep, setStudioStep] = useState<1 | 2 | 3>(1);
+  // Studio Progressive Flow: 1: Source & Idea -> 2: Clip Strategies & Trimmer -> 3: Studio Canvas & Timeline -> 4: Forge Media Engine
+  const [studioStep, setStudioStep] = useState<1 | 2 | 3 | 4>(1);
 
   const [creationMode, setCreationMode] = useState<'youtube' | 'prompt'>('youtube');
   const [topic, setTopic] = useState("Steve Jobs' 2005 Stanford Commencement Address");
@@ -1023,6 +1024,19 @@ export const App: React.FC = () => {
               </span>
               <span>Canvas & Timeline</span>
             </button>
+
+            {/* Step 4: Native FFmpeg Media Studio */}
+            <button
+              onClick={() => setStudioStep(4)}
+              className={`px-3 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 transition ${
+                studioStep === 4
+                  ? 'bg-rose-600 text-white font-semibold shadow-sm'
+                  : 'text-neutral-400 hover:text-white'
+              }`}
+            >
+              <Layers className="w-3.5 h-3.5" />
+              <span>Media Engine</span>
+            </button>
           </nav>
 
           {/* User Profile & Actions */}
@@ -1146,7 +1160,7 @@ export const App: React.FC = () => {
           </div>
 
           <div className="flex items-center gap-2 text-[11px] text-neutral-500 shrink-0">
-            <span>Stage: {studioStep === 1 ? '1. Source & Idea' : studioStep === 2 ? '2. Clip Strategies & Trimmer' : '3. Studio Canvas & Timeline'}</span>
+            <span>Stage: {studioStep === 1 ? '1. Source & Idea' : studioStep === 2 ? '2. Clip Strategies & Trimmer' : studioStep === 3 ? '3. Studio Canvas & Timeline' : '4. Forge Media Studio'}</span>
             <span aria-hidden="true">·</span>
             <span className={currentProjectId && currentProjectId !== SAMPLE_PROJECT_ID ? 'text-emerald-400 font-mono' : 'text-neutral-500 font-mono'}>
               {currentProjectId && currentProjectId !== SAMPLE_PROJECT_ID ? 'Saved project' : 'Not saved yet'}
@@ -1265,6 +1279,8 @@ export const App: React.FC = () => {
             onChangeVisualMode={setVisualMode}
           />
         )}
+
+        {studioStep === 4 && <MediaStudioWorkspace />}
       </main>
 
       {/* Stock Video Picker Modal */}

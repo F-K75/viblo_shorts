@@ -26,9 +26,10 @@ COPY --from=prod-deps /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
 COPY package.json server.ts firebase-applet-config.json ./
 COPY server ./server
+COPY skills ./skills
 COPY scripts/backup.ts scripts/data-migration.ts ./scripts/
 COPY assets ./assets
-RUN mkdir -p /data && chown -R node:node /data /app
+RUN mkdir -p /data/media && chown -R node:node /data
 USER node
 VOLUME ["/data"]
 EXPOSE 3000

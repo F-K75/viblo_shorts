@@ -1,0 +1,41 @@
+import type { ExportPreset } from '../models.ts';
+
+export const SQUARE_SOCIAL_PRESET: ExportPreset = {
+  id: 'square_social',
+  name: 'Square Social',
+  aspectRatio: '1:1',
+  width: 1080,
+  height: 1080,
+  fps: 30,
+  container: 'mp4',
+  videoCodec: 'libx264',
+  allowedVideoCodecs: ['libx264'],
+  audioCodec: 'aac',
+  pixelFormat: 'yuv420p',
+  videoBitrate: '6M',
+  audioBitrate: '192k',
+  crfByQuality: { draft: 26, standard: 22, high: 19 },
+  ffmpegPresetByQuality: { draft: 'ultrafast', standard: 'fast', high: 'medium' },
+  maxDurationSeconds: 120,
+  maxFileSizeBytes: 250 * 1024 * 1024,
+};
+
+export const LANDSCAPE_AD_PRESET: ExportPreset = {
+  id: 'landscape_ad',
+  name: 'Landscape Ad',
+  aspectRatio: '16:9',
+  width: 1920,
+  height: 1080,
+  fps: 30,
+  container: 'mp4',
+  videoCodec: 'libx264',
+  allowedVideoCodecs: ['libx264'],
+  audioCodec: 'aac',
+  pixelFormat: 'yuv420p',
+  videoBitrate: '10M',
+  audioBitrate: '192k',
+  crfByQuality: { draft: 25, standard: 21, high: 18 },
+  ffmpegPresetByQuality: { draft: 'ultrafast', standard: 'fast', high: 'medium' },
+  maxDurationSeconds: 180,
+  maxFileSizeBytes: 400 * 1024 * 1024,
+};

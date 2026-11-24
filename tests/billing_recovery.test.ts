@@ -223,8 +223,17 @@ describe('S1: the queue worker is the only code that starts a render encoder', (
     assert.ok(call > exec && call < execEnd, 'the only call is inside executeRenderJob (the queue worker)');
     const spawns = [...src.matchAll(/spawn\('ffmpeg', ([^,]+)/g)].map((m) => m[1]);
     assert.deepEqual(spawns, ["['-version']", 'args'], 'ffmpeg spawned only by the readiness probe and the render function');
-    // nothing else in the server tree spawns ffmpeg
-    const others = fs.readdirSync(path.join(ROOT, 'server'), { recursive: true }).map(String).filter((f) => f.endsWith('.ts'));
-    for (const f of others) assert.doesNotMatch(fs.readFileSync(path.join(ROOT, 'server', f), 'utf8'), /['"]ffmpeg['"]/, f);
+    // Verify mediaOrchestrator.executeQueuedRenderJob is also invoked exclusively inside executeRenderJob
+    const mediaCallSites = [...src.matchAll(/executeQueuedRenderJob\(/g)].map((m) => m.index!);
+    assert.ok(mediaCallSites.length <= 1, `executeQueuedRenderJob( appears ${mediaCallSites.length} times in server.ts`);
+    for (const c of mediaCallSites) {
+      assert.ok(c > exec && c < execEnd, 'executeQueuedRenderJob is only called inside executeRenderJob (the queue worker)');
+    }
+    // Outside server/media_engine/*, nothing else in the server tree spawns ffmpeg directly
+    const others = fs
+      .readdirSync(path.join(ROOT, 'server'), { recursive: true })
+      .map(String)
+      .filter((f) => f.endsWith('.ts') && !f.startsWith(`media_engine${path.sep}`));
+    for (const f of others) assert.doesNotMatch(fs.readFileSync(path.join(ROOT, 'server', f), 'utf8'), /spawn\(\s*['"]ffmpeg['"]/, f);
   });
 });

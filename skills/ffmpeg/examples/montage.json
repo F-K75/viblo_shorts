@@ -1,0 +1,73 @@
+{
+  "schema_version": "1.0",
+  "project_id": "media_montage_01",
+  "format": "youtube_short",
+  "resolution": {
+    "width": 1080,
+    "height": 1920
+  },
+  "fps": 30,
+  "duration_seconds": 12,
+  "tracks": {
+    "video": [
+      {
+        "asset_id": "asset_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "start": 0,
+        "end": 4,
+        "source_start": 0,
+        "source_end": 4,
+        "transition_out": "fade",
+        "transition_duration": 0.4,
+        "mute_source_audio": true
+      },
+      {
+        "asset_id": "asset_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "start": 4,
+        "end": 8,
+        "source_start": 1,
+        "source_end": 5,
+        "transition_in": "fade",
+        "transition_out": "fade",
+        "transition_duration": 0.4,
+        "mute_source_audio": true
+      },
+      {
+        "asset_id": "asset_cccccccccccccccccccccccccccccccc",
+        "start": 8,
+        "end": 12,
+        "source_start": 0,
+        "source_end": 4,
+        "transition_in": "fade",
+        "transition_duration": 0.4,
+        "mute_source_audio": true
+      }
+    ],
+    "audio": [
+      {
+        "asset_id": "asset_dddddddddddddddddddddddddddddddd",
+        "role": "voiceover",
+        "start": 0,
+        "end": 12,
+        "volume": 1.0,
+        "normalize_loudness": true
+      },
+      {
+        "asset_id": "asset_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "role": "music",
+        "start": 0,
+        "end": 12,
+        "volume": 0.18,
+        "fade_in": 0.5,
+        "fade_out": 1.5
+      }
+    ],
+    "subtitles": []
+  },
+  "export": {
+    "container": "mp4",
+    "video_codec": "libx264",
+    "audio_codec": "aac",
+    "pixel_format": "yuv420p",
+    "video_bitrate": "8M"
+  }
+}

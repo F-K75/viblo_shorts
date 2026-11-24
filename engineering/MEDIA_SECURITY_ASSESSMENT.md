@@ -1,0 +1,17 @@
+# Forge Media Engine — Security Assessment
+
+**Scope:** `server/media_engine/*`, `server/agents/media/*`, `server/routes/media.ts`, `skills/ffmpeg/*`, `Dockerfile`
+
+## Threat Model & Implemented Controls
+
+| Threat / Attack Vector | Control Implemented | Code Location | Status |
+|---|---|---|---|
+| **Arbitrary command injection via AI or user prompts** | Zero shell usage (`shell: false`), explicit `string[]` argument arrays, no raw user flags or filter expressions accepted. | `server/media_engine/commandBuilder.ts`, `executor.ts` | **MITIGATED** |
+| **SSRF / local file read via crafted containers (HLS/concat/http)** | `-nostdin` and per-input `-threads` + `-protocol_whitelist file,pipe` enforced before **every** `-i` across `FfmpegCommandBuilder`, `MediaProbe`, and `MediaValidator`. | `server/media_engine/config.ts`, `probe.ts`, `commandBuilder.ts`, `validator.ts` | **MITIGATED** |
+| **Path traversal, symlink escape & stderr path disclosure** | Opaque `asset_<32hex>` / `artifact_<32hex>` IDs only; `fs.lstatSync().isSymbolicLink()` and `fs.realpathSync` confinement checks; `redactFilesystemPaths()` scrubs host paths from FFmpeg/FFprobe errors; `/tmp` excluded from production binary search. | `server/media_engine/storage.ts`, `config.ts`, `probe.ts`, `executor.ts` | **MITIGATED** |
+| **Source asset tampering / S3 MIME & checksum spoofing** | Assets written atomically via temp file + rename and locked `0o444` read-only; canonical MIME types derived strictly from extension allowlist; SHA-256 verified on S3 hydration. | `server/media_engine/storage.ts` | **MITIGATED** |
+| **Subtitle / ASS script & font path injection** | ASS override tags (`{...}`) stripped; subtitles re-serialized into clean server-generated `captions.srt` inside per-job staging dir; bundled `Poppins-Bold.ttf` `fontsdir` only; `escapeFfmpegFilterPath` escapes `:`, `\`, `'`, `[`, `]`, `,`, `;`. | `server/media_engine/filterGraph.ts`, `renderAgent.ts` | **MITIGATED** |
+| **Cross-tenant enumeration, guest upload abuse & AI quota bypass** | Signed-in guard (`refuseGuestRender`) enforced on asset upload, probe, project write, plan, and render; uniform `404` on cross-tenant lookups; `{ ai: true }` daily quota reservation enforced on `/plan` + `aiCallContext` guard in `generateMediaAgentCompletion`; cross-tenant `WHERE tenant_id = EXCLUDED.tenant_id` upsert guards on all 4 Postgres/JSON tables. | `server/routes/media.ts`, `mediaStore.ts`, `orchestrator.ts`, `server.ts` | **MITIGATED** |
+| **Secret leakage to FFmpeg/FFprobe child processes** | Shared `buildCleanSubprocessEnv()` passed to every `spawn` and `execFileSync` across `config.ts`, `probe.ts`, `validator.ts`, and `executor.ts` — zero secrets inherited. | `server/media_engine/config.ts`, `probe.ts`, `validator.ts`, `executor.ts` | **MITIGATED** |
+| **CPU / Memory / Disk exhaustion & concurrency bounds** | `activeMediaRenders` tracked synchronously across full job lifecycle (`MAX_CONCURRENT_RENDERS`), `MediaProbe` semaphore (`maxConcurrentProbes`), per-input/output `-threads` cap, `AbortSignal` propagation into QA filters, and Express 4 `forwardErrors` enabled for `PUT`/`PATCH`. | `server.ts`, `probe.ts`, `validator.ts`, `requestGuards.ts` | **MITIGATED** |
+| **Container root & filesystem immutability** | Runs as non-root `USER node` under `tini`; `/app` remains root-owned read-only while `/data` is owned by `node`; no Docker socket mounted. | `Dockerfile`, `docs/MEDIA_ENGINE_DEPLOYMENT.md` | **MITIGATED** |

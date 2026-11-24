@@ -62,6 +62,7 @@ export async function startTestServer(extraEnv: Record<string, string> = {}): Pr
     cwd: path.resolve(import.meta.dirname, '..', '..'),
     env: {
       ...process.env,
+      PATH: `${process.env.PATH || ''}:/tmp/ffmpeg-bin`,
       NODE_ENV: 'test',
       PORT: String(port),
       DATA_DIR: dataDir,

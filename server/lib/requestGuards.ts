@@ -25,16 +25,29 @@ export interface BodyLimits {
   mediumBytes: number;
   /** Everything else (small JSON forms). */
   defaultBytes: number;
+  /** Media asset upload payloads (`/api/v1/media/assets`). */
+  mediaAssetBytes?: number;
 }
 
-const PROJECT_ROUTES = new Set(['/api/projects', '/api/publish/generate-pack', '/api/gemini/optimize-metadata', '/api/render/video', '/api/jobs/create']);
+const PROJECT_ROUTES = new Set([
+  '/api/projects',
+  '/api/publish/generate-pack',
+  '/api/gemini/optimize-metadata',
+  '/api/render/video',
+  '/api/jobs/create',
+  '/api/v1/media/projects',
+  '/api/v1/media/render',
+]);
 const TRANSCRIPT_ROUTES = new Set(['/api/youtube/parse-transcript', '/api/youtube/generate-clips']);
-const MEDIUM_ROUTES = new Set(['/api/voice-to-text/transcribe-clip', '/api/voice-to-text/align-words']);
+const MEDIUM_ROUTES = new Set(['/api/voice-to-text/transcribe-clip', '/api/voice-to-text/align-words', '/api/v1/media/probe']);
 /** Routes that start renders: refused under memory pressure whatever their body size. */
-const RENDER_ROUTE = /^\/api\/(render\/video|jobs\/create|jobs\/[^/]+\/retry)$/;
+const RENDER_ROUTE = /^\/api\/(render\/video|v1\/media\/render|jobs\/create|jobs\/[^/]+\/retry)$/;
 
 export function bodyLimitFor(path: string, limits: BodyLimits): number {
-  if (PROJECT_ROUTES.has(path)) return limits.projectBytes;
+  if (path === '/api/v1/media/assets') return limits.mediaAssetBytes ?? 32 * MB;
+  if (PROJECT_ROUTES.has(path) || /^\/api\/v1\/media\/projects\/[^/]+\/(timeline|plan)$/.test(path)) {
+    return limits.projectBytes;
+  }
   if (TRANSCRIPT_ROUTES.has(path)) return limits.transcriptBytes;
   if (MEDIUM_ROUTES.has(path)) return limits.mediumBytes;
   return limits.defaultBytes;

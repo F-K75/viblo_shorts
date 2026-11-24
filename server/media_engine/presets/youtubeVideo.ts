@@ -1,0 +1,41 @@
+import type { ExportPreset } from '../models.ts';
+
+export const YOUTUBE_1080P_PRESET: ExportPreset = {
+  id: 'youtube_1080p',
+  name: 'YouTube 1080p',
+  aspectRatio: '16:9',
+  width: 1920,
+  height: 1080,
+  fps: 30,
+  container: 'mp4',
+  videoCodec: 'libx264',
+  allowedVideoCodecs: ['libx264'],
+  audioCodec: 'aac',
+  pixelFormat: 'yuv420p',
+  videoBitrate: '10M',
+  audioBitrate: '192k',
+  crfByQuality: { draft: 26, standard: 21, high: 18 },
+  ffmpegPresetByQuality: { draft: 'ultrafast', standard: 'fast', high: 'medium' },
+  maxDurationSeconds: 900,
+  maxFileSizeBytes: 1024 * 1024 * 1024,
+};
+
+export const YOUTUBE_4K_PRESET: ExportPreset = {
+  id: 'youtube_4k',
+  name: 'YouTube 4K',
+  aspectRatio: '16:9',
+  width: 3840,
+  height: 2160,
+  fps: 30,
+  container: 'mp4',
+  videoCodec: 'libx265',
+  allowedVideoCodecs: ['libx265', 'libx264'],
+  audioCodec: 'aac',
+  pixelFormat: 'yuv420p',
+  videoBitrate: '24M',
+  audioBitrate: '256k',
+  crfByQuality: { draft: 28, standard: 23, high: 20 },
+  ffmpegPresetByQuality: { draft: 'ultrafast', standard: 'fast', high: 'medium' },
+  maxDurationSeconds: 900,
+  maxFileSizeBytes: 2 * 1024 * 1024 * 1024,
+};

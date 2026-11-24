@@ -1,0 +1,55 @@
+{
+  "schema_version": "1.0",
+  "project_id": "media_001",
+  "format": "instagram_reel",
+  "resolution": {
+    "width": 1080,
+    "height": 1920
+  },
+  "fps": 30,
+  "duration_seconds": 18,
+  "tracks": {
+    "video": [
+      {
+        "asset_id": "asset_11111111111111111111111111111111",
+        "start": 0,
+        "end": 8,
+        "source_start": 2,
+        "source_end": 10,
+        "transition_out": "fade",
+        "transition_duration": 0.5,
+        "fit_mode": "cover"
+      },
+      {
+        "asset_id": "asset_22222222222222222222222222222222",
+        "start": 8,
+        "end": 18,
+        "source_start": 0,
+        "source_end": 10,
+        "transition_in": "fade",
+        "transition_duration": 0.5,
+        "fit_mode": "cover"
+      }
+    ],
+    "audio": [
+      {
+        "asset_id": "asset_33333333333333333333333333333333",
+        "role": "music",
+        "start": 0,
+        "end": 18,
+        "volume": 0.25,
+        "fade_in": 1,
+        "fade_out": 2,
+        "normalize_loudness": true
+      }
+    ],
+    "subtitles": []
+  },
+  "export": {
+    "container": "mp4",
+    "video_codec": "libx264",
+    "audio_codec": "aac",
+    "pixel_format": "yuv420p",
+    "video_bitrate": "8M"
+  }
+}

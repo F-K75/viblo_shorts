@@ -19,6 +19,7 @@ This board tracks all engineering tasks across their lifecycle through Gate 5 (M
 | **TASK-008** | `qa-engineer` | `chore/TASK-008-frontend-tests-lint` | Frontend component test harness and test lint script | `tests/components/*.test.ts` | G5 MERGED | **MERGED_INTO_MAIN** |
 | **TASK-009** | `backend-engineer` | `refactor/TASK-009-server-routes` | Modularize Express server routes into `server/routes/*` | Unit & API tests | G5 MERGED | **MERGED_INTO_MAIN** |
 | **TASK-002** | `ai-engineer` | `feat/TASK-002-gemini-structured-output` | Native Gemini `responseSchema` migration | Requires live GEMINI_API_KEY | G2 PLAN | **PENDING_API_KEY** |
+| **TASK-010..016** | `orchestrator` + specialists | `feat/TASK-010-forge-media-engine` | Forge Media Engine (`server/media_engine/*`), `skills/ffmpeg/SKILL.md`, 7 specialist agents (`server/agents/media/*`), `/api/v1/media/*` API + `0007_media_engine.sql`, 5-dimension QA + repair loop, `MediaStudioWorkspace.tsx`, and golden media test suite | `tests/media_*.test.ts`, `tests/components/MediaStudioWorkspace.test.ts` | G3/G4 VERIFICATION | **READY_FOR_G4_G5** |
 
 ---
 
