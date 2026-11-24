@@ -1,0 +1,45 @@
+{
+  "manifest_version": "1.0",
+  "skill": {
+    "id": "video-trimming",
+    "name": "Video Trimming",
+    "version": "1.0.0",
+    "domain": "video-editing",
+    "description": "Precisely trim an authorized media asset to a caller-specified source window.",
+    "lifecycle": "planned",
+    "maturity": "experimental",
+    "tags": ["video", "editing", "ffmpeg"],
+    "capabilities": ["media.video.trim"],
+    "inputs": [
+      { "name": "asset_id", "type": "string", "required": true },
+      { "name": "start_seconds", "type": "number", "required": true },
+      { "name": "end_seconds", "type": "number", "required": true }
+    ],
+    "outputs": [
+      { "name": "artifact_id", "type": "string", "required": true },
+      { "name": "duration_seconds", "type": "number", "required": true }
+    ],
+    "dependencies": [],
+    "providers": {
+      "preferred": ["ffmpeg"],
+      "supported": ["ffmpeg"]
+    },
+    "execution": {
+      "mode": "deterministic",
+      "queue": "media_cpu",
+      "timeout_seconds": 300,
+      "retry_policy": "transient_only",
+      "idempotent": true
+    },
+    "resources": { "cpu": 1, "memory_mb": 1024, "gpu_required": false },
+    "permissions": ["media.asset.read", "media.artifact.create"],
+    "safety": {
+      "network_access": false,
+      "filesystem_scope": "authorized_assets",
+      "shell_access": false
+    },
+    "quality": { "test_suite": "media_registry.test.ts", "validation_required": true },
+    "observability": { "metrics": ["execution_duration", "execution_success", "output_duration"] },
+    "documentation": { "skill_file": "SKILL.md", "examples": ["examples/basic_trim.json"] }
+  }
+}

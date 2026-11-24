@@ -15,6 +15,7 @@
     "test:load": "tsx scripts/loadtest.ts",
     "make-video": "tsx scripts/make-video.ts",
     "make-clip": "tsx scripts/make-clip.ts",
+    "media:validate": "node --import tsx server/media/validateManifests.ts",
     "lint": "tsc --noEmit && tsc --noEmit -p tsconfig.node.json",
     "lint:tests": "tsc --noEmit -p tsconfig.tests.json",
     "backup": "tsx scripts/backup.ts",
