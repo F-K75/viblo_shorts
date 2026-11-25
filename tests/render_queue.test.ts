@@ -37,7 +37,7 @@ async function boot(env: Record<string, string> = {}) {
  */
 function hangingFfmpeg(): Record<string, string> {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ffmpeg-stub-'));
-  fs.writeFileSync(path.join(dir, 'ffmpeg'), '#!/bin/sh\nif [ "$1" = "-version" ]; then echo "ffmpeg stub"; exit 0; fi\nexec sleep 300\n', { mode: 0o755 });
+  fs.writeFileSync(path.join(dir, 'ffmpeg'), '#!/bin/sh\nif [ "$1" = "-version" ] || [ "$1" = "-hide_banner" ]; then echo "ffmpeg stub"; exit 0; fi\nexec sleep 300\n', { mode: 0o755 });
   return { PATH: `${dir}:${process.env.PATH}` };
 }
 const post = (s: TestServer, p: string, token: string, body: unknown = {}) =>

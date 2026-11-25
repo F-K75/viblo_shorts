@@ -30,6 +30,55 @@ Without `GEMINI_API_KEY` the app still works, using built-in template content th
 | `npm run build` | Typecheck + production bundle in `dist/` |
 | `npm start` | Production server (requires `SESSION_SECRET`) |
 
+## Make a finished video from the command line
+
+```bash
+npm run build
+npm run make-video -- "5 science-backed habits to fall asleep faster"   # → output/forge_short.mp4
+```
+
+Drives the real UI in headless Chromium (guest → idea → script → export) and writes a 1080×1920 H.264/AAC MP4
+normalised to YouTube loudness (−14 LUFS). With `GEMINI_API_KEY` set you get an AI-written script and AI voiceover;
+with `PEXELS_API_KEY`, real stock footage. Without keys you get the built-in template script on animated
+motion-graphics backgrounds with background music.
+
+## Clip a long video (YouTube link + your own copy of the video)
+
+```bash
+npm run build
+npm run make-clip -- --url "https://www.youtube.com/watch?v=VIDEO_ID" \
+  --source my-video.mp4 --transcript transcript.txt --clip 1        # → output/forge_clip_1.mp4
+```
+
+* `--transcript`: paste of YouTube's "Show transcript" panel (or any `m:ss` timed text). Without it the server tries the
+  video's captions; without AI it then picks clips from the transcript itself (hook, complete sentences, no intro/outro).
+* `--source`: your own copy of the full video (e.g. downloaded from YouTube Studio). The browser cannot record
+  YouTube's embedded player, so this is what puts real footage and the speaker's audio into the clip. In the app:
+  *Canvas & Timeline → Add your video file*. It stays on your device.
+* `--clip N` picks the Nth candidate (1 = best), `--fit` letterboxes instead of centre-cropping.
+* `--download --i-have-rights` instead of `--source`: fetches just the clip's section from YouTube with
+  [yt-dlp](https://github.com/yt-dlp/yt-dlp) (`pip install yt-dlp`; needs ffmpeg). Only for videos you own or have
+  permission to use — downloading other people's videos breaks YouTube's Terms of Service.
+
+### Optional: YouTube footage download in the app
+
+Off by default. Install `yt-dlp` on the server and set `YOUTUBE_DOWNLOAD_ENABLED=true`. The editor then shows
+*Get this clip's footage from YouTube* (after the user confirms they own the video or have permission). Only the clip
+section (±15 s) is downloaded, files are visible only to their owner and deleted after `YTDLP_TTL_MIN` (60). Limits:
+`YTDLP_MAX_MB` (500), `YTDLP_TIMEOUT_S` (300), `YTDLP_MAX_CONCURRENT` (2), `YTDLP_MAX_SECTION_S` (300); `YTDLP_PATH`
+overrides the binary. YouTube may block downloads from cloud/datacenter IPs ("confirm you're not a bot").
+
+### Your own video, no YouTube link
+
+*Source & Idea → Your Video to Clips*: pick a video file and paste its timed transcript (`m:ss` lines, YouTube's
+"Show transcript" copy, `[0:12] text`) or load an `.srt`/`.vtt` file. Only the transcript is sent
+(`POST /api/clips/from-transcript`); the canvas opens with the file attached as the source.
+
+Attached footage (your file or a downloaded YouTube section) is kept in the browser's IndexedDB per project and source
+video, so it is restored after a reload or when the project is reopened on the same browser. Up to 2 GB is kept
+(`FOOTAGE_STORE_MAX_BYTES` in `src/utils/footageStore.ts`), least recently used first out; if the browser refuses
+(quota, private mode) the file still works until the tab is closed. Video files are never uploaded.
+
 ## Production
 
 ```bash

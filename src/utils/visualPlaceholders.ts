@@ -1,70 +1,64 @@
 // High quality reliable SVG data URLs for vertical video thumbnails
 // Guarantees zero broken images across all sandbox and offline environments
 
-function createSvgPlaceholder(title: string, subtitle: string, gradientStart: string, gradientEnd: string, iconSymbol: string): string {
+/** Topic categories for keyless fallbacks: icon + palette only (no titles that could mislabel the Short). */
+export const TOPICS = {
+  sleep: { icon: '🌙', from: '#0B1026', to: '#312E81', hue: 245, words: ['sleep', 'bed', 'night', 'dream', 'melatonin', 'rem', 'tired', 'nap', 'insomnia'] },
+  tech: { icon: '⚡', from: '#0B0F19', to: '#1E293B', hue: 200, words: ['code', 'tech', 'laptop', 'developer', 'computer', 'ai', 'software'] },
+  fitness: { icon: '🔥', from: '#1C0A0A', to: '#7F1D1D', hue: 10, words: ['gym', 'fitness', 'workout', 'exercise', 'run', 'muscle', 'sport'] },
+  wealth: { icon: '📈', from: '#061A14', to: '#064E3B', hue: 155, words: ['money', 'wealth', 'finance', 'dollar', 'invest', 'income', 'business'] },
+  food: { icon: '🥗', from: '#14210A', to: '#3F6212', hue: 90, words: ['food', 'eat', 'diet', 'meal', 'nutrition', 'cook', 'coffee', 'caffeine', 'tea'] },
+  study: { icon: '📚', from: '#172554', to: '#1E3A8A', hue: 220, words: ['book', 'study', 'read', 'learn', 'brain', 'focus', 'memory', 'mind'] },
+  phone: { icon: '📱', from: '#1E1B4B', to: '#312E81', hue: 265, words: ['phone', 'scroll', 'app', 'social', 'screen', 'blue light'] },
+  city: { icon: '🏙️', from: '#090D16', to: '#1E1B4B', hue: 230, words: ['city', 'walk', 'street', 'urban', 'travel'] },
+  clock: { icon: '⏱️', from: '#18181B', to: '#3F3F46', hue: 35, words: ['clock', 'time', 'timer', 'habit', 'routine', 'morning', 'schedule'] },
+  default: { icon: '✨', from: '#0F172A', to: '#1E293B', hue: 330, words: [] as string[] },
+} as const;
+export type TopicKey = keyof typeof TOPICS;
+
+export function getTopic(query?: string): TopicKey {
+  const q = (query || '').toLowerCase();
+  for (const key of Object.keys(TOPICS) as TopicKey[]) {
+    // Whole word plus common endings: "sleep" matches "sleeping"; "ai" never matches "brain", "rem" never "remember".
+    if (TOPICS[key].words.some((w) => new RegExp(`\\b${w}(s|es|ing|ed|y|er|ers)?\\b`).test(q))) return key;
+  }
+  return 'default';
+}
+
+function createSvgPlaceholder(topic: TopicKey): string {
+  const { icon, from, to } = TOPICS[topic];
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="720" height="1280" viewBox="0 0 720 1280">
   <defs>
     <linearGradient id="grad" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" stop-color="${gradientStart}" />
-      <stop offset="100%" stop-color="${gradientEnd}" />
+      <stop offset="0%" stop-color="${from}" />
+      <stop offset="100%" stop-color="${to}" />
     </linearGradient>
-    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
-      <path d="M 40 0 L 0 0 0 40" fill="none" stroke="rgba(255,255,255,0.04)" stroke-width="1"/>
-    </pattern>
+    <radialGradient id="glow" cx="50%" cy="40%" r="50%">
+      <stop offset="0%" stop-color="rgba(255,255,255,0.16)" />
+      <stop offset="100%" stop-color="rgba(255,255,255,0)" />
+    </radialGradient>
   </defs>
   <rect width="100%" height="100%" fill="url(#grad)" />
-  <rect width="100%" height="100%" fill="url(#grid)" />
-  <circle cx="360" cy="560" r="140" fill="rgba(255,255,255,0.06)" />
-  <text x="360" y="580" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="84" font-weight="900" fill="#ffffff" text-anchor="middle" dominant-baseline="middle">${iconSymbol}</text>
-  <text x="360" y="760" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="34" font-weight="800" fill="#ffffff" text-anchor="middle" letter-spacing="1">${title.toUpperCase()}</text>
-  <text x="360" y="810" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="20" font-weight="500" fill="rgba(255,255,255,0.7)" text-anchor="middle">${subtitle}</text>
-  <rect x="300" y="860" width="120" height="6" rx="3" fill="#E11D48" />
+  <rect width="100%" height="100%" fill="url(#glow)" />
+  <text x="360" y="500" font-family="sans-serif" font-size="150" text-anchor="middle" dominant-baseline="middle">${icon}</text>
 </svg>`;
   return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
 }
 
-export const FALLBACK_THUMBNAILS = {
-  tech: createSvgPlaceholder('Focus & Code', 'Deep Work Studio', '#0B0F19', '#1E293B', '⚡'),
-  clock: createSvgPlaceholder('Time Management', 'Morning Habits', '#18181B', '#27272A', '⏱️'),
-  coffee: createSvgPlaceholder('Morning Routine', 'Daily Ritual', '#1C1917', '#292524', '☕'),
-  city: createSvgPlaceholder('Urban Motion', 'Daily Commute', '#090D16', '#1E1B4B', '🏙️'),
-  fitness: createSvgPlaceholder('High Energy', 'Peak Performance', '#18181B', '#3F3F46', '🔥'),
-  wealth: createSvgPlaceholder('Wealth & Growth', 'Compounding Results', '#061A14', '#064E3B', '📈'),
-  phone: createSvgPlaceholder('Social Hook', 'Digital Attention', '#1E1B4B', '#312E81', '📱'),
-  study: createSvgPlaceholder('Deep Learning', 'Mastery & Focus', '#172554', '#1E3A8A', '📚'),
-  default: createSvgPlaceholder('Short Visual', 'High Impact Beat', '#0F172A', '#1E293B', '🎬'),
-};
+export const FALLBACK_THUMBNAILS = Object.fromEntries(
+  (Object.keys(TOPICS) as TopicKey[]).map((k) => [k, createSvgPlaceholder(k)]),
+) as Record<TopicKey, string>;
+
+/** True for the built-in SVG placeholders (no real footage or photo for this beat). */
+export function isPlaceholderImage(url?: string): boolean {
+  return !!url && url.startsWith('data:image/svg+xml');
+}
 
 export function getSafeThumbnail(query?: string, providedUrl?: string): string {
   if (providedUrl && !providedUrl.includes('unsplash.com') && !providedUrl.includes('placeholder.com')) {
     return providedUrl;
   }
-  const q = (query || '').toLowerCase();
-  if (q.includes('code') || q.includes('tech') || q.includes('laptop') || q.includes('developer')) {
-    return FALLBACK_THUMBNAILS.tech;
-  }
-  if (q.includes('clock') || q.includes('time') || q.includes('timer') || q.includes('habit')) {
-    return FALLBACK_THUMBNAILS.clock;
-  }
-  if (q.includes('coffee') || q.includes('morning') || q.includes('desk') || q.includes('tea')) {
-    return FALLBACK_THUMBNAILS.coffee;
-  }
-  if (q.includes('city') || q.includes('walk') || q.includes('street') || q.includes('urban')) {
-    return FALLBACK_THUMBNAILS.city;
-  }
-  if (q.includes('gym') || q.includes('fitness') || q.includes('workout') || q.includes('exercise')) {
-    return FALLBACK_THUMBNAILS.fitness;
-  }
-  if (q.includes('money') || q.includes('wealth') || q.includes('finance') || q.includes('dollar')) {
-    return FALLBACK_THUMBNAILS.wealth;
-  }
-  if (q.includes('phone') || q.includes('scroll') || q.includes('app') || q.includes('social')) {
-    return FALLBACK_THUMBNAILS.phone;
-  }
-  if (q.includes('book') || q.includes('study') || q.includes('read') || q.includes('learn')) {
-    return FALLBACK_THUMBNAILS.study;
-  }
-  return FALLBACK_THUMBNAILS.default;
+  return FALLBACK_THUMBNAILS[getTopic(query)];
 }
 
 export const FALLBACK_VIDEOS = {

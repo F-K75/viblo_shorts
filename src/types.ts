@@ -1,3 +1,5 @@
+export type BeatRole = 'hook' | 'context' | 'main' | 'progression' | 'cta';
+
 export interface Beat {
   id: string;
   text: string;
@@ -7,6 +9,7 @@ export interface Beat {
   video_url: string;
   thumbnail?: string;
   duration?: number;
+  role?: BeatRole;
 }
 
 export interface ShortScript {
@@ -18,6 +21,8 @@ export interface ShortScript {
   sourceYouTubeId?: string;
   sourceYouTubeTitle?: string;
   sourceYouTubeAuthor?: string;
+  /** Clip cut from the user's own video file (no YouTube link). Only its name is saved; the file stays in the browser. */
+  sourceLocalVideo?: { name: string; durationSeconds?: number };
   viralScore?: number;
   clipReasoning?: string;
   clipStartSeconds?: number;
@@ -31,6 +36,8 @@ export interface WordTiming {
   start_s: number;
   end_s: number;
   beatId?: string;
+  segmentIndex?: number;
+  wordIndex?: number;
 }
 
 export interface CaptionChunk {
@@ -38,6 +45,30 @@ export interface CaptionChunk {
   start_s: number;
   end_s: number;
   words: WordTiming[];
+  beatId?: string;
+}
+
+/** Explicit 4-layer Caption Intelligence representation: transcript -> segments -> individual words -> active highlight. */
+export interface CaptionModel {
+  fullTranscript: string;
+  segments: CaptionChunk[];
+  words: WordTiming[];
+}
+
+export interface ActiveCaptionState {
+  segment: CaptionChunk | null;
+  segmentIndex: number;
+  activeWord: WordTiming | null;
+  activeWordIndexInSegment: number;
+}
+
+export interface AudioAnalysisMetrics {
+  durationS: number;
+  rmsDb: number;
+  peakDb: number;
+  silenceRatio: number;
+  isSilent: boolean;
+  sampleRate: number;
 }
 
 export interface CaptionStyle {
@@ -51,6 +82,8 @@ export interface CaptionStyle {
   backgroundColor?: string;
   positionY: number; // percentage from top, e.g. 68
   wordsPerChunk: number;
+  /** 'phrase' (default): whole clauses up to two lines. 'words': fixed bursts of wordsPerChunk words. */
+  grouping?: 'phrase' | 'words';
   fontFamily?: string;
   fontWeight?: string;
   textTransform?: 'uppercase' | 'none';
@@ -92,13 +125,15 @@ export interface YouTubeClipCandidate {
 
 export type VisualSourceMode = 'youtube-crop' | 'youtube-fit' | 'b-roll' | 'split';
 export type AudioSourceMode = 'youtube' | 'tts';
+/** Where a Short starts: a YouTube link, an idea prompt, or the user's own video file + transcript. */
+export type CreationMode = 'youtube' | 'prompt' | 'local';
 
 export interface Project {
   id: string;
   userId?: string;
   title: string;
   topic: string;
-  creationMode: 'youtube' | 'prompt';
+  creationMode: CreationMode;
   script: ShortScript;
   captionStyle: CaptionStyle;
   visualMode: VisualSourceMode;

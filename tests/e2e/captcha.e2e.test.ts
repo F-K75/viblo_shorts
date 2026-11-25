@@ -9,6 +9,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { createRequire } from 'node:module';
+import { watchCspViolations, formatViolations } from '../helpers/cspWatch.ts';
 import { startTestServer, TEST_BACKEND, type TestServer } from '../helpers/server.ts';
 import { startTurnstileStub } from '../helpers/turnstileStub.ts';
 
@@ -50,6 +51,10 @@ const FAKE_TURNSTILE = `
   window.turnstile = {
     render(el, opts) {
       window.__turnstileCalls.push({ sitekey: opts.sitekey, action: opts.action, inDom: document.body.contains(el) });
+      // Like the real widget, render the challenge iframe from challenges.cloudflare.com (exercises CSP frame-src).
+      const f = document.createElement('iframe');
+      f.src = 'https://challenges.cloudflare.com/cdn-cgi/challenge-platform/turnstile/if/e2e';
+      el.appendChild(f);
       setTimeout(() => opts.callback('ok-e2e-' + Math.random().toString(16).slice(2)), 50);
       return 'w1';
     },
@@ -62,6 +67,7 @@ test('E2E: guest onboarding solves Turnstile (site key from /api/config, action 
   const browser = await chromium.launch();
   const ctx = await browser.newContext();
   const page = await ctx.newPage();
+  const cspViolations = await watchCspViolations(page, srv.baseUrl); // FS-013: the production CSP blocks nothing legitimate
   const pageErrors: string[] = [];
   page.on('pageerror', (e: Error) => pageErrors.push(e.message));
   const scriptRequests: string[] = [];
@@ -81,6 +87,7 @@ test('E2E: guest onboarding solves Turnstile (site key from /api/config, action 
     assert.deepEqual(calls.map((c: any) => [c.sitekey, c.action]), [[SITE_KEY, 'guest_mint']], JSON.stringify(calls));
     assert.ok(stub.calls.some((c) => c.response.startsWith('ok-e2e-') && c.secret === SECRET), 'the server verified the browser token');
     assert.deepEqual(pageErrors, []);
+    assert.equal(cspViolations.length, 0, `CSP violations:\n${formatViolations(cspViolations)}`);
   } finally {
     await browser.close();
   }

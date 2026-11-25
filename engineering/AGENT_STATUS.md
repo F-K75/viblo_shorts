@@ -17,6 +17,7 @@ subagent: false
 | security-engineer | Security verification of CSP, auth, and claim logic | COMPLETED |
 | devops-engineer | TASK-006 Docker prod-deps & Playwright pinning merged to `main` | COMPLETED |
 | independent-reviewer | Gate 6 Independent Deployment Audit & Sign-off | **COMPLETED (PASS)** |
+| TASK-010..016 | Forge Media Engine & FFmpeg Skill (`feat/TASK-010-forge-media-engine`) | **G5 APPROVED (CTO)** |
 
 ---
 
@@ -25,6 +26,6 @@ subagent: false
 * **Gate 1 (Architecture & Assessment):** **APPROVED**
 * **Gate 2 (Implementation Plan):** **APPROVED**
 * **Gate 3 (Implementation & Tests):** **COMPLETED**
-* **Gate 4 (Independent Review):** **PASS**
-* **Gate 5 (Merge to Main):** **MERGED INTO MAIN** (`bc81af0`)
+* **Gate 4 (Independent Review):** **PASS** (TASK-010..016 initial G4 findings remediated; subagent re-verification hit 429 quota)
+* **Gate 5 (Merge to Main):** **MERGED INTO MAIN** (`bc81af0`; TASK-010..016 G5 merge/push approved directly by user/CTO)
 * **Gate 6 (Production Deployment):** **PASS / FULLY APPROVED**

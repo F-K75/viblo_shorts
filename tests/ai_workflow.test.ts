@@ -3,6 +3,7 @@
 // as fallbacks, and the server never fabricates "transcriptions" of audio it has not heard.
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import { startTestServer, guestToken, type TestServer, healthDetails } from './helpers/server.ts';
 
 let srv: TestServer;
@@ -83,14 +84,112 @@ test('generate-clips with a pasted transcript is grounded: verbatim captions fro
   for (const c of d.clips) assert.ok(c.endSeconds > c.startSeconds);
 });
 
-test('generate-clips without any transcript: template clips carry a clear grounding warning', async () => {
-  const d = await (await post('/api/youtube/generate-clips', { url: 'https://www.youtube.com/watch?v=UF8uR6Z6KLc' })).json();
-  // In this sandbox YouTube is unreachable, so no captions can be fetched.
-  if (d.transcriptSource === 'none') {
-    assert.equal(d.grounded, false);
-    assert.match(d.groundingWarning, /not match/);
-    assert.ok(d.clips.every((c: any) => c.timestampsEstimated === true));
+test('generate-clips without any transcript and without AI: asks for the transcript instead of inventing clips', async () => {
+  const r = await post('/api/youtube/generate-clips', { url: 'https://www.youtube.com/watch?v=UF8uR6Z6KLc' });
+  const d = await r.json();
+  // Captions may be reachable from some networks; only the no-transcript case is asserted.
+  if (r.status === 422) {
+    assert.equal(d.code, 'transcript_required');
+    assert.match(d.error, /Show transcript/);
+    assert.equal(d.clips, undefined, 'no template clips that look real but are not');
+  } else {
+    assert.equal(d.grounded, true);
   }
+});
+
+// ----- The user's own video: clips from a transcript, no YouTube link (the video file never reaches the server) -----
+const talkTranscript = fs.readFileSync(new URL('./fixtures/talk.transcript.txt', import.meta.url), 'utf8');
+
+test('clips/from-transcript: pasted timed transcript → the same transcript-grounded clips as a YouTube link', async () => {
+  const r = await post('/api/clips/from-transcript', { transcript: talkTranscript, title: 'my-talk.mp4', durationSeconds: 135 });
+  assert.equal(r.status, 200);
+  const d = await r.json();
+  assert.equal(d.grounded, true);
+  assert.equal(d.transcriptSource, 'pasted');
+  assert.equal(d.source, 'transcript');
+  assert.equal(d.isFallback, true, 'AI ranking unavailable is disclosed');
+  assert.match(d.fallbackMessage, /picked from the transcript/);
+  assert.deepEqual(d.sourceInfo, { title: 'my-talk.mp4', durationSeconds: 135 });
+  assert.equal(d.videoInfo, undefined, 'no YouTube metadata for a local video');
+  assert.equal(d.audioCcSegments.length, 31);
+  assert.equal(d.clips.length, 3);
+  assert.equal(d.clips[0].clipTitle, 'Why does your to-do list never actually get done?');
+  assert.equal(d.clips[0].startSeconds, 29.86);
+  assert.equal(d.clips[0].endSeconds, 58.56);
+  for (const c of d.clips) {
+    assert.match(c.id, /^local-clip-[0-9a-f]{10}-\d$/);
+    assert.ok(c.endSeconds > c.startSeconds && c.endSeconds <= 135);
+    for (const b of c.beats) assert.ok(talkTranscript.includes(b.text), `caption not verbatim: ${b.text}`);
+  }
+  // Same picks as the YouTube route with the same pasted transcript (shared code path).
+  const yt = await (await post('/api/youtube/generate-clips', { url: 'https://youtu.be/arj7oStGLkU', transcript: talkTranscript })).json();
+  assert.deepEqual(yt.clips.map((c: any) => [c.startSeconds, c.endSeconds]), d.clips.map((c: any) => [c.startSeconds, c.endSeconds]));
+});
+
+test('clips/from-transcript: SRT and VTT subtitle files are accepted', async () => {
+  const srt = [
+    '1', '00:00:00,000 --> 00:00:06,000', 'Why does your to-do list never actually get done?', '',
+    '2', '00:00:06,000 --> 00:00:12,000', 'It is not because you are lazy.', '',
+    '3', '00:00:12,000 --> 00:00:20,000', 'The real reason is that your list mixes three different kinds of work.', '',
+    '4', '00:00:20,000 --> 00:00:28,000', 'When you put them on one page, your brain sees a wall it can never finish.', '',
+  ].join('\n');
+  const d = await (await post('/api/clips/from-transcript', { transcript: srt })).json();
+  assert.equal(d.transcriptSource, 'subtitle_file');
+  assert.equal(d.audioCcSegments.length, 4);
+  assert.equal(d.clips[0].startSeconds, 0);
+  assert.equal(d.clips[0].beats[0].text, 'Why does your to-do list never actually get done?');
+  assert.deepEqual(d.sourceInfo, { title: 'Your video', durationSeconds: null });
+
+  const vtt = `WEBVTT\n\n${srt.replace(/^\d+\n/gm, '').replace(/,(\d{3})/g, '.$1')}`;
+  const v = await (await post('/api/clips/from-transcript', { transcript: vtt })).json();
+  assert.deepEqual(v.audioCcSegments, d.audioCcSegments);
+});
+
+test('clips/from-transcript: no transcript / untimed / out-of-range → 422 with instructions, never invented clips', async () => {
+  const none = await post('/api/clips/from-transcript', { title: 'talk.mp4' });
+  assert.equal(none.status, 422);
+  const n = await none.json();
+  assert.equal(n.code, 'transcript_required');
+  assert.match(n.error, /YouTube Studio/);
+  assert.match(n.error, /\.srt/);
+  assert.match(n.error, /type it yourself/);
+  assert.equal(n.clips, undefined);
+
+  const untimed = await post('/api/clips/from-transcript', { transcript: 'Why does your to-do list never get done? It is not because you are lazy.' });
+  assert.equal(untimed.status, 422);
+  const u = await untimed.json();
+  assert.equal(u.code, 'transcript_untimed');
+  assert.equal(u.clips, undefined);
+
+  const late = await post('/api/clips/from-transcript', { transcript: talkTranscript, durationSeconds: 0.2 });
+  assert.equal(late.status, 422);
+  assert.equal((await late.json()).code, 'transcript_out_of_range');
+
+  // A file shorter than the transcript: clips stay inside the file.
+  const short = await (await post('/api/clips/from-transcript', { transcript: talkTranscript, durationSeconds: 60 })).json();
+  assert.ok(short.clips.length >= 1);
+  for (const c of short.clips) assert.ok(c.endSeconds <= 60, `clip ends at ${c.endSeconds}s, past the 60s file`);
+});
+
+test('clips/from-transcript: requires auth and is rate limited like the other clip routes', async () => {
+  const anon = await fetch(`${srv.baseUrl}/api/clips/from-transcript`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ transcript: talkTranscript }),
+  });
+  assert.equal(anon.status, 401);
+  const token = await guestToken(srv.baseUrl);
+  const statuses: number[] = [];
+  for (let i = 0; i < 16; i++) {
+    const r = await fetch(`${srv.baseUrl}/api/clips/from-transcript`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+      body: JSON.stringify({}),
+    });
+    statuses.push(r.status);
+  }
+  assert.equal(statuses.filter((s) => s === 422).length, 15);
+  assert.equal(statuses.at(-1), 429);
 });
 
 test('voice-to-text: never fabricates a transcript; estimates only from supplied text', async () => {

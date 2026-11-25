@@ -18,11 +18,47 @@ import {
   Eye,
   EyeOff,
   ShieldAlert,
+  FileVideo,
+  X,
+  ScanFace,
 } from 'lucide-react';
 import { Beat, CaptionStyle, WordTiming, VisualSourceMode, AudioSourceMode } from '../types';
-import { chunkWords, applyCaptionOffset } from '../utils/pipeline';
+import {
+  applyCaptionOffset,
+  buildCaptionModel,
+  clampCaptionPositionY,
+  formatCaptionDisplayWord,
+  getActiveCaptionState,
+  pickDistinctAssets,
+} from '../utils/pipeline';
 import { audioManager, MusicMood } from '../utils/audio';
-import { getSafeThumbnail, getSafeVideoUrl } from '../utils/visualPlaceholders';
+import { apiFetch, apiErrorMessage } from '../utils/api';
+import {
+  MAX_REMEDIATION,
+  MIME_ORDERS,
+  downloadBlob,
+  measureBlob,
+  needsReRecord,
+  runPreflightQuality,
+  type QualityReport,
+  type QualityResult,
+  type RecordedExport,
+  type RepairActionType,
+  type RepairRecommendation,
+  type TimelineKind,
+} from '../utils/quality';
+import type { SourceFootage } from '../utils/useSourceFootage';
+import { getSafeThumbnail, getSafeVideoUrl, isPlaceholderImage } from '../utils/visualPlaceholders';
+import {
+  drawCaptionChunk,
+  drawMotionBackground,
+  drawSceneTransition,
+  drawSourceFrame,
+  captionMaxChars,
+  captionLineCount,
+} from '../utils/exportCanvas';
+import { analyzeSubjectTrack, cropCenterAt, cropXAt, objectPositionPercent, type CropPath } from '../utils/smartCrop';
+import { QualityReportPanel } from './QualityReportPanel';
 
 function formatSecondsToTimestamp(sec: number): string {
   const m = Math.floor(sec / 60);
@@ -59,6 +95,13 @@ interface ShortsPlayerProps {
   onUpdateCaptionStyle?: (updates: Partial<CaptionStyle>) => void;
   visualMode?: VisualSourceMode;
   onChangeVisualMode?: (mode: VisualSourceMode) => void;
+  /** The user's own copy of the source video, held by the parent so it survives step changes and reloads. */
+  sourceFile?: SourceFootage | null;
+  onChangeSourceFile?: (next: SourceFootage | null) => void;
+  /** Set when the clip is cut from the user's own video file (no YouTube link): its file name. */
+  localSourceName?: string;
+  onAutoAlignBeats?: () => void;
+  onUpdateAllBeats?: (beats: Beat[]) => void;
 }
 
 export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
@@ -90,6 +133,11 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
   onUpdateCaptionStyle,
   visualMode: propVisualMode,
   onChangeVisualMode,
+  sourceFile: propSourceFile,
+  onChangeSourceFile,
+  localSourceName,
+  onAutoAlignBeats,
+  onUpdateAllBeats,
 }) => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -109,12 +157,13 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
   const [exportProgress, setExportProgress] = useState(0);
   const [exportResolution, setExportResolution] = useState<'1080p' | '720p'>('1080p');
   const [exportError, setExportError] = useState<string | null>(null);
-  const isYouTubeSource = Boolean(sourceYouTubeId);
+  // A clip cut from a source video: a YouTube link, or the user's own file (localSourceName, no YouTube UI).
+  const isYouTubeSource = Boolean(sourceYouTubeId) || Boolean(localSourceName);
   const [musicMood, setMusicMood] = useState<MusicMood>('lofi');
   const [videoLoaded, setVideoLoaded] = useState(false);
   const [videoError, setVideoError] = useState(false);
   const [visualMode, setVisualMode] = useState<VisualSourceMode>(
-    propVisualMode || (sourceYouTubeId ? 'youtube-crop' : 'split')
+    propVisualMode || (isYouTubeSource ? 'youtube-crop' : 'split')
   );
   const [showSafeZones, setShowSafeZones] = useState(false);
 
@@ -123,6 +172,96 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
   const [youtubeVolume, setYoutubeVolume] = useState(1.0);
   const [isYoutubeMuted, setIsYoutubeMuted] = useState(false);
   const [clipStartSec, setClipStartSec] = useState<number>(clipStartSeconds);
+
+  // The user's own copy of the source video (local file, never uploaded). YouTube's embedded player cannot be
+  // recorded, so this is what puts the real footage and the speaker's audio into exported clips.
+  // `offset`: source time at which the file starts (a downloaded YouTube section starts before the clip; a full
+  // local copy starts at 0). Source time for playhead t = clip start + t, so file time = that minus offset.
+  // Held by the parent when it passes onChangeSourceFile (kept across steps, stored in this browser); else local.
+  const [ownSourceFile, setOwnSourceFile] = useState<SourceFootage | null>(null);
+  const isSourceFileLifted = onChangeSourceFile !== undefined;
+  const sourceFile = isSourceFileLifted ? propSourceFile ?? null : ownSourceFile;
+  const setSourceFile = isSourceFileLifted ? onChangeSourceFile : setOwnSourceFile;
+  const sourceOffset = sourceFile?.offset ?? 0;
+  const sourceStartSec = Math.max(0, clipStartSec - sourceOffset);
+  const [ytDownloadEnabled, setYtDownloadEnabled] = useState(false);
+  const [rightsConfirmed, setRightsConfirmed] = useState(false);
+  const [isDownloading, setIsDownloading] = useState(false);
+  useEffect(() => {
+    if (!sourceYouTubeId) return;
+    let alive = true;
+    fetch('/api/config')
+      .then((r) => (r.ok ? r.json() : null))
+      .then((c) => alive && setYtDownloadEnabled(Boolean(c?.features?.youtubeDownload)))
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [sourceYouTubeId]);
+  const handleDownloadFromYouTube = async () => {
+    if (!sourceYouTubeId || isDownloading) return;
+    setIsDownloading(true);
+    setExportError(null);
+    try {
+      const clipLen = beats.length ? Math.max(...beats.map((b) => b.end_s)) : 30;
+      const r = await apiFetch('/api/youtube/download', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          url: `https://www.youtube.com/watch?v=${sourceYouTubeId}`,
+          startSeconds: clipStartSec,
+          endSeconds: clipStartSec + clipLen,
+          rightsConfirmed,
+        }),
+      });
+      if (!r.ok) throw new Error(await apiErrorMessage(r, 'YouTube download failed.'));
+      const d = await r.json();
+      const fileRes = await apiFetch(`/api/youtube/download/${d.downloadId}`);
+      if (!fileRes.ok) throw new Error(await apiErrorMessage(fileRes, 'Could not load the downloaded footage.'));
+      const blob = await fileRes.blob();
+      setSourceFile({ url: URL.createObjectURL(blob), name: `YouTube footage (${Math.round(d.offsetSeconds)}s–${Math.round(d.endSeconds)}s)`, offset: d.offsetSeconds, end: d.endSeconds, blob });
+    } catch (e: any) {
+      setExportError(e?.message || 'YouTube download failed.');
+    } finally {
+      setIsDownloading(false);
+    }
+  };
+  const sourceVideoRef = useRef<HTMLVideoElement>(null);
+  const useSourceFile = Boolean(sourceFile) && visualMode !== 'b-roll';
+  useEffect(() => () => {
+    // A lifted file outlives this component (the parent revokes it when it is replaced or removed).
+    if (sourceFile && !isSourceFileLifted) URL.revokeObjectURL(sourceFile.url);
+  }, [sourceFile, isSourceFileLifted]);
+  const handlePickSourceFile = (file: File | undefined) => {
+    if (!file) return;
+    if (!file.type.startsWith('video/') && !/\.(mp4|webm|mov|m4v|mkv)$/i.test(file.name)) {
+      setExportError('Please choose a video file (MP4, WebM or MOV).');
+      return;
+    }
+    setExportError(null);
+    setSourceFile({ url: URL.createObjectURL(file), name: file.name, offset: 0, blob: file });
+  };
+
+  // A downloaded section only covers the range it was fetched for; if the clip moves outside it, drop it.
+  useEffect(() => {
+    if (!sourceFile?.end) return;
+    const clipLen = beats.length ? Math.max(...beats.map((b) => b.end_s)) : 0;
+    if (clipStartSec < sourceFile.offset - 0.05 || clipStartSec + clipLen > sourceFile.end + 0.05) {
+      setSourceFile(null);
+      setExportError('The clip range moved outside the downloaded footage. Get the footage again for the new range.');
+    }
+  }, [clipStartSec, beats, sourceFile]);
+
+  // Keep the local source video on the clip timeline: source time = clip start + playhead.
+  useEffect(() => {
+    const v = sourceVideoRef.current;
+    if (!v || !useSourceFile) return;
+    const target = sourceStartSec + currentTimestamp;
+    if (Math.abs(v.currentTime - target) > 0.3) v.currentTime = target;
+    v.volume = youtubeVolume;
+    if (isPlaying && v.paused) v.play().catch(() => {});
+    if (!isPlaying && !v.paused) v.pause();
+  }, [isPlaying, currentTimestamp, sourceStartSec, useSourceFile, youtubeVolume]);
 
   useEffect(() => {
     if (propVisualMode) {
@@ -136,11 +275,11 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
   };
 
   useEffect(() => {
-    if (sourceYouTubeId) {
+    if (sourceYouTubeId || localSourceName) {
       setVisualMode('youtube-crop');
       setAudioMode('youtube');
     }
-  }, [sourceYouTubeId]);
+  }, [sourceYouTubeId, localSourceName]);
 
   useEffect(() => {
     setClipStartSec(clipStartSeconds);
@@ -288,6 +427,37 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
     return Math.max(...beats.map((b) => b.end_s), 10);
   }, [beats]);
 
+  // Speaker-aware Vertical Fill: a centre crop cuts off speakers who stand left or right of centre, so the clip range
+  // of the source file is analysed (in the background; playback isn't blocked) and the 9:16 window follows the subject.
+  const [autoFrame, setAutoFrame] = useState(true);
+  const [cropTrack, setCropTrack] = useState<{ key: string; path: CropPath } | null>(null);
+  const [isFindingSpeaker, setIsFindingSpeaker] = useState(false);
+  const cropAnalysisRef = useRef<Promise<{ key: string; path: CropPath } | null> | null>(null);
+  const smartCropOn = useSourceFile && autoFrame && visualMode === 'youtube-crop';
+  const cropKey = sourceFile ? `${sourceFile.url}|${sourceStartSec.toFixed(2)}|${totalDuration.toFixed(2)}` : '';
+  const cropPath = smartCropOn && cropTrack?.key === cropKey ? cropTrack.path : null;
+  useEffect(() => {
+    if (!smartCropOn || !sourceFile || cropTrack?.key === cropKey) return;
+    const ac = new AbortController();
+    const key = cropKey;
+    setIsFindingSpeaker(true);
+    cropAnalysisRef.current = analyzeSubjectTrack(sourceFile.url, sourceStartSec, sourceStartSec + totalDuration, { signal: ac.signal })
+      .then(({ path }) => {
+        if (ac.signal.aborted) return null;
+        setCropTrack({ key, path });
+        return { key, path };
+      })
+      .catch(() => null) // a nicety, never a blocker: on failure the centre crop stays
+      .finally(() => {
+        if (!ac.signal.aborted) setIsFindingSpeaker(false);
+      });
+    // A new file, range or mode cancels the running analysis.
+    return () => {
+      ac.abort();
+      setIsFindingSpeaker(false);
+    };
+  }, [smartCropOn, cropKey]);
+
   const activeBeat = useMemo(() => {
     if (beats.length === 0) return null;
     const found = beats.find((b) => currentTimestamp >= b.start_s && currentTimestamp < b.end_s);
@@ -303,20 +473,41 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
     return applyCaptionOffset(allWords, captionOffsetSeconds || 0);
   }, [allWords, captionOffsetSeconds]);
 
-  const captionChunks = useMemo(() => {
-    return chunkWords(effectiveWords, captionStyle.wordsPerChunk);
-  }, [effectiveWords, captionStyle.wordsPerChunk]);
+  // Phrase captions by default: whole clauses, grouped with the renderer's own line layout so each fits two lines.
+  // Re-measured once web fonts have loaded (a fallback font has different widths).
+  const [fontsReady, setFontsReady] = useState(0);
+  useEffect(() => {
+    let alive = true;
+    // Fonts only start loading when first used, so request the caption font explicitly before measuring with it.
+    const font = `${captionStyle.fontWeight || '900'} ${captionStyle.fontSize}px '${captionStyle.fontFamily || 'Montserrat'}'`;
+    Promise.resolve(document.fonts?.load(font))
+      .catch(() => undefined)
+      .then(() => document.fonts?.ready)
+      .then(() => alive && setFontsReady((n) => n + 1))
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [captionStyle.fontFamily, captionStyle.fontWeight, captionStyle.fontSize]);
+  const measureCtx = useMemo(() => (typeof document !== 'undefined' ? document.createElement('canvas').getContext('2d') : null), []);
+  // 4-layer Caption Intelligence model: fullTranscript -> phrase segments -> words -> active highlighted word.
+  const captionModel = useMemo(() => {
+    const fits = measureCtx ? (ws: string[]) => captionLineCount(measureCtx, ws, captionStyle) <= 2 : undefined;
+    return buildCaptionModel(effectiveWords, captionStyle, {
+      maxChars: captionMaxChars(captionStyle.fontSize),
+      fits,
+    });
+  }, [effectiveWords, captionStyle, measureCtx, fontsReady]);
+  const captionChunks = captionModel.segments;
 
+  const activeCaptionState = useMemo(() => getActiveCaptionState(captionModel, currentTimestamp), [captionModel, currentTimestamp]);
   const activeChunk = useMemo(() => {
+    if (activeCaptionState.segment) return activeCaptionState.segment;
     if (captionChunks.length === 0) return null;
-    const direct = captionChunks.find((c) => currentTimestamp >= c.start_s && currentTimestamp <= c.end_s);
-    if (direct) return direct;
     const prev = [...captionChunks].reverse().find((c) => currentTimestamp >= c.start_s);
-    if (prev && currentTimestamp <= prev.end_s + 0.35) {
-      return prev;
-    }
+    if (prev && currentTimestamp <= prev.end_s + 0.35) return prev;
     return null;
-  }, [captionChunks, currentTimestamp]);
+  }, [activeCaptionState, captionChunks, currentTimestamp]);
 
   useEffect(() => {
     const video = videoRef.current;
@@ -345,6 +536,175 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
   }, [activeBeat, isPlaying, currentTimestamp]);
 
   // Video Export Handler using Canvas + MediaRecorder with mixed audio
+  // ---- Post-export & preflight quality gate ----
+  const [quality, setQuality] = useState<QualityReport | null>(null);
+  const [qualityStage, setQualityStage] = useState<string | null>(null);
+  const [isPreflighting, setIsPreflighting] = useState(false);
+  const [pendingDelivery, setPendingDelivery] = useState<{ blob: Blob; name: string } | null>(null);
+  // Punch-ins: a single continuous talking-head shot gets a tighter framing on every other sentence.
+  const [punchIn, setPunchIn] = useState(true);
+  const punchInZoom = (beatIndex: number) =>
+    punchIn && useSourceFile && visualMode === 'youtube-crop' && beats.length > 1 && beatIndex % 2 === 1 ? 1.12 : 1;
+
+  /** What the reel was supposed to contain, so the server can check captions, scenes, audio, and export against it. */
+  const buildTimeline = (rec: RecordedExport | null, canvasW: number, canvasH: number) => {
+    const narrate = aiVoiceEnabled && !(isYouTubeSource && audioSourceMode === 'youtube');
+    const sourceAudible = useSourceFile && audioMode === 'youtube' && !isYoutubeMuted;
+    return {
+      durationS: totalDuration,
+      scriptText: beats.map((b) => b.text).join(' '),
+      beats: beats.map((b, i) => ({
+        text: b.text,
+        start_s: b.start_s,
+        end_s: b.end_s,
+        visual_keywords: b.visual_keywords,
+        asset: rec?.shownByBeat[i]?.asset ?? (b.video_url || b.thumbnail || undefined),
+        kind: rec?.shownByBeat[i]?.kind ?? (b.video_url ? 'broll' : b.thumbnail ? 'image' : 'motion'),
+        role: b.role,
+      })),
+      captions: {
+        enabled: captionStyle.showCaptions !== false,
+        maxLines: 2,
+        positionY: captionStyle.positionY,
+        fontSize: captionStyle.fontSize,
+        grouping: captionStyle.grouping || 'phrase',
+        chunks: captionChunks.map((c, i) => ({
+          text: c.words.map((w) => w.word).join(' '),
+          start_s: c.start_s,
+          end_s: c.end_s,
+          words: c.words.length,
+          lines: rec?.linesByChunk.get(i) ?? (measureCtx ? captionLineCount(measureCtx, c.words.map((w) => w.word), captionStyle) : undefined),
+          wordTimings: c.words.map((w) => ({ word: w.word, start_s: w.start_s, end_s: w.end_s })),
+        })),
+      },
+      audio: {
+        required: musicEnabled || narrate || sourceAudible,
+        narration: narrate,
+        sourceSpeech: sourceAudible,
+        music: musicEnabled,
+        musicVolume: sourceAudible ? musicVolume * 0.3 : musicVolume,
+        clientMeasuredPeakDb: rec?.audioMetrics?.peakDb,
+        clientMeasuredRmsDb: rec?.audioMetrics?.rmsDb,
+      },
+      target: { width: canvasW, height: canvasH, fps: 30 },
+    };
+  };
+
+  /** Instant server-side timeline preflight / post-edit re-evaluation without needing to re-record first. */
+  const handlePreflightCheck = async () => {
+    if (beats.length === 0 || isPreflighting) return;
+    setIsPreflighting(true);
+    try {
+      const canvasW = exportResolution === '720p' ? 720 : 1080;
+      const canvasH = exportResolution === '720p' ? 1280 : 1920;
+      const ev = await runPreflightQuality(buildTimeline(null, canvasW, canvasH), false);
+      if (ev) {
+        setQuality({
+          verified: true,
+          mode: 'preflight',
+          result: {
+            evaluation: ev,
+            before: { score: ev.score, classification: ev.classification, action: ev.action, readyToPublish: ev.readyToPublish, status: ev.status, problems: ev.problems },
+            remediation: [],
+            downloadId: null,
+          },
+          attempts: [],
+          fileName: '',
+          delivered: false,
+        });
+      }
+    } finally {
+      setIsPreflighting(false);
+    }
+  };
+
+  /** Safe 1-click repairs triggered directly from QualityReportPanel recommendations. */
+  const handleApplyRepair = async (action: RepairActionType, _rec: RepairRecommendation) => {
+    if (action === 'enable_phrase_captions') {
+      onUpdateCaptionStyle?.({ grouping: 'phrase', wordsPerChunk: 5, fontSize: Math.min(captionStyle.fontSize, 32) });
+    } else if (action === 'adjust_caption_safe_zone') {
+      onUpdateCaptionStyle?.({ positionY: clampCaptionPositionY(68, isYouTubeSource) });
+    } else if (action === 'realign_captions') {
+      onUpdateCaptionOffset?.(0);
+      onAutoAlignBeats?.();
+    } else if (action === 'diversify_visuals') {
+      if (isYouTubeSource && visualMode === 'youtube-crop') {
+        setPunchIn(true);
+      } else if (onUpdateAllBeats && beats.length > 1) {
+        try {
+          const resultsPerBeat = await Promise.all(
+            beats.map(async (b) => {
+              const r = await apiFetch('/api/stock-footage', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ query: b.visual_keywords || b.text.slice(0, 40), orientation: 'portrait' }),
+              });
+              const d = r.ok ? await r.json() : { results: [] };
+              return Array.isArray(d.results) ? d.results : [];
+            }),
+          );
+          const picks = pickDistinctAssets(resultsPerBeat);
+          const nextBeats = beats.map((b, i) => {
+            const picked = picks[i] >= 0 ? resultsPerBeat[i][picks[i]] : null;
+            return picked ? { ...b, video_url: picked.url || '', thumbnail: picked.thumbnail || b.thumbnail } : b;
+          });
+          onUpdateAllBeats(nextBeats);
+        } catch {
+          // ignore network errors
+        }
+      }
+    } else if (action === 'rerecord_export') {
+      void handleExportVideo();
+      return;
+    }
+    setTimeout(() => {
+      void handlePreflightCheck();
+    }, 120);
+  };
+
+  /** Uploads the exported reel (only the reel, never source footage) and gets it conformed + evaluated. */
+  const verifyExport = async (rec: RecordedExport, canvasW: number, canvasH: number): Promise<{ result?: QualityResult; error?: string }> => {
+    try {
+      setQualityStage('Checking quality: uploading the export…');
+      const up = await apiFetch('/api/quality/uploads', { method: 'POST', headers: { 'Content-Type': rec.mime.split(';')[0] }, body: rec.blob });
+      if (!up.ok) return { error: await apiErrorMessage(up, 'The quality check is unavailable.') };
+      const { uploadId } = await up.json();
+      setQualityStage('Checking quality: conforming to 1080×1920 H.264/AAC and measuring…');
+      const ev = await apiFetch('/api/quality/evaluate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ uploadId, timeline: buildTimeline(rec, canvasW, canvasH) }),
+      });
+      if (!ev.ok) return { error: await apiErrorMessage(ev, 'The quality check failed.') };
+      return { result: await ev.json() };
+    } catch (e: any) {
+      return { error: e?.message || 'The quality check is unavailable.' };
+    }
+  };
+
+  /** Delivers the verified file under its measured spec; a REJECTED reel is not downloaded automatically. */
+  const deliverExport = async (rec: RecordedExport, report: { result?: QualityResult; error?: string }, attempts: string[]) => {
+    const r = report.result;
+    if (r?.downloadId) {
+      const res = await apiFetch(`/api/quality/download/${r.downloadId}`);
+      if (res.ok) {
+        const file = await res.blob();
+        const name = r.fileName || `forge_short_${r.evaluation.spec.label}_${Date.now()}.mp4`;
+        const delivered = r.evaluation.status !== 'REJECTED';
+        setQuality({ verified: true, result: r, attempts, fileName: name, delivered });
+        setPendingDelivery(delivered ? null : { blob: file, name });
+        if (delivered) downloadBlob(file, name);
+        return;
+      }
+    }
+    // The server check was unavailable: deliver the recording, named only by what we could measure here.
+    const local = await measureBlob(rec.blob);
+    const ext = rec.mime.includes('mp4') ? 'mp4' : 'webm';
+    const name = `forge_short_${local ? `${local.width}x${local.height}` : 'unknown-size'}_unverified_${Date.now()}.${ext}`;
+    setQuality({ verified: false, result: r, error: report.error || 'Quality check unavailable.', attempts, fileName: name, local, delivered: true });
+    downloadBlob(rec.blob, name);
+  };
+
   const handleExportVideo = async () => {
     if (beats.length === 0 || isExporting) return;
     if (typeof MediaRecorder === 'undefined') {
@@ -354,26 +714,91 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
     setIsExporting(true);
     setExportProgress(0);
     setExportError(null);
-
+    setQuality(null);
     const canvasW = exportResolution === '720p' ? 720 : 1080;
     const canvasH = exportResolution === '720p' ? 1280 : 1920;
-    const scaleFactor = canvasW / 1080;
 
+    try {
+      // Record → verify on the server (conform + evaluate) → at most MAX_REMEDIATION re-records when the recording
+      // itself is broken (wrong size, cut short, silent) → deliver the verified file under its MEASURED spec.
+      const attempts: string[] = [];
+      let rec = await recordOnce(canvasW, canvasH, MIME_ORDERS[0]);
+      attempts.push(rec.mime);
+      let report = await verifyExport(rec, canvasW, canvasH);
+      for (let i = 1; i <= MAX_REMEDIATION && report.result && needsReRecord(report.result.evaluation); i++) {
+        setQualityStage(`Re-recording (attempt ${i + 1}): ${report.result.evaluation.criticalDefects.map((c) => c.message).join(' ')}`);
+        rec = await recordOnce(canvasW, canvasH, MIME_ORDERS[Math.min(i, MIME_ORDERS.length - 1)]);
+        attempts.push(rec.mime);
+        report = await verifyExport(rec, canvasW, canvasH);
+      }
+      await deliverExport(rec, report, attempts);
+    } catch (err: any) {
+      console.error('Video export error:', err);
+      setExportError(`Export failed: ${err?.message || 'unknown error'}. Please try again, or use 720p.`);
+    } finally {
+      if (!isPlaying) {
+        audioManager.stopBackgroundMusic();
+      }
+      setIsExporting(false);
+      setExportProgress(0);
+      setQualityStage(null);
+    }
+  };
+
+  /** One real-time recording of the timeline. Returns the file plus the evidence the quality check needs. */
+  const recordOnce = async (canvasW: number, canvasH: number, mimeOrder: string[]): Promise<RecordedExport> => {
     const canvas = document.createElement('canvas');
     canvas.width = canvasW;
     canvas.height = canvasH;
     const ctx = canvas.getContext('2d');
-    if (!ctx) {
-      setIsExporting(false);
-      return;
-    }
-
-    try {
+    if (!ctx) throw new Error('canvas 2D is not available');
+    const linesByChunk = new Map<number, number>();
+    const shownByBeat: Array<{ kind: TimelineKind; asset: string } | undefined> = [];
+    setQualityStage(null);
+    {
       const audioRunning = await audioManager.ensureRunning();
+      // The user's own source video: real footage + original speech. Music is ducked under the speech.
+      let sourceVideo: HTMLVideoElement | null = null;
+      let disconnectSource: (() => void) | null = null;
+      const sourceAudible = useSourceFile && audioMode === 'youtube' && !isYoutubeMuted;
+      // Export follows the speaker too; if analysis is still running, wait for it rather than export a centre crop.
+      let exportCropPath: CropPath | null = cropPath;
+      if (!exportCropPath && smartCropOn && cropAnalysisRef.current) {
+        const done = await cropAnalysisRef.current;
+        if (done?.key === cropKey) exportCropPath = done.path;
+      }
+      if (useSourceFile && sourceFile) {
+        sourceVideo = document.createElement('video');
+        sourceVideo.src = sourceFile.url;
+        sourceVideo.playsInline = true;
+        sourceVideo.preload = 'auto';
+        sourceVideo.muted = !sourceAudible;
+        sourceVideo.volume = youtubeVolume;
+        await new Promise<void>((resolve, reject) => {
+          sourceVideo!.onloadedmetadata = () => resolve();
+          sourceVideo!.onerror = () => reject(new Error('could not read the source video file'));
+        });
+        sourceVideo.currentTime = Math.min(sourceStartSec, Math.max(0, sourceVideo.duration - 0.1));
+        await new Promise((r) => {
+          sourceVideo!.onseeked = r;
+          setTimeout(r, 3000);
+        });
+        if (sourceAudible && audioRunning) disconnectSource = audioManager.connectElementToExport(sourceVideo);
+      }
+      const narrate = aiVoiceEnabled && !(isYouTubeSource && audioSourceMode === 'youtube');
+      // Pre-fetch & validate all neural TTS AudioBuffers BEFORE starting MediaRecorder so audio is never missed or silent.
+      let stopScheduledTts: (() => void) | null = null;
+      if (narrate && audioRunning) {
+        setQualityStage('Preparing voiceover audio tracks…');
+        await audioManager.prefetchAllTts(beats, voiceName);
+        setQualityStage(null);
+      }
+
       if (musicEnabled) {
-        audioManager.startBackgroundMusic(musicVolume, musicMood);
+        audioManager.startBackgroundMusic(sourceAudible ? musicVolume * 0.3 : musicVolume, musicMood);
       }
       // Only attach an audio track when the audio graph is running; a dead track stalls the muxer.
+      audioManager.startExportAudioMonitor();
       const audioTrack = audioRunning ? audioManager.getExportAudioStream() : null;
       // captureStream(0) + requestFrame(): emit exactly one frame per drawn frame. With captureStream(30),
       // Chromium only emits frames when it decides the canvas changed, which dropped most frames of static scenes.
@@ -382,20 +807,8 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
         ? new MediaStream([videoTrack, audioTrack])
         : new MediaStream([videoTrack]);
 
-      // Prefer H.264: it is hardware-accelerated almost everywhere, YouTube's preferred upload codec, and
-      // in testing it was the only codec that kept up with real-time 1080p capture on a 4-core machine
-      // (VP8/VP9 software encoders dropped most frames).
-      const mimeTypes = [
-        'video/mp4;codecs=avc1.42E028,mp4a.40.2',
-        'video/mp4;codecs=avc1.42E028',
-        'video/mp4;codecs=avc1',
-        'video/webm;codecs=h264,opus',
-        'video/webm;codecs=h264',
-        'video/mp4',
-        'video/webm;codecs=vp9',
-        'video/webm',
-      ];
-      const supportedMime = mimeTypes.find((m) => MediaRecorder.isTypeSupported(m)) || 'video/webm';
+      // Order chosen by the caller: H.264 first (fastest real-time encoder); a re-record tries another encoder path.
+      const supportedMime = mimeOrder.find((m) => MediaRecorder.isTypeSupported(m)) || 'video/webm';
 
       const recorder = new MediaRecorder(combinedStream, {
         mimeType: supportedMime,
@@ -424,6 +837,10 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
         return v;
       });
 
+      // A still image repeated by consecutive scenes (e.g. every beat of a link-only clip inherits the video's
+      // thumbnail) would sit on screen for the whole reel; only its first scene shows it, the rest get motion scenes.
+      const imageKeys = beats.map((b) => getSafeThumbnail(b.visual_keywords, b.thumbnail));
+      const repeatedImage = imageKeys.map((k, i) => i > 0 && imageKeys.slice(0, i).includes(k) && !isPlaceholderImage(k));
       const imageElements: HTMLImageElement[] = beats.map((b) => {
         const img = new Image();
         img.crossOrigin = 'anonymous';
@@ -445,37 +862,60 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
       ]);
 
       videoElements.forEach((v) => v.play().catch(() => {}));
+      if (sourceVideo) await sourceVideo.play().catch(() => {});
+
+      // Schedule all decoded TTS AudioBuffers sample-accurately on the AudioContext clock aligned with startWall.
+      if (narrate && audioRunning) {
+        const scheduled = audioManager.scheduleTtsTrack(beats, voiceName, true);
+        stopScheduledTts = scheduled.stop;
+      }
 
       // MediaRecorder captures in WALL-CLOCK time, so frames must be drawn in real time.
-      // (Previously the loop ran ~3x faster than real time and a 33s Short exported as ~10s.)
       const fps = 30;
       const frameMs = 1000 / fps;
       const startWall = performance.now();
-      const narrate = aiVoiceEnabled && !(isYouTubeSource && audioSourceMode === 'youtube');
-      let lastSpokenBeat = -1;
       let frame = 0;
 
       while (true) {
         const t = (performance.now() - startWall) / 1000;
         if (t >= totalDuration) break;
-        if (frame % 10 === 0) setExportProgress(Math.min(99, Math.round((t / totalDuration) * 100)));
+        if (frame % 10 === 0) {
+          setExportProgress(Math.min(99, Math.round((t / totalDuration) * 100)));
+          audioManager.sampleExportAudio();
+        }
 
         const bIndex = beats.findIndex((b) => t >= b.start_s && t < b.end_s);
         const activeIdx = bIndex !== -1 ? bIndex : 0;
         const currentV = videoElements[activeIdx];
         const currentImg = imageElements[activeIdx];
         const currentBeat = beats[activeIdx];
-        if (narrate && bIndex !== -1 && bIndex !== lastSpokenBeat) {
-          lastSpokenBeat = bIndex;
-          // Neural TTS audio is routed into the export stream by audioManager.
-          void audioManager.speakNeuralOrFallback(currentBeat.text, voiceName);
-        }
 
         ctx.fillStyle = '#0a0a0a';
         ctx.fillRect(0, 0, canvasW, canvasH);
+        const drawMotion = () =>
+          drawMotionBackground(ctx, {
+            t,
+            beatIndex: activeIdx,
+            beatCount: beats.length,
+            beatProgress: currentBeat ? Math.max(0, Math.min(1, (t - currentBeat.start_s) / Math.max(0.5, currentBeat.end_s - currentBeat.start_s))) : 0,
+            beatElapsed: currentBeat ? Math.max(0, t - currentBeat.start_s) : t,
+            text: currentBeat?.text,
+            keywords: currentBeat?.visual_keywords,
+            w: canvasW,
+            h: canvasH,
+          });
 
         try {
-          if (currentV && currentV.videoWidth) {
+          if (sourceVideo && sourceVideo.videoWidth) {
+            // Keep footage on the wall clock (the recorder is real time): resync only on real drift.
+            const want = sourceStartSec + t;
+            if (Math.abs(sourceVideo.currentTime - want) > 0.35 && !sourceVideo.seeking) sourceVideo.currentTime = want;
+            const cropCenter = exportCropPath ? cropCenterAt(exportCropPath, sourceVideo.currentTime) : 0.5;
+            const zoom = punchInZoom(activeIdx);
+            drawSourceFrame(ctx, sourceVideo, visualMode === 'youtube-fit' ? 'fit' : 'fill', canvasW, canvasH, cropCenter, zoom);
+            shownByBeat[activeIdx] = { kind: 'source', asset: `source@${zoom}` };
+          } else if (currentV && currentV.videoWidth) {
+            shownByBeat[activeIdx] = { kind: 'broll', asset: (currentBeat?.video_url || '').split('?')[0] };
             const vw = currentV.videoWidth;
             const vh = currentV.videoHeight;
             const targetRatio = canvasW / canvasH;
@@ -490,7 +930,8 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
               sy = (vh - sh) / 2;
             }
             ctx.drawImage(currentV, sx, sy, sw, sh, 0, 0, canvasW, canvasH);
-          } else if (currentImg && currentImg.naturalWidth) {
+          } else if (currentImg && currentImg.naturalWidth && !isPlaceholderImage(currentImg.src) && !repeatedImage[activeIdx]) {
+            shownByBeat[activeIdx] = { kind: 'image', asset: currentImg.src.split('?')[0].slice(0, 200) };
             const iw = currentImg.naturalWidth;
             const ih = currentImg.naturalHeight;
             const targetRatio = canvasW / canvasH;
@@ -517,75 +958,25 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
             ctx.drawImage(currentImg, sx, sy, sw, sh, 0, 0, canvasW, canvasH);
             ctx.restore();
           } else {
-            // Elegant native background gradient fallback
-            const grad = ctx.createLinearGradient(0, 0, canvasW, canvasH);
-            grad.addColorStop(0, '#0d121c');
-            grad.addColorStop(1, '#1b2234');
-            ctx.fillStyle = grad;
-            ctx.fillRect(0, 0, canvasW, canvasH);
+            drawMotion();
+            shownByBeat[activeIdx] = { kind: 'motion', asset: `motion:${activeIdx}` };
           }
         } catch {
-          // Graceful fallback if CORS blocks image capture
-          const grad = ctx.createLinearGradient(0, 0, canvasW, canvasH);
-          grad.addColorStop(0, '#0d121c');
-          grad.addColorStop(1, '#1e1b4b');
-          ctx.fillStyle = grad;
-          ctx.fillRect(0, 0, canvasW, canvasH);
+          // CORS-tainted or undecodable media: keep the frame alive with the motion background
+          drawMotion();
+          shownByBeat[activeIdx] = { kind: 'motion', asset: `motion:${activeIdx}` };
         }
 
-        const chunk = captionChunks.find((c) => t >= c.start_s && t <= c.end_s);
+        // Subtle scene transition polish at beat cuts (never introduces black frames)
+        if (currentBeat) {
+          drawSceneTransition(ctx, Math.max(0, t - currentBeat.start_s), activeIdx, canvasW, canvasH);
+        }
+
+        const chunkState = getActiveCaptionState(captionModel, t);
+        const chunk = chunkState.segment;
         if (captionStyle.showCaptions !== false && chunk) {
-          ctx.save();
-          const fontFam = captionStyle.fontFamily || 'Montserrat';
-          const fontWt = captionStyle.fontWeight || '900';
-          const computedFontSize = (captionStyle.fontSize * 1.5) * scaleFactor;
-          ctx.font = `${fontWt} ${computedFontSize}px '${fontFam}', 'Poppins', sans-serif`;
-          ctx.textAlign = 'center';
-          ctx.textBaseline = 'middle';
-
-          const textY = canvasH * (captionStyle.positionY / 100);
-          const wordsInChunk = chunk.words;
-          const isUpper = captionStyle.textTransform !== 'none';
-          const formatWord = (w: string) => isUpper ? w.toUpperCase().replace(/[.,!?;:]/g, '') : w.replace(/[.,!?;:]/g, '');
-
-          const wordMetrics = wordsInChunk.map((w) => {
-            const formatted = formatWord(w.word);
-            return {
-              word: formatted,
-              width: ctx.measureText(formatted + ' ').width,
-              isActive: t >= w.start_s && t <= w.end_s,
-            };
-          });
-
-          const totalTextWidth = wordMetrics.reduce((acc, m) => acc + m.width, 0);
-          let currentX = (canvasW - totalTextWidth) / 2;
-
-          ctx.fillStyle = captionStyle.boxStyle === 'glow' ? 'rgba(10,5,20,0.85)' : 'rgba(0,0,0,0.72)';
-          const padX = 35 * scaleFactor;
-          const boxH = (captionStyle.fontSize * 2.2) * scaleFactor;
-          ctx.beginPath();
-          ctx.roundRect(
-            (canvasW - totalTextWidth) / 2 - padX,
-            textY - boxH / 2,
-            totalTextWidth + padX * 2,
-            boxH,
-            24 * scaleFactor
-          );
-          ctx.fill();
-
-          wordMetrics.forEach((item) => {
-            const wordCenterX = currentX + item.width / 2;
-            ctx.strokeStyle = captionStyle.strokeColor || '#000000';
-            ctx.lineWidth = ((captionStyle.strokeWidth || 4) * 2) * scaleFactor;
-            ctx.strokeText(item.word, wordCenterX, textY);
-
-            ctx.fillStyle = item.isActive ? captionStyle.highlightColor : captionStyle.textColor;
-            ctx.fillText(item.word, wordCenterX, textY);
-
-            currentX += item.width;
-          });
-
-          ctx.restore();
+          const lines = drawCaptionChunk(ctx, { words: chunk.words, t, style: captionStyle, w: canvasW, h: canvasH });
+          linesByChunk.set(chunkState.segmentIndex, Math.max(linesByChunk.get(chunkState.segmentIndex) || 0, lines));
         }
 
         videoTrack.requestFrame?.();
@@ -594,30 +985,20 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
         await new Promise((r) => setTimeout(r, Math.max(0, wait)));
       }
 
+      const audioMetrics = audioManager.getExportAudioMetrics();
       recorder.stop();
+      stopScheduledTts?.();
       audioManager.stopSpeech();
       videoElements.forEach((v) => v.pause());
+      if (sourceVideo) {
+        sourceVideo.pause();
+        disconnectSource?.();
+        sourceVideo.removeAttribute('src');
+        sourceVideo.load();
+      }
 
       const blob = await exportPromise;
-      const downloadUrl = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = downloadUrl;
-      const extension = supportedMime.includes('mp4') ? 'mp4' : 'webm';
-      a.download = `forge_short_${exportResolution}_${Date.now()}.${extension}`;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      // Revoking immediately can cancel the download in some browsers.
-      setTimeout(() => URL.revokeObjectURL(downloadUrl), 60_000);
-    } catch (err: any) {
-      console.error('Video export error:', err);
-      setExportError(`Export failed: ${err?.message || 'unknown error'}. Please try again, or use 720p.`);
-    } finally {
-      if (!isPlaying) {
-        audioManager.stopBackgroundMusic();
-      }
-      setIsExporting(false);
-      setExportProgress(0);
+      return { blob, mime: supportedMime, linesByChunk, shownByBeat, audioMetrics };
     }
   };
 
@@ -631,12 +1012,12 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
           <span className="font-semibold text-white">9:16 Canvas</span>
           <span aria-hidden="true">·</span>
           <span className="font-mono text-[11px] text-neutral-400">
-            {sourceYouTubeId ? (visualMode === 'youtube-crop' ? 'YT Fill' : visualMode === 'youtube-fit' ? 'YT Fit' : 'B-Roll') : 'HD B-Roll'}
+            {isYouTubeSource ? `${sourceYouTubeId ? 'YT ' : ''}${visualMode === 'youtube-crop' ? 'Fill' : visualMode === 'youtube-fit' ? 'Fit' : 'B-Roll'}` : 'HD B-Roll'}
           </span>
         </div>
 
         <div className="flex items-center gap-1.5">
-          {sourceYouTubeId && (
+          {isYouTubeSource && (
             <div className="flex items-center bg-black/40 border border-white/8 rounded-lg p-0.5 text-[10px]">
               <button
                 type="button"
@@ -687,7 +1068,28 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
         className="relative w-full aspect-[9/16] rounded-3xl overflow-hidden shadow-2xl bg-black border border-white/12 select-none group"
       >
         {/* Visual Layer: YouTube Video OR Vertical B-Roll */}
-        {sourceYouTubeId && visualMode !== 'b-roll' ? (
+        {useSourceFile && sourceFile ? (
+          <div className="absolute inset-0 overflow-hidden bg-black flex items-center justify-center">
+            <video
+              ref={sourceVideoRef}
+              src={sourceFile.url}
+              playsInline
+              preload="auto"
+              muted={audioMode !== 'youtube' || isYoutubeMuted}
+              onLoadedMetadata={(e) => {
+                e.currentTarget.currentTime = sourceStartSec + currentTimestamp;
+              }}
+              className={`w-full h-full pointer-events-none ${visualMode === 'youtube-fit' ? 'object-contain' : 'object-cover'}`}
+              style={{
+                ...(cropPath && visualMode === 'youtube-crop'
+                  ? { objectPosition: `${objectPositionPercent(cropXAt(cropPath, sourceStartSec + currentTimestamp), cropPath.cropFrac)}% 50%` }
+                  : {}),
+                // Same punch-in as the export (tighter framing on alternate sentences).
+                ...(punchInZoom(activeBeat ? beats.indexOf(activeBeat) : 0) > 1 ? { transform: 'scale(1.12)', transformOrigin: '50% 35%' } : {}),
+              }}
+            />
+          </div>
+        ) : sourceYouTubeId && visualMode !== 'b-roll' ? (
           visualMode === 'youtube-fit' ? (
             <div className="absolute inset-0 overflow-hidden bg-black flex items-center justify-center">
               {/* Ambient blurred backdrop of original YouTube video */}
@@ -791,11 +1193,9 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
               }`}
             >
               {activeChunk.words.map((w, idx) => {
-                const isWordActive = currentTimestamp >= w.start_s && currentTimestamp <= w.end_s;
+                const isWordActive = currentTimestamp >= w.start_s - 0.04 && currentTimestamp <= w.end_s + 0.06;
                 const isUppercase = captionStyle.textTransform !== 'none';
-                const displayText = isUppercase
-                  ? w.word.toUpperCase().replace(/[.,!?;:]/g, '')
-                  : w.word.replace(/[.,!?;:]/g, '');
+                const displayText = formatCaptionDisplayWord(w.word, isUppercase);
 
                 return (
                   <span
@@ -891,8 +1291,8 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
           </div>
         </div>
 
-        {/* Framing Selector for YouTube Clip */}
-        {sourceYouTubeId && (
+        {/* Framing Selector for a clip from a source video (YouTube or the user's own file) */}
+        {isYouTubeSource && (
           <div className="grid grid-cols-3 gap-1.5 p-1 bg-[#0f141c] border border-white/8 rounded-xl text-xs">
             <button
               onClick={() => handleSetVisualMode('youtube-crop')}
@@ -920,6 +1320,97 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
             </button>
           </div>
         )}
+        {isYouTubeSource && visualMode === 'youtube-crop' && (
+          <div className="flex items-center justify-between gap-2 px-1 text-[11px]">
+            <label className="flex items-center gap-1.5 text-neutral-300 cursor-pointer">
+              <input type="checkbox" checked={autoFrame} onChange={(e) => setAutoFrame(e.target.checked)} className="accent-rose-500" />
+              <ScanFace className="w-3.5 h-3.5" />
+              <span>Auto-frame speaker</span>
+            </label>
+            <label className="flex items-center gap-1.5 text-neutral-300 cursor-pointer" title="Tighter framing on every other sentence, so a single talking-head shot doesn't sit unchanged">
+              <input type="checkbox" checked={punchIn} onChange={(e) => setPunchIn(e.target.checked)} className="accent-rose-500" />
+              <span>Punch-ins</span>
+            </label>
+            {smartCropOn && (
+              <span className="flex items-center gap-1 text-neutral-500" aria-live="polite">
+                {isFindingSpeaker ? (
+                  <>
+                    <Loader2 className="w-3 h-3 animate-spin" />
+                    Finding the speaker…
+                  </>
+                ) : cropPath ? (
+                  'Speaker framed'
+                ) : null}
+              </span>
+            )}
+          </div>
+        )}
+
+        {isYouTubeSource && (
+          <div className="p-2.5 bg-[#0f141c] border border-white/8 rounded-xl text-xs flex flex-col gap-1.5">
+            {sourceFile ? (
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-1.5 min-w-0 text-emerald-300">
+                  <FileVideo className="w-3.5 h-3.5 shrink-0" />
+                  <span className="truncate" title={sourceFile.name}>{sourceFile.name}</span>
+                  {sourceFile.restored && <span className="shrink-0 text-[10px] text-neutral-400">· restored from this browser</span>}
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setSourceFile(null)}
+                  className="p-1 rounded-md text-neutral-400 hover:text-white hover:bg-white/5"
+                  aria-label="Remove source video file"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            ) : (
+              <>
+              {ytDownloadEnabled && (
+                <div className="flex flex-col gap-1.5 pb-1.5 border-b border-white/8">
+                  <label className="flex items-start gap-1.5 text-[11px] text-neutral-300 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={rightsConfirmed}
+                      onChange={(e) => setRightsConfirmed(e.target.checked)}
+                      className="mt-0.5 accent-rose-500"
+                    />
+                    <span>I own this video or have permission to use it</span>
+                  </label>
+                  <button
+                    type="button"
+                    onClick={handleDownloadFromYouTube}
+                    disabled={!rightsConfirmed || isDownloading}
+                    className="flex items-center justify-center gap-1.5 py-1.5 rounded-lg bg-rose-600 hover:bg-rose-500 disabled:opacity-40 disabled:cursor-not-allowed text-white font-medium transition"
+                  >
+                    {isDownloading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Youtube className="w-3.5 h-3.5" />}
+                    <span>{isDownloading ? 'Downloading clip footage…' : 'Get this clip\'s footage from YouTube'}</span>
+                  </button>
+                </div>
+              )}
+              <label className="flex items-center justify-center gap-1.5 py-1.5 rounded-lg border border-dashed border-white/15 text-neutral-200 hover:border-rose-400/60 hover:text-white cursor-pointer transition">
+                <FileVideo className="w-3.5 h-3.5" />
+                <span>Add your video file for real footage + audio</span>
+                <input
+                  type="file"
+                  accept="video/*"
+                  className="sr-only"
+                  aria-label="Source video file"
+                  onChange={(e) => handlePickSourceFile(e.target.files?.[0])}
+                />
+              </label>
+              </>
+            )}
+            <p className="text-[10px] leading-snug text-neutral-500">
+              {sourceFile
+                ? 'Export uses this file from the clip start, with its original audio. It stays on your device.'
+                : localSourceName
+                ? `Add ${localSourceName} again (the video the transcript belongs to) to preview and export it. It stays on your device.`
+                : 'Use a copy of the full video you have the rights to (e.g. your own upload from YouTube Studio). It stays on your device.'}
+            </p>
+            {sourceFile?.storageNote && <p className="text-[10px] leading-snug text-amber-300">{sourceFile.storageNote}</p>}
+          </div>
+        )}
 
         {/* Primary Transport Controls */}
         <div className="flex items-center justify-between gap-2 p-2 bg-[#0f141c] border border-white/8 rounded-2xl">
@@ -942,7 +1433,7 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
           </div>
 
           <div className="flex items-center gap-1.5">
-            {sourceYouTubeId && (
+            {isYouTubeSource && (
               <div className="flex items-center gap-1 bg-black/40 border border-white/8 px-2 py-1.5 rounded-xl">
                 <button
                   type="button"
@@ -967,7 +1458,7 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
               </div>
             )}
 
-            {!sourceYouTubeId && onToggleAiVoice && (
+            {!isYouTubeSource && onToggleAiVoice && (
               <button
                 type="button"
                 onClick={onToggleAiVoice}
@@ -1093,34 +1584,74 @@ export const ShortsPlayer: React.FC<ShortsPlayerProps> = ({
           </div>
 
           <p className="text-[10px] leading-snug text-neutral-500 px-1">
-            {isYouTubeSource
-              ? 'Note: YouTube footage and audio cannot be recorded by the browser (embedded player). The export contains the thumbnail/B-roll with your captions; publish the clip from the original video with these captions (SRT in Publishing Pack).'
+            {isYouTubeSource && useSourceFile
+              ? 'Exports in real time with your video file\'s footage and original audio (a 30s clip takes ~30s). Keep this tab in the foreground.'
+              : isYouTubeSource
+              ? `Without your video file the export is a captions-only clip on animated backgrounds (no speaker footage or voice).${sourceYouTubeId ? ' YouTube\'s embedded player cannot be recorded.' : ''}`
               : 'Exports render in real time (a 30s Short takes ~30s). Keep this tab in the foreground. Narration is included when server AI voice is available; browser system voices cannot be recorded.'}
           </p>
+          {isYouTubeSource && !sourceFile && visualMode !== 'b-roll' && (
+            <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-200 flex items-start gap-2">
+              <FileVideo className="w-3.5 h-3.5 mt-0.5 shrink-0" />
+              <span>
+                <strong className="font-semibold">{ytDownloadEnabled ? 'Get the footage from YouTube or add your video file' : 'Add your video file'}</strong>{' '}
+                (above the play controls) to export this clip with the real footage and the speaker&apos;s voice.
+              </span>
+            </div>
+          )}
           {exportError && (
             <div role="alert" className="rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-[11px] text-rose-200">
               {exportError}
             </div>
           )}
-          <button
-            onClick={handleExportVideo}
-            disabled={isExporting || beats.length === 0}
-            className="w-full py-3 px-4 bg-rose-600 hover:bg-rose-500 text-white font-semibold text-xs rounded-xl shadow-lg shadow-rose-950/40 transition flex items-center justify-center gap-2 disabled:opacity-50"
-          >
-            {isExporting ? (
-              <>
-                <Loader2 className="w-4 h-4 animate-spin" />
-                <span>Rendering {exportResolution} Short... {exportProgress}%</span>
-              </>
-            ) : (
-              <>
-                <Download className="w-4 h-4" />
-                <span>Export & Download Finished Short</span>
-              </>
-            )}
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={handleExportVideo}
+              disabled={isExporting || beats.length === 0}
+              className="flex-1 py-3 px-4 bg-rose-600 hover:bg-rose-500 text-white font-semibold text-xs rounded-xl shadow-lg shadow-rose-950/40 transition flex items-center justify-center gap-2 disabled:opacity-50"
+            >
+              {isExporting ? (
+                <>
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                  <span>{qualityStage ? 'Checking quality…' : `Rendering ${exportResolution} Short... ${exportProgress}%`}</span>
+                </>
+              ) : (
+                <>
+                  <Download className="w-4 h-4" />
+                  <span>Export & Download Finished Short</span>
+                </>
+              )}
+            </button>
+            <button
+              type="button"
+              onClick={handlePreflightCheck}
+              disabled={isExporting || isPreflighting || beats.length === 0}
+              title="Run instant pre-export quality check on script, captions, visuals, and audio setup"
+              className="py-3 px-3 bg-[#151c29] hover:bg-[#1e2638] border border-white/10 text-neutral-200 font-semibold text-xs rounded-xl transition flex items-center justify-center gap-1.5 disabled:opacity-50"
+            >
+              {isPreflighting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4 text-rose-400" />}
+              <span>Check</span>
+            </button>
+          </div>
+          {qualityStage && (
+            <p className="text-[11px] text-neutral-400 px-1" aria-live="polite">
+              {qualityStage}
+            </p>
+          )}
+          {quality && (
+            <QualityReportPanel
+              report={quality}
+              isReevaluating={isPreflighting}
+              onDownloadAnyway={pendingDelivery ? () => downloadBlob(pendingDelivery.blob, pendingDelivery.name) : undefined}
+              onReevaluate={handlePreflightCheck}
+              onReexport={handleExportVideo}
+              onApplyRepair={handleApplyRepair}
+            />
+          )}
         </div>
       </div>
     </div>
   );
 };
+
+

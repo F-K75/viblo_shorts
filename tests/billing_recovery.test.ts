@@ -229,11 +229,26 @@ describe('S1: the queue worker is the only code that starts a render encoder', (
     for (const c of mediaCallSites) {
       assert.ok(c > exec && c < execEnd, 'executeQueuedRenderJob is only called inside executeRenderJob (the queue worker)');
     }
-    // Outside server/media_engine/*, nothing else in the server tree spawns ffmpeg directly
+    // Nothing else in the server tree spawns ffmpeg, except the post-export quality gate, which is not a render: it
+    // probes/conforms an already-exported reel, costs no credits, and is bounded on its own (concurrency cap,
+    // per-process timeouts, rate limits, upload size cap). Only these two files may, and only with those bounds.
+    const QUALITY = new Set(['lib/videoQuality/probe.ts', 'routes/quality.ts'].map((f) => path.normalize(f)));
+    // server/media_engine/* is the Forge Media Engine: its only FFmpeg launchers (executor.ts, probe.ts, validator.ts)
+    // are argument-array spawns behind the queue worker, covered by tests/media_*.test.ts. Everything else stays banned.
     const others = fs
       .readdirSync(path.join(ROOT, 'server'), { recursive: true })
       .map(String)
       .filter((f) => f.endsWith('.ts') && !f.startsWith(`media_engine${path.sep}`));
-    for (const f of others) assert.doesNotMatch(fs.readFileSync(path.join(ROOT, 'server', f), 'utf8'), /spawn\(\s*['"]ffmpeg['"]/, f);
+    for (const f of others) {
+      const code = fs.readFileSync(path.join(ROOT, 'server', f), 'utf8');
+      if (QUALITY.has(path.normalize(f))) continue;
+      assert.doesNotMatch(code, /['"]ffmpeg['"]/, f);
+    }
+    const route = fs.readFileSync(path.join(ROOT, 'server/routes/quality.ts'), 'utf8');
+    assert.match(route, /running >= maxConcurrent/, 'quality gate caps concurrent ffmpeg work');
+    assert.match(route, /setTimeout\(\(\) => p\.kill\('SIGKILL'\), timeoutMs\)/, 'quality conform has a kill timeout');
+    assert.match(fs.readFileSync(path.join(ROOT, 'server/lib/videoQuality/probe.ts'), 'utf8'), /proc\.kill\('SIGKILL'\)/, 'probe has a kill timeout');
+    const probeUsers = others.filter((f) => /from ['"].*videoQuality\/probe\.ts['"]/.test(fs.readFileSync(path.join(ROOT, 'server', f), 'utf8')));
+    assert.deepEqual(probeUsers.map((f) => path.normalize(f)), [path.normalize('routes/quality.ts')], 'probe runs only behind the capped quality route');
   });
 });

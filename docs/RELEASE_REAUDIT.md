@@ -43,6 +43,51 @@
 * **The merge is not authorization for further work.** D-2 and Track E each need separate approval. Production
   deployment is not approved.
 
+### Post-merge CI, run 66 (`main` @ `dffa550`, the PR #8 merge): green on attempt 2, after one infrastructure failure
+* **Run:** `42671001928`, `push` to `main` @ `dffa55006001f5f36531934e54716f16d0240b18` (merge of PR #8, docs only;
+  its tree is identical to the reviewed PR head `297ffea`). The log of every job was read: both `docker` attempts, and
+  `test` and `live-llm`.
+* **Attempt 1: `docker` failed** (job `129350272110`) in the step "docker build -f Dockerfile.backup". The build ran
+  `Dockerfile.backup` line 18, which downloads the PostgreSQL apt signing key, and `curl` failed:
+  `curl: (18) HTTP/2 stream 1 was not closed cleanly before end of the underlying stream`
+  (`https://www.postgresql.org/media/keys/ACCC4CF8.asc`). This was an external download failure, not an application
+  or test failure. The later steps that need the backup image were skipped. The D7 step still ran and printed
+  "D7 PASSED". The application image build (`forge-studio:ci`) succeeded.
+* **Attempt 2: only the failed `docker` job was re-run, once** (job `129353953016`). It passed. No other retry was made.
+  `test` and `live-llm` were not re-run; GitHub carries their attempt-1 results into attempt 2 (same job timestamps).
+  **The failed attempt stays part of this record; the retry does not erase it.**
+
+| Job | Result (from the log) |
+|---|---|
+| `test` (`129347108089`; attempt-2 copy `129354016890`, whose log was read): JSON suite | 287 tests, 285 pass, **0 fail**, 0 cancelled, 2 skipped |
+| `test`: every server on PostgreSQL | 287 tests, 278 pass, **0 fail**, 0 cancelled, 9 skipped |
+| `test`: typecheck, build, E2E, audit | typecheck passes; build passes ("built in 2.85s"); E2E JSON 2/2, PostgreSQL 2/2; `bun audit --audit-level=high`: "No vulnerabilities found (checked 389 packages, 2 below --audit-level=high, 1 ignored)". The fetched log is capped at 5 000 lines. |
+| `test`: E2E step's throwaway Playwright install | npm prints "5 vulnerabilities (1 moderate, 4 high)" (D9, still open) |
+| `docker` attempt 2: image builds | `forge-studio:ci` and `forge-backup:ci` both built |
+| `docker` attempt 2: PostgreSQL smoke test (two instances, one `postgres:16`) | both instances ready; a project saved through instance 1 is served by instance 2; `/api/health/details` is 404 without a token and reports `"backend":"postgres"` with it; `/api/health` is `{"status":"ok"}` |
+| `docker` attempt 2: JSON smoke test | single-instance JSON container ready; `scripts/backup.ts create` reports `"created"` |
+| `docker` attempt 2: production refuses unsafe configuration | exit 1 for each: no `TRUST_PROXY`, no `DATABASE_URL`/`STORAGE_BACKEND`, no `TURNSTILE_SECRET` (each with its `[Config]` message) |
+| `docker` attempt 2: **D2** | restore exit 137 (SIGKILL mid-swap); the app refuses to start; "volume unchanged by the refused start (11 files, sha256 identical)"; "D2 PASSED" |
+| `docker` attempt 2: **D7** | "ff-normal PASSED … no orphan", "ff-forced PASSED … no orphan", "D7 PASSED" |
+| `docker` attempt 2: backup image tools | pg_dump, pg_restore and psql 17.11; age 1.1.1; Node v22.23.4 |
+| `docker` attempt 2: errors | 0 `##[error]` lines |
+| `live-llm` (`129347107360`) | green with **0 live tests**: 2 tests, 0 pass, 2 skipped, "GEMINI_API_KEY not set — live LLM tests skipped (NOT passed)". **Not live validation; R-01 remains a release blocker.** |
+
+* **Connection resets during startup are not smoke-test failures.** The `docker` attempt-2 log has two
+  `curl: (56) Recv failure: Connection reset by peer` lines. Each is a readiness check (`/api/ready`, retried up to 30
+  times) that ran before the container was listening. The next checks returned `{"ready":true,…}` and the step
+  passed. A real smoke-test failure would fail the step, because the checks after the readiness loop use `curl -f`
+  under `bash -e`.
+* **Migration 0006 is not established by run 66's `docker` job.** Unlike run 60's log, this log contains no
+  migration-version marker (`"version":6`). The evidence that migration 0006 applies correctly comes from the review
+  R6 tests, which passed in this run's `test` job, in both test steps (the JSON-backend step and the every-server-on-PostgreSQL
+  step):
+  * "Review R6 (postgres): migration 0006 on a real version-5 database": legacy rows keep their data and billing; an
+    interrupted migration leaves version 5 intact; a re-run recovers; the previous release still runs;
+  * "Review R6 (json): ledger files written by the previous release".
+* **This record changes no gate.** D-2 and Track E are not authorized; production deployment is not approved; the
+  PR #7 merge-provenance investigation (open item 6) remains open.
+
 ### Release position after Tracks C, B, A and D-1 (production release NOT approved)
 | Track | State |
 |---|---|

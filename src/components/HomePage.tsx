@@ -29,7 +29,6 @@ const SAMPLE_CLIPS = [
     title: "Steve Jobs: Don't Waste Your Time",
     author: "Stanford Commencement",
     duration: "33s",
-    viralScore: 97,
     url: "https://www.youtube.com/watch?v=UF8uR6Z6KLc",
     tag: "Life & Purpose",
   },
@@ -37,7 +36,6 @@ const SAMPLE_CLIPS = [
     title: "Huberman on Deep Sleep & Focus",
     author: "Huberman Lab",
     duration: "42s",
-    viralScore: 94,
     url: "https://www.youtube.com/watch?v=nm1TxQj94ow",
     tag: "Neuroscience",
   },
@@ -45,7 +43,6 @@ const SAMPLE_CLIPS = [
     title: "Why 99% Of People Never Start",
     author: "Ali Abdaal",
     duration: "29s",
-    viralScore: 91,
     url: "https://www.youtube.com/watch?v=UF8uR6Z6KLc",
     tag: "Productivity",
   },
@@ -395,10 +392,6 @@ export const HomePage: React.FC<HomePageProps> = ({ onStartFree, onSignIn, onTry
                 <div className="flex items-center justify-between text-xs">
                   <span className="px-2 py-0.5 rounded bg-black/40 text-neutral-400 font-mono text-[11px] border border-white/6">
                     {sample.tag}
-                  </span>
-                  <span className="font-mono text-amber-400 font-bold text-xs flex items-center gap-1">
-                    <Flame className="w-3 h-3" />
-                    {sample.viralScore}/100
                   </span>
                 </div>
 

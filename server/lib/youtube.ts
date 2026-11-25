@@ -113,9 +113,68 @@ export function parseXmlCaptions(xml: string): CaptionSegment[] {
   return segments;
 }
 
-/** Parses transcripts pasted from YouTube's "Show transcript" panel, or inline-timestamp formats. */
+// SRT uses "00:00:01,000", WebVTT "00:01.000" or "00:00:01.000" (hours optional).
+const CUE_TIME = String.raw`(?:(\d{1,2}):)?(\d{1,2}):(\d{2})[,.](\d{1,3})`;
+const CUE_TIMING_RE = new RegExp(`^${CUE_TIME}\\s*-->\\s*${CUE_TIME}`);
+
+const cueSeconds = (h: string | undefined, m: string, s: string, frac: string) =>
+  (h ? Number(h) * 3600 : 0) + Number(m) * 60 + Number(s) + Number(frac.padEnd(3, '0')) / 1000;
+
+/** True when the text looks like an SRT or WebVTT subtitle file (has at least one "a --> b" cue timing line). */
+export function isSubtitleFile(rawText: string): boolean {
+  if (!rawText || typeof rawText !== 'string') return false;
+  return /^﻿?WEBVTT/.test(rawText.trimStart()) || rawText.split('\n').some((l) => CUE_TIMING_RE.test(l.trim()));
+}
+
+/**
+ * Parses SRT and WebVTT subtitle files (e.g. downloaded from YouTube Studio, or exported by an editor) into timed
+ * segments. Cue numbers, NOTE/STYLE/REGION blocks, cue settings and markup (<v Speaker>, <c>, <00:00:01.000>, <i>)
+ * are dropped. YouTube's auto-generated VTT repeats the previous caption line at the top of each cue ("rolling"
+ * captions) and adds ~10 ms bridge cues; both are removed so the text is not duplicated.
+ */
+export function parseSubtitleFile(rawText: string): CaptionSegment[] {
+  if (!rawText || typeof rawText !== 'string') return [];
+  const blocks = rawText.replace(/^﻿/, '').replace(/\r\n?/g, '\n').split(/\n[ \t]*\n/);
+  const segments: CaptionSegment[] = [];
+  let prevLines: string[] = [];
+  for (const block of blocks) {
+    const lines = block.split('\n').map((l) => l.trim()).filter(Boolean);
+    const timingIdx = lines.findIndex((l) => CUE_TIMING_RE.test(l));
+    if (timingIdx < 0) continue; // header, NOTE, STYLE, REGION, or stray text
+    const m = CUE_TIMING_RE.exec(lines[timingIdx])!;
+    const start = cueSeconds(m[1], m[2], m[3], m[4]);
+    const end = cueSeconds(m[5], m[6], m[7], m[8]);
+    if (end - start < 0.05) continue; // zero-length bridge cue
+    const textLines = lines
+      .slice(timingIdx + 1)
+      .map((l) => decodeEntities(l.replace(/<[^>]*>/g, '').replace(/\{\\[^}]*\}/g, '')).replace(/\s+/g, ' ').trim())
+      .filter(Boolean);
+    // Rolling captions: drop lines already shown in the previous cue.
+    const fresh = textLines.filter((l) => !prevLines.includes(l));
+    if (textLines.length) prevLines = textLines;
+    const text = fresh.join(' ').trim();
+    if (!text || isNoise(text)) continue;
+    segments.push({ start_s: +start.toFixed(2), end_s: +Math.max(end, start + 0.1).toFixed(2), text });
+  }
+  return segments.sort((a, b) => a.start_s - b.start_s);
+}
+
+/** "[m:ss.xx] text" lines: a compact, unambiguous timed form of any transcript (e.g. to hand to a model). */
+export function segmentsToTimedText(segments: CaptionSegment[]): string {
+  const fmt = (t: number) => `${Math.floor(t / 60)}:${(t % 60).toFixed(2).padStart(5, '0')}`;
+  return segments.map((s) => `[${fmt(s.start_s)}] ${s.text}`).join('\n');
+}
+
+/**
+ * Parses transcripts pasted from YouTube's "Show transcript" panel, inline-timestamp formats, or the contents of an
+ * SRT / WebVTT subtitle file.
+ */
 export function parsePastedTranscriptToSegments(rawText: string): CaptionSegment[] {
   if (!rawText || typeof rawText !== 'string') return [];
+  if (isSubtitleFile(rawText)) {
+    const subs = parseSubtitleFile(rawText);
+    if (subs.length > 0) return subs;
+  }
   const lines = rawText.split('\n').map((l) => l.trim()).filter(Boolean);
   if (lines.length === 0) return [];
   const segments: CaptionSegment[] = [];
@@ -203,5 +262,142 @@ export function estimateSentenceBeats(text: string, durationS: number) {
     const b = { text: s, start_s: +cur.toFixed(2), end_s: +(cur + dur).toFixed(2) };
     cur += dur;
     return b;
+  });
+}
+
+// ---------------------------------------------------------------------------------------------
+// Deterministic clip picking (used when AI ranking is unavailable, and to snap AI picks to sentences)
+// ---------------------------------------------------------------------------------------------
+
+export interface PickedClip {
+  startIdx: number;
+  endIdx: number; // inclusive
+  start_s: number;
+  end_s: number;
+  score: number; // 0-100, heuristic (not a prediction of views)
+  reasons: string[];
+  title: string;
+  keywords: string[];
+}
+
+const STRONG_WORDS = [
+  'secret', 'mistake', 'never', 'always', 'truth', 'why', 'how', 'worst', 'best', 'nobody', 'everyone', 'problem',
+  'actually', 'stop', 'wrong', 'biggest', 'reason', 'realized', 'crazy', 'insane', 'surprising', 'simple', 'only',
+  'nothing', 'everything', 'hate', 'love', 'fear', 'afraid', 'imagine', 'remember', 'important', 'changed', 'difference',
+  'rule', 'lesson', 'trick', 'habit', 'money', 'die', 'dead', 'life', 'happy', 'success', 'fail', 'failure', 'panic',
+];
+const WEAK_OPENERS = /^(and|but|so|because|which|that|or|then|also|um+|uh+|like|well|it|this|they|he|she)\b/i;
+const INTRO_OUTRO = /\b(thank you|thanks for (watching|listening)|subscribe|welcome (back|to)|hi everyone|hello everyone|today i('m| am) going to|in this video|see you (next|in the)|like and subscribe)\b/i;
+const DIGRESSION = /\b(let me tell you about|by the way|anyway|back to the (main )?point|quick side note|off topic|where was i)\b/i;
+const STOPWORDS = new Set(('the a an and or but so because which that this these those it its i me my we our you your he she they them ' +
+  'their is are was were be been being have has had do does did of to in on at for with from by as about into over after before ' +
+  'just not no yes very really can could would should will what when where who how why there here than then if all any some ' +
+  'more most much many one two three get got going go like know think thing things way also even dont im youre its thats ' +
+  'kind sort lot little bit right okay well now people time say said make made want see').split(' '));
+
+const endsSentence = (t: string) => /[.!?]["')\]]?$/.test(t.trim());
+const startsSentence = (t: string) => /^["'(\[]?[A-Z0-9]/.test(t.trim());
+
+export function hookFeatures(text: string) {
+  const words = text.toLowerCase().match(/[a-z0-9']+/g) || [];
+  const first = words.slice(0, 18);
+  const reasons: string[] = [];
+  let s = 0;
+  if (/\?/.test(text.split(/(?<=[.!?])\s/).slice(0, 2).join(' '))) { s += 3; reasons.push('opens with a question'); }
+  const strong = first.filter((w) => STRONG_WORDS.includes(w)).length;
+  if (strong) { s += Math.min(3, strong * 1.5); reasons.push('strong opening words'); }
+  if (first.some((w) => w === 'you' || w === 'your')) { s += 1; reasons.push('speaks to the viewer'); }
+  if (first.some((w) => /^\d+$/.test(w))) { s += 1; reasons.push('concrete number up front'); }
+  if (WEAK_OPENERS.test(text.trim())) { s -= 2.5; reasons.push('starts on a connective word (needs context)'); }
+  return { s, reasons };
+}
+
+/**
+ * Picks the strongest self-contained moments from a timed transcript: sentence-aligned windows of minS-maxS seconds,
+ * scored on hook strength, density of questions / strong words / numbers, clean start and end, and with intros/outros
+ * penalised. Returns up to `count` non-overlapping clips, best first.
+ */
+export function pickTranscriptClips(
+  segments: CaptionSegment[],
+  opts: { count?: number; minS?: number; maxS?: number; idealS?: [number, number] } = {},
+): PickedClip[] {
+  const { count = 3, minS = 18, maxS = 50, idealS = [25, 40] } = opts;
+  const segs = segments.filter((s) => s.text && s.end_s > s.start_s).sort((a, b) => a.start_s - b.start_s);
+  if (segs.length === 0) return [];
+  const total = segs[segs.length - 1].end_s;
+  const hasPunctuation = segs.filter((s) => /[.!?]/.test(s.text)).length >= segs.length * 0.2;
+
+  const goodStart = (i: number) => {
+    if (i === 0) return true;
+    const gap = segs[i].start_s - segs[i - 1].end_s;
+    return hasPunctuation ? endsSentence(segs[i - 1].text) && startsSentence(segs[i].text) : gap >= 0.6 || startsSentence(segs[i].text);
+  };
+  const goodEnd = (j: number) => {
+    if (j === segs.length - 1) return true;
+    const gap = segs[j + 1].start_s - segs[j].end_s;
+    return hasPunctuation ? endsSentence(segs[j].text) : gap >= 0.6;
+  };
+
+  const candidates: PickedClip[] = [];
+  for (let i = 0; i < segs.length; i++) {
+    const startOk = goodStart(i);
+    for (let j = i; j < segs.length; j++) {
+      const dur = segs[j].end_s - segs[i].start_s;
+      if (dur > maxS) break;
+      if (dur < minS) continue;
+      const endOk = goodEnd(j);
+      const text = segs.slice(i, j + 1).map((s) => s.text).join(' ');
+      const words = text.toLowerCase().match(/[a-z0-9']+/g) || [];
+      const hook = hookFeatures(text);
+      const reasons = [...hook.reasons];
+      let score = 50 + hook.s * 4;
+      if (startOk) { score += 6; } else { score -= 12; reasons.push('starts mid-sentence'); }
+      if (endOk) { score += 6; reasons.push('ends on a complete thought'); } else { score -= 10; reasons.push('ends mid-sentence'); }
+      const strongDensity = words.filter((w) => STRONG_WORDS.includes(w)).length / Math.max(1, words.length);
+      score += Math.min(10, strongDensity * 250);
+      const questions = (text.match(/\?/g) || []).length;
+      if (questions) score += Math.min(6, questions * 2);
+      const youDensity = words.filter((w) => w === 'you' || w === 'your').length / Math.max(1, words.length);
+      score += Math.min(5, youDensity * 120);
+      const wps = words.length / dur;
+      if (wps < 1.4) { score -= 6; reasons.push('slow / sparse speech'); }
+      if (dur < idealS[0]) score -= (idealS[0] - dur) * 0.8;
+      if (dur > idealS[1]) score -= (dur - idealS[1]) * 0.8;
+      if (INTRO_OUTRO.test(text)) { score -= 15; reasons.push('contains intro/outro talk'); }
+      if (DIGRESSION.test(text)) { score -= 12; reasons.push('drifts into a tangent'); }
+      if (segs[i].start_s < total * 0.03 && total > 180) score -= 8;
+      candidates.push({ startIdx: i, endIdx: j, start_s: segs[i].start_s, end_s: segs[j].end_s, score, reasons, title: '', keywords: [] });
+    }
+  }
+  candidates.sort((a, b) => b.score - a.score);
+
+  const picked: PickedClip[] = [];
+  for (const c of candidates) {
+    if (picked.length >= count) break;
+    if (picked.some((p) => c.start_s < p.end_s - 0.05 && c.end_s > p.start_s + 0.05)) continue; // back-to-back is fine
+    picked.push(c);
+  }
+
+  return picked.map((c) => {
+    const text = segs.slice(c.startIdx, c.endIdx + 1).map((s) => s.text).join(' ');
+    const firstSentence = (text.match(/^[^.!?]+[.!?]?/)?.[0] || text).trim();
+    const title = firstSentence.length <= 60 ? firstSentence : firstSentence.slice(0, 60).replace(/\s+\S*$/, '') + '…';
+    const freq = new Map<string, number>();
+    for (const w of text.toLowerCase().match(/[a-z][a-z']{3,}/g) || []) {
+      const k = w.replace(/'/g, '');
+      // Topic words only: stopwords and generic hook words ("never", "always") make useless hashtags.
+      if (!STOPWORDS.has(k) && !STRONG_WORDS.includes(k)) freq.set(w, (freq.get(w) || 0) + 1);
+    }
+    const keywords = [...freq.entries()].sort((a, b) => b[1] - a[1]).slice(0, 4).map(([w]) => w.replace(/'/g, ''));
+    const positives = c.reasons.filter((r) => !/mid-sentence|intro|slow|connective|tangent/.test(r));
+    return {
+      ...c,
+      start_s: +c.start_s.toFixed(2),
+      end_s: +c.end_s.toFixed(2),
+      score: Math.max(0, Math.min(100, Math.round(c.score))),
+      reasons: positives.length ? positives : ['most self-contained passage available'],
+      title,
+      keywords,
+    };
   });
 }

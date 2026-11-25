@@ -47,7 +47,7 @@ describe('health, readiness, config', () => {
   test('config exposes feature flags only (no keys, model names or provider details)', async () => {
     const d = await (await api('/api/config')).json();
     // captcha: the public Turnstile site key when CAPTCHA is required, else null (never the secret; Track A)
-    assert.deepEqual(d, { features: { ai: false, stockFootage: false, billing: 'disabled', captcha: null } });
+    assert.deepEqual(d, { features: { ai: false, stockFootage: false, youtubeDownload: false, billing: 'disabled', captcha: null } });
   });
   test('security headers present, x-powered-by removed', async () => {
     const r = await api('/api/health');
@@ -141,8 +141,8 @@ describe('projects: lifecycle and isolation', () => {
   });
 
   test('POST /api/projects/claim transfers guest projects to signed-in user and enforces isolation', async () => {
-    const fb1 = srv.signFirebaseToken({ sub: 'firebase-claim-1', email: 'c1@example.com' });
-    const fb2 = srv.signFirebaseToken({ sub: 'firebase-claim-2', email: 'c2@example.com' });
+    const fb1 = srv.signFirebaseToken({ sub: 'firebase-claim-1', email: 'c1@example.com', email_verified: true });
+    const fb2 = srv.signFirebaseToken({ sub: 'firebase-claim-2', email: 'c2@example.com', email_verified: true });
 
     // Unauthenticated and guest callers are rejected
     assert.equal((await post('/api/projects/claim', undefined, { guestToken: A })).status, 401);

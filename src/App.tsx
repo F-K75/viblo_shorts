@@ -32,11 +32,14 @@ import {
   AudioSourceMode,
   VisualSourceMode,
   Project,
+  CreationMode,
 } from './types';
 import {
   estimateWordTimings,
   assignBeatTimings,
   recalculateWordsFromBeats,
+  pickDistinctAssets,
+  retimeBeatsToNarration,
   autoAlignBeatTimelines,
   shiftAllBeats,
 } from './utils/pipeline';
@@ -54,6 +57,7 @@ import { BillingModal } from './components/BillingModal';
 import { MyProjectsModal } from './components/MyProjectsModal';
 import { PublishingPackModal } from './components/PublishingPackModal';
 import { apiFetch, apiErrorMessage, clearGuestSession, hasGuestSession } from './utils/api';
+import { footageKeyFor, useSourceFootage } from './utils/useSourceFootage';
 import { auth } from './utils/googleDrive';
 import { onAuthStateChanged, signOut } from 'firebase/auth';
 
@@ -117,7 +121,7 @@ export const App: React.FC = () => {
   // Studio Progressive Flow: 1: Source & Idea -> 2: Clip Strategies & Trimmer -> 3: Studio Canvas & Timeline -> 4: Forge Media Engine
   const [studioStep, setStudioStep] = useState<1 | 2 | 3 | 4>(1);
 
-  const [creationMode, setCreationMode] = useState<'youtube' | 'prompt'>('youtube');
+  const [creationMode, setCreationMode] = useState<CreationMode>('youtube');
   const [topic, setTopic] = useState("Steve Jobs' 2005 Stanford Commencement Address");
   const [audience, setAudience] = useState('general YouTube audience');
   const [tone, setTone] = useState('energetic, direct, no fluff');
@@ -150,7 +154,8 @@ export const App: React.FC = () => {
     strokeColor: '#000000',
     strokeWidth: 5,
     positionY: 68,
-    wordsPerChunk: 2,
+    wordsPerChunk: 5,
+    grouping: 'phrase',
     textTransform: 'uppercase',
     boxStyle: 'rounded-pill',
     badge: 'Hormozi Gold',
@@ -160,8 +165,9 @@ export const App: React.FC = () => {
   const [isPlaying, setIsPlaying] = useState(false);
   const [voiceName, setVoiceName] = useState('Kore');
   const [aiVoiceEnabled, setAiVoiceEnabled] = useState(false);
-  const [musicEnabled, setMusicEnabled] = useState(false);
-  const [musicVolume, setMusicVolume] = useState(0.12);
+  // On by default: a silent Short is rarely what anyone wants to upload. Toggle in the player.
+  const [musicEnabled, setMusicEnabled] = useState(true);
+  const [musicVolume, setMusicVolume] = useState(0.3);
 
   const [editingClipBeat, setEditingClipBeat] = useState<Beat | null>(null);
   const [isDriveModalOpen, setIsDriveModalOpen] = useState(false);
@@ -174,6 +180,10 @@ export const App: React.FC = () => {
   const [userPlan, setUserPlan] = useState<'free' | 'pro' | 'studio'>('free');
   const [saveError, setSaveError] = useState<string | null>(null);
   const [authSynced, setAuthSynced] = useState(!auth);
+
+  // The user's own source footage lives here (not in the player) so switching steps keeps it, and in this browser's
+  // IndexedDB keyed by project + source video so a reload or reopening the project restores it.
+  const { sourceFile, setSourceFile, moveFootage } = useSourceFootage(footageKeyFor(currentProjectId, script), footageKeyFor(undefined, script));
 
   const currentPageRef = useRef(currentPage);
   currentPageRef.current = currentPage;
@@ -277,6 +287,7 @@ export const App: React.FC = () => {
 
       if (res.ok) {
         const data = await res.json();
+        moveFootage(footageKeyFor(currentProjectId, script), footageKeyFor(data.project.id, script));
         setCurrentProjectId(data.project.id);
         try {
           localStorage.setItem('forge_active_project', JSON.stringify(data.project));
@@ -312,9 +323,8 @@ export const App: React.FC = () => {
     if (proj.visualMode) {
       setVisualMode(proj.visualMode);
     }
-    if (proj.videoInfo) {
-      setVideoInfo(proj.videoInfo);
-    }
+    // A project from the user's own video has no YouTube info; don't keep the previous project's.
+    setVideoInfo(proj.videoInfo ?? null);
     setStudioStep(3);
     setLastSavedMessage(`Loaded "${proj.title.slice(0, 20)}..."`);
     setTimeout(() => setLastSavedMessage(null), 3000);
@@ -466,7 +476,7 @@ export const App: React.FC = () => {
           return 0;
         }
 
-        const isYouTubeVoice = Boolean(currentScript?.sourceYouTubeId && currentScript?.audioSourceMode !== 'tts');
+        const isYouTubeVoice = Boolean((currentScript?.sourceYouTubeId || currentScript?.sourceLocalVideo) && currentScript?.audioSourceMode !== 'tts');
         if (!isYouTubeVoice && aiVoiceEnabledRef.current) {
           const currentBeat = currentScript?.beats.find((b) => prev < b.start_s && next >= b.start_s);
           if (currentBeat) {
@@ -529,7 +539,9 @@ export const App: React.FC = () => {
       setGenerationStep('Matching vertical footage to Gemini visual prompts...');
       const timedBeats = assignBeatTimings(scriptData.beats, words);
 
-      const finalBeats: Beat[] = await Promise.all(
+      // Search per scene, then choose per scene WITHOUT repeating a clip another scene already uses (results[0] for
+      // every beat showed the same clip again whenever queries were similar or the fallback library answered).
+      const searchResults: Array<Array<{ url?: string; thumbnail?: string }>> = await Promise.all(
         timedBeats.map(async (beat) => {
           try {
             const fRes = await apiFetch('/api/stock-footage', {
@@ -538,20 +550,21 @@ export const App: React.FC = () => {
               body: JSON.stringify({ query: beat.visual_keywords }),
             });
             const fData = await fRes.json();
-            const chosen = fData.results?.[0];
-            return {
-              ...beat,
-              video_url: chosen?.url || '',
-              thumbnail: getSafeThumbnail(beat.visual_keywords, chosen?.thumbnail),
-            };
-          } catch (e) {
-            return {
-              ...beat,
-              thumbnail: getSafeThumbnail(beat.visual_keywords),
-            };
+            return Array.isArray(fData.results) ? fData.results : [];
+          } catch {
+            return [];
           }
         })
       );
+      const picks = pickDistinctAssets(searchResults);
+      const finalBeats: Beat[] = timedBeats.map((beat, i) => {
+        const chosen = picks[i] >= 0 ? searchResults[i][picks[i]] : undefined;
+        return {
+          ...beat,
+          video_url: chosen?.url || '',
+          thumbnail: getSafeThumbnail(beat.visual_keywords, chosen?.thumbnail),
+        };
+      });
 
       const newScript: ShortScript = {
         hook: scriptData.hook || finalBeats[0]?.text || '',
@@ -619,7 +632,7 @@ export const App: React.FC = () => {
       setVideoInfo(infoData);
       setTopic(infoData.title);
 
-      setGenerationStep('Gemini analyzing viral moments and high-retention clip strategies...');
+      setGenerationStep(customTranscript ? 'Finding the strongest clip moments in the transcript...' : 'Fetching captions and finding the strongest clip moments...');
       const genRes = await apiFetch('/api/youtube/generate-clips', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -661,9 +674,62 @@ export const App: React.FC = () => {
     }
   };
 
-  const handleSelectYouTubeCandidate = async (clip: YouTubeClipCandidate, infoOverride?: YouTubeVideoInfo) => {
-    const currentInfo = infoOverride || videoInfo;
-    if (!currentInfo) return;
+  // "Your Video to Clips": only the transcript goes to the server; the file is attached in the browser (offset 0,
+  // it is the whole video) and stored locally under this draft, so the canvas opens with real footage + audio.
+  const handleAnalyzeLocalVideo = async (file: File, transcript: string, objective: string, durationSeconds?: number) => {
+    setIsGenerating(true);
+    setIsPlaying(false);
+    audioManager.stopAll();
+    setYoutubeError(null);
+    setAiNotice(null);
+
+    try {
+      setGenerationStep('Finding the strongest clip moments in your transcript...');
+      const genRes = await apiFetch('/api/clips/from-transcript', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ transcript, title: file.name, durationSeconds, clipObjective: objective }),
+      });
+      if (!genRes.ok) {
+        throw new Error(await apiErrorMessage(genRes, 'Could not find clips in this transcript.'));
+      }
+      const genData = await genRes.json();
+      if (!genData.clips || genData.clips.length === 0) {
+        throw new Error(genData.error || 'No clips found in this transcript.');
+      }
+
+      setAiNotice(genData.fallbackMessage ? `${genData.fallbackMessage} ${genData.groundingWarning || ''}`.trim() : genData.groundingWarning || null);
+      setClipCandidates(genData.clips);
+      setCurrentProjectId(undefined);
+      setVideoInfo(null);
+      setCreationMode('local');
+      setVisualMode('youtube-crop');
+
+      const localVideo = { name: file.name, ...(durationSeconds ? { durationSeconds: +durationSeconds.toFixed(2) } : {}) };
+      await handleSelectYouTubeCandidate(genData.clips[0], undefined, localVideo);
+      setSourceFile(
+        { url: URL.createObjectURL(file), name: file.name, offset: 0, blob: file },
+        footageKeyFor(undefined, { sourceLocalVideo: localVideo }),
+      );
+      setStudioStep(2);
+    } catch (err: any) {
+      console.error('Failed to find clips in the local video:', err);
+      setYoutubeError(err?.message || 'Could not find clips in your video. Check the transcript and try again.');
+    } finally {
+      setIsGenerating(false);
+      setGenerationStep('');
+    }
+  };
+
+  const handleSelectYouTubeCandidate = async (
+    clip: YouTubeClipCandidate,
+    infoOverride?: YouTubeVideoInfo,
+    localOverride?: { name: string; durationSeconds?: number },
+  ) => {
+    const currentInfo = infoOverride || (localOverride ? undefined : videoInfo);
+    // A clip from the user's own video file: no YouTube info, the file name identifies the source.
+    const localVideo = currentInfo ? undefined : localOverride || scriptRef.current?.sourceLocalVideo;
+    if (!currentInfo && !localVideo) return;
 
     const startSec = clip.startSeconds ?? 15;
     const endSec = clip.endSeconds ?? (startSec + 30);
@@ -689,19 +755,20 @@ export const App: React.FC = () => {
 
     const finalBeats: Beat[] = timedBeats.map((beat) => ({
       ...beat,
-      video_url: '', // Real YouTube video rendered directly from iframe!
-      thumbnail: currentInfo.thumbnailUrl,
+      video_url: '', // Real YouTube video rendered directly from iframe (or the user's own file)!
+      thumbnail: currentInfo?.thumbnailUrl,
     }));
 
     setScript({
       hook: clip.hook || finalBeats[0]?.text || '',
       title: clip.suggestedTitles?.[0] || `${clip.clipTitle} #shorts`,
-      description: clip.description || `Key moment from "${currentInfo.title}" by ${currentInfo.authorName}.`,
+      description:
+        clip.description || (currentInfo ? `Key moment from "${currentInfo.title}" by ${currentInfo.authorName}.` : `Key moment from ${localVideo!.name}.`),
       hashtags: clip.hashtags || ['#shorts', '#viral'],
       beats: finalBeats,
-      sourceYouTubeId: currentInfo.videoId,
-      sourceYouTubeTitle: currentInfo.title,
-      sourceYouTubeAuthor: currentInfo.authorName,
+      ...(currentInfo
+        ? { sourceYouTubeId: currentInfo.videoId, sourceYouTubeTitle: currentInfo.title, sourceYouTubeAuthor: currentInfo.authorName }
+        : { sourceLocalVideo: localVideo }),
       viralScore: clip.viralScore,
       clipReasoning: clip.reasoning,
       clipStartSeconds: startSec,
@@ -711,7 +778,7 @@ export const App: React.FC = () => {
 
     const accurateWords = recalculateWordsFromBeats(finalBeats);
     setAllWords(accurateWords);
-    setTopic(currentInfo.title);
+    setTopic(currentInfo ? currentInfo.title : localVideo!.name);
     setCurrentTimestamp(0);
   };
 
@@ -764,14 +831,34 @@ export const App: React.FC = () => {
     }
   };
 
-  const handleToggleAiVoice = () => {
-    setAiVoiceEnabled((prev) => {
-      const next = !prev;
-      if (!next) {
-        audioManager.stopSpeech();
+  const [isSyncingVoice, setIsSyncingVoice] = useState(false);
+  /**
+   * Times every beat (and its captions) to the real narration: lines are fetched once up front (cached, so playback and
+   * export use them without another call), measured, and the beats re-timed so no line is cut off by the next and
+   * captions follow the voice. Only for scripted Shorts; clips keep the speaker's own timing.
+   */
+  const syncBeatsToNarration = async (voice: string) => {
+    if (!script?.beats?.length || script.sourceYouTubeId || script.sourceLocalVideo) return;
+    setIsSyncingVoice(true);
+    try {
+      const durations = await Promise.all(script.beats.map((b) => audioManager.prefetchTts(b.text, voice)));
+      if (durations.every((d) => d === null)) {
+        setAiNotice('AI voice is unavailable on this server, so beats keep their estimated timing.');
+        return;
       }
-      return next;
-    });
+      const beats = retimeBeatsToNarration(script.beats, durations);
+      setScript({ ...script, beats });
+      setAllWords(recalculateWordsFromBeats(beats));
+    } finally {
+      setIsSyncingVoice(false);
+    }
+  };
+
+  const handleToggleAiVoice = () => {
+    const next = !aiVoiceEnabled;
+    setAiVoiceEnabled(next);
+    if (!next) audioManager.stopSpeech();
+    else void syncBeatsToNarration(voiceName);
   };
 
   const handleTogglePlay = () => {
@@ -1178,9 +1265,19 @@ export const App: React.FC = () => {
             </div>
           )}
           {aiNotice && (
-            <div role="status" className="flex items-start justify-between gap-3 rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-xs text-amber-100">
-              <span>{aiNotice}</span>
-              <button onClick={() => setAiNotice(null)} className="text-amber-300 hover:text-white" aria-label="Dismiss notice">✕</button>
+            <div role="status" className="flex items-start justify-between gap-3 rounded-xl border border-amber-500/30 bg-amber-950/40 px-4 py-3 text-xs text-amber-100 shadow-sm backdrop-blur-sm">
+              <div className="flex items-start gap-2.5">
+                <span className="text-amber-400 mt-0.5 text-sm shrink-0" aria-hidden="true">⚠️</span>
+                <div className="space-y-1">
+                  <p className="leading-relaxed">{aiNotice}</p>
+                  {aiNotice.includes('GEMINI_API_KEY') && (
+                    <p className="text-[11px] text-amber-300/90 font-medium">
+                      To enable Gemini AI video analysis and custom script generation, configure your Gemini API key in the AI Studio <strong>Settings &gt; Secrets</strong> panel.
+                    </p>
+                  )}
+                </div>
+              </div>
+              <button onClick={() => setAiNotice(null)} className="text-amber-300/70 hover:text-white shrink-0 ml-2" aria-label="Dismiss notice">✕</button>
             </div>
           )}
         </div>
@@ -1202,6 +1299,7 @@ export const App: React.FC = () => {
             processingStep={generationStep}
             onGenerateFromPrompt={handleGenerateFromPrompt}
             onAnalyzeYouTubeUrl={handleAnalyzeYouTubeUrl}
+            onAnalyzeLocalVideo={handleAnalyzeLocalVideo}
             sampleVideos={SAMPLE_VIDEOS}
             quickTopics={QUICK_TOPICS}
             errorMessage={youtubeError}
@@ -1247,7 +1345,10 @@ export const App: React.FC = () => {
             onSeek={handleSeek}
             onTogglePlay={handleTogglePlay}
             onReset={handleReset}
-            onSelectVoiceName={setVoiceName}
+            onSelectVoiceName={(v: string) => {
+              setVoiceName(v);
+              if (aiVoiceEnabled) void syncBeatsToNarration(v); // a different voice speaks at a different pace
+            }}
             onToggleAiVoice={handleToggleAiVoice}
             onToggleMusic={() => {
               setMusicEnabled(!musicEnabled);
@@ -1277,6 +1378,8 @@ export const App: React.FC = () => {
             onApplyWordsAndBeats={handleApplyWordsAndBeats}
             visualMode={visualMode}
             onChangeVisualMode={setVisualMode}
+            sourceFile={sourceFile}
+            onChangeSourceFile={(next) => setSourceFile(next)}
           />
         )}
 

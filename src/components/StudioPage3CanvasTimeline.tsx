@@ -16,6 +16,7 @@ import { CaptionStyleConfig } from './CaptionStyleConfig';
 import { YouTubeMetadataCard } from './YouTubeMetadataCard';
 import { ShortsPlayer } from './ShortsPlayer';
 import { audioManager } from '../utils/audio';
+import type { SourceFootage } from '../utils/useSourceFootage';
 
 interface StudioPage3CanvasTimelineProps {
   script: ShortScript;
@@ -54,6 +55,8 @@ interface StudioPage3CanvasTimelineProps {
   onApplyWordsAndBeats?: (words: WordTiming[], beats?: Beat[]) => void;
   visualMode?: VisualSourceMode;
   onChangeVisualMode?: (mode: VisualSourceMode) => void;
+  sourceFile?: SourceFootage | null;
+  onChangeSourceFile?: (next: SourceFootage | null) => void;
 }
 
 export const StudioPage3CanvasTimeline: React.FC<StudioPage3CanvasTimelineProps> = ({
@@ -93,6 +96,8 @@ export const StudioPage3CanvasTimeline: React.FC<StudioPage3CanvasTimelineProps>
   onApplyWordsAndBeats,
   visualMode,
   onChangeVisualMode,
+  sourceFile,
+  onChangeSourceFile,
 }) => {
   const scriptSectionRef = useRef<HTMLDivElement>(null);
   const captionSectionRef = useRef<HTMLDivElement>(null);
@@ -263,6 +268,11 @@ export const StudioPage3CanvasTimeline: React.FC<StudioPage3CanvasTimelineProps>
             onUpdateCaptionStyle={onChangeCaptionStyle}
             visualMode={visualMode}
             onChangeVisualMode={onChangeVisualMode}
+            sourceFile={sourceFile}
+            onChangeSourceFile={onChangeSourceFile}
+            localSourceName={script.sourceLocalVideo?.name}
+            onAutoAlignBeats={onAutoAlignBeats}
+            onUpdateAllBeats={onUpdateAllBeats}
           />
         </aside>
       </div>
